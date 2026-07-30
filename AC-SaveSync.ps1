@@ -1,0 +1,853 @@
+<#
+================================================================================
+  Animal Crossing Save-Sync + Sperre (Git) - mit grafischer Oberflaeche
+================================================================================
+
+  Was macht das Skript?
+  ---------------------
+  Es startet Dolphin NICHT direkt, sondern kuemmert sich drumherum:
+    1. Vor dem Spielen:  holt den neuesten Spielstand aus dem Git-Repo
+    2. Setzt eine "Sperre" (PLAYING.lock) mit deinem Namen + Zeitstempel
+    3. Waehrend des Spielens: sendet regelmaessig einen "Herzschlag"
+       (aktualisiert den Zeitstempel + sichert den Spielstand)
+    4. Nach dem Beenden: laedt den Spielstand hoch und gibt die Sperre frei
+
+  Warum kann die Sperre NICHT dauerhaft haengen bleiben?
+  ------------------------------------------------------
+    - Lease/Ablauf:  Ist der Zeitstempel aelter als "LeaseMinutes" (Standard 5),
+      gilt die Sperre als tot und wird automatisch uebernommen. Ein Absturz
+      stoppt den Herzschlag -> Sperre laeuft von allein ab.
+    - Aufraeumen:  Beendet sich Dolphin normal, wird die Sperre sofort freigegeben.
+    - Notausgang:  Der Knopf "Sperre erzwingen freigeben" loescht sie sofort.
+    - Beim Schliessen des Fensters wirst du gewarnt; selbst dann laeuft die
+      Sperre spaetestens nach LeaseMinutes ab.
+
+  Voraussetzungen (einmalig):
+  ---------------------------
+    - Git muss installiert und im PATH sein  (git --version testen)
+    - Ihr habt EIN gemeinsames privates Git-Repo (z. B. GitHub) und BEIDE
+      habt es lokal geklont. RepoPath zeigt auf diesen Ordner.
+    - Der Dolphin-Spielstand liegt in diesem Repo-Ordner (oder ihr verlinkt
+      den Dolphin-Save-Ordner per Symlink dort hinein).
+    - Eure Git-Zugangsdaten sind gespeichert (Git Credential Manager bei HTTPS
+      oder ein SSH-Key), sonst kann das Skript nicht ohne Nachfrage pushen.
+    - Beide benutzen dieses Skript, ABER mit UNTERSCHIEDLICHEM Spielernamen.
+
+  Starten:
+  --------
+    Rechtsklick auf die Datei -> "Mit PowerShell ausfuehren"
+    Oder in PowerShell:   powershell -ExecutionPolicy Bypass -File .\AC-SaveSync.ps1
+================================================================================
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Git soll nie interaktiv nach Passwoertern fragen (sonst haengt das Skript):
+$env:GIT_TERMINAL_PROMPT = "0"
+
+# --------------------------------------------------------------------------
+# Konfiguration
+# --------------------------------------------------------------------------
+# Die Konfig liegt im Windows-Benutzerprofil unter %APPDATA%\AC-SaveSync\.
+# Dieser Ordner ist im Explorer standardmaessig ausgeblendet und liegt voellig
+# getrennt vom Skript - es landet also nichts Sichtbares neben der .ps1.
+$script:AppDir = if ($env:APPDATA) { Join-Path $env:APPDATA "AC-SaveSync" }
+elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "AC-SaveSync" }
+else { Join-Path (Get-Location).Path "AC-SaveSync" }
+if (-not (Test-Path $script:AppDir)) {
+    New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+}
+$script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
+
+$script:defaults = @{
+    DolphinPath      = "C:\Program Files\Dolphin-x64\Dolphin.exe"
+    RepoPath         = "$env:USERPROFILE\Documents\ACSave"
+    GamePath         = ""
+    SaveFolder       = ""
+    PlayerName       = $env:USERNAME
+    Branch           = "main"
+    LeaseMinutes     = 5
+    HeartbeatSeconds = 60
+}
+$script:cfg = $script:defaults.Clone()
+
+# Laufzeit-Zustand
+$script:proc = $null
+$script:holdingLock = $false
+$script:lastHeartbeat = Get-Date
+$script:lastAccounted = Get-Date
+
+function Load-Config {
+    if (Test-Path $script:ConfigPath) {
+        try {
+            $j = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
+            foreach ($k in @($script:cfg.Keys)) {
+                if ($null -ne $j.$k -and "$($j.$k)" -ne "") { $script:cfg[$k] = $j.$k }
+            }
+        }
+        catch { }
+    }
+}
+
+function Save-ConfigFromUI {
+    $script:cfg.DolphinPath = $script:txtDolphin.Text
+    $script:cfg.RepoPath = $script:txtRepo.Text
+    $script:cfg.GamePath = $script:txtGame.Text
+    $script:cfg.SaveFolder = $script:txtSave.Text
+    $script:cfg.PlayerName = $script:txtName.Text
+    $script:cfg.Branch = $script:txtBranch.Text
+
+    $lm = 5; [void][int]::TryParse($script:txtLease.Text, [ref]$lm)
+    $hb = 60; [void][int]::TryParse($script:txtHeart.Text, [ref]$hb)
+    if ($lm -lt 1) { $lm = 1 }
+    if ($hb -lt 10) { $hb = 10 }
+    $script:cfg.LeaseMinutes = $lm
+    $script:cfg.HeartbeatSeconds = $hb
+
+    try { ($script:cfg | ConvertTo-Json) | Set-Content -Path $script:ConfigPath -Encoding UTF8 } catch {}
+}
+
+# --------------------------------------------------------------------------
+# Kleine Helfer
+# --------------------------------------------------------------------------
+function Write-Log {
+    param([string]$msg)
+    $line = "[{0}] {1}`r`n" -f (Get-Date).ToString("HH:mm:ss"), $msg
+    if ($script:txtLog) {
+        $script:txtLog.AppendText($line)
+        $script:txtLog.SelectionStart = $script:txtLog.Text.Length
+        $script:txtLog.ScrollToCaret()
+    }
+    else { Write-Host $line }
+}
+
+function Invoke-Git {
+    param([string[]]$GitArgs)
+    $out = & git -C $script:cfg.RepoPath @GitArgs 2>&1
+    [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($out | Out-String).Trim() }
+}
+
+function Test-Repo {
+    if (-not (Test-Path (Join-Path $script:cfg.RepoPath ".git"))) {
+        Write-Log "FEHLER: Unter RepoPath liegt kein Git-Repo. Bitte erst das gemeinsame Repo dorthin klonen."
+        return $false
+    }
+    return $true
+}
+
+# Auf den Remote-Stand zwingen (kein Merge -> keine Konflikte).
+# Nur aufrufen, wenn wir die Sperre NICHT halten (sonst wuerden wir eigenen
+# Fortschritt verwerfen).
+function Sync-Remote {
+    $f = Invoke-Git @('fetch', 'origin')
+    if ($f.Code -ne 0) { Write-Log "fetch-Warnung: $($f.Text)" }
+    $r = Invoke-Git @('reset', '--hard', "origin/$($script:cfg.Branch)")
+    if ($r.Code -ne 0) { Write-Log "reset-Warnung: $($r.Text)" }
+}
+
+function Get-LockPath { Join-Path $script:cfg.RepoPath "PLAYING.lock" }
+
+function Set-LockFile {
+    $obj = [ordered]@{
+        owner      = $script:cfg.PlayerName
+        machine    = $env:COMPUTERNAME
+        updatedUtc = [datetime]::UtcNow.ToString("o")
+    }
+    ($obj | ConvertTo-Json) | Set-Content -Path (Get-LockPath) -Encoding UTF8
+}
+
+function Get-LockState {
+    $lf = Get-LockPath
+    if (-not (Test-Path $lf)) { return [pscustomobject]@{ State = 'free' } }
+    try {
+        $j = Get-Content $lf -Raw -ErrorAction Stop | ConvertFrom-Json
+        $upd = [datetimeoffset]::Parse($j.updatedUtc).UtcDateTime
+        $age = ([datetime]::UtcNow - $upd).TotalMinutes
+        $mine = ($j.owner -eq $script:cfg.PlayerName) -and ($j.machine -eq $env:COMPUTERNAME)
+        return [pscustomobject]@{
+            State      = 'locked'
+            Owner      = $j.owner
+            Machine    = $j.machine
+            AgeMinutes = $age
+            Stale      = ($age -gt $script:cfg.LeaseMinutes)
+            Mine       = $mine
+        }
+    }
+    catch {
+        return [pscustomobject]@{ State = 'unknown' }
+    }
+}
+
+function Git-CommitPush {
+    param([string]$msg)
+    Invoke-Git @('add', '-A') | Out-Null
+    $c = Invoke-Git @('commit', '-m', $msg)
+    if ($c.Code -ne 0 -and $c.Text -notmatch 'nothing to commit') {
+        # Kein echter Fehler, nur informativ
+    }
+    return Invoke-Git @('push', 'origin', $script:cfg.Branch)
+}
+
+function Update-StatusUI {
+    param($lock)
+    switch ($lock.State) {
+        'free' {
+            $script:lblStatus.Text = "FREI  -  niemand spielt gerade"
+            $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(200, 240, 200)
+        }
+        'locked' {
+            if ($lock.Mine) {
+                $script:lblStatus.Text = "DU spielst gerade  (Sperre liegt bei dir)"
+                $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(200, 220, 255)
+            }
+            elseif ($lock.Stale) {
+                $script:lblStatus.Text = ("ABGELAUFENE Sperre von {0}  (seit {1} Min)  -  kann uebernommen werden" -f $lock.Owner, [math]::Round($lock.AgeMinutes, 1))
+                $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 235, 180)
+            }
+            else {
+                $script:lblStatus.Text = ("GESPERRT  -  {0} spielt  (seit {1} Min)" -f $lock.Owner, [math]::Round($lock.AgeMinutes, 1))
+                $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 200, 200)
+            }
+        }
+        default {
+            $script:lblStatus.Text = "Status unbekannt (Sperr-Datei unlesbar)"
+            $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(230, 230, 230)
+        }
+    }
+}
+
+# --------------------------------------------------------------------------
+# Ablauf: Spielen starten
+# --------------------------------------------------------------------------
+function Start-Play {
+    Save-ConfigFromUI
+
+    if (-not (Test-Path $script:cfg.DolphinPath)) {
+        Write-Log "FEHLER: Dolphin nicht gefunden unter: $($script:cfg.DolphinPath)"
+        return
+    }
+    if (-not (Test-Repo)) { return }
+
+    Write-Log "Synchronisiere mit dem Remote-Repo..."
+    Sync-Remote
+    $lock = Get-LockState
+    Update-StatusUI $lock
+
+    if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
+        Write-Log ("GESPERRT: {0} spielt gerade (seit {1} Min). Bitte warten." -f $lock.Owner, [math]::Round($lock.AgeMinutes, 1))
+        return
+    }
+    if ($lock.State -eq 'locked' -and $lock.Stale) {
+        Write-Log ("Alte Sperre von {0} ist abgelaufen -> ich uebernehme." -f $lock.Owner)
+    }
+
+    # Sperre sichern (mit Wettlauf-Schutz: wer zuerst pusht, gewinnt)
+    $acquired = $false
+    for ($i = 1; $i -le 3 -and -not $acquired; $i++) {
+        Set-LockFile
+        $p = Git-CommitPush ("lock: {0}" -f $script:cfg.PlayerName)
+        if ($p.Code -eq 0) { $acquired = $true; break }
+
+        Write-Log "Push abgelehnt (Versuch $i) - jemand war evtl. schneller. Pruefe erneut..."
+        Sync-Remote
+        $lock = Get-LockState
+        if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
+            Update-StatusUI $lock
+            Write-Log ("GESPERRT: {0} war schneller. Abbruch." -f $lock.Owner)
+            return
+        }
+    }
+    if (-not $acquired) {
+        Write-Log "Konnte die Sperre nicht sichern (Push-Problem?). Abbruch. Siehe Log."
+        return
+    }
+
+    Write-Log "Sperre gesichert. Starte Dolphin..."
+    $script:holdingLock = $true
+
+    Restore-Saves | Out-Null
+
+    try {
+        $gp = $script:cfg.GamePath
+        if ($gp -and (Test-Path $gp)) {
+            $ext = [IO.Path]::GetExtension($gp).ToLowerInvariant()
+
+            if ($ext -eq '.lnk') {
+                # Verknuepfung aufloesen und Dolphin direkt mit denselben Argumenten
+                # starten (-> zuverlaessiger Prozess-Handle fuers Sitzungsende,
+                # und dein Mod-Preset laeuft genau wie beim Doppelklick auf die .lnk).
+                $tgt = $null; $ar = ""
+                try {
+                    $wsh = New-Object -ComObject WScript.Shell
+                    $sc = $wsh.CreateShortcut($gp)
+                    $tgt = $sc.TargetPath
+                    $ar = $sc.Arguments
+                }
+                catch { $tgt = $null }
+
+                if ([string]::IsNullOrWhiteSpace($tgt) -or -not (Test-Path $tgt)) {
+                    Write-Log "Verknuepfung nicht aufloesbar - starte sie direkt."
+                    $script:proc = Start-Process -FilePath $gp -PassThru
+                }
+                else {
+                    Write-Log ("Starte via Verknuepfung: `"{0}`" {1}" -f $tgt, $ar)
+                    if ([string]::IsNullOrWhiteSpace($ar)) {
+                        $script:proc = Start-Process -FilePath $tgt -PassThru
+                    }
+                    else {
+                        $script:proc = Start-Process -FilePath $tgt -ArgumentList $ar -PassThru
+                    }
+                }
+            }
+            elseif ($ext -eq '.exe' -or $ext -eq '.bat' -or $ext -eq '.cmd') {
+                # Ein Programm/Skript, das sich selbst um Dolphin + Mods kuemmert.
+                $script:proc = Start-Process -FilePath $gp -PassThru
+            }
+            else {
+                # Normale Spiel-/Preset-Datei an Dolphin uebergeben.
+                # Pfad in Anfuehrungszeichen -> Leerzeichen im Pfad sind kein Problem.
+                $argStr = '-b -e "{0}"' -f $gp
+                Write-Log ("Starte Dolphin mit: {0}" -f $argStr)
+                $script:proc = Start-Process -FilePath $script:cfg.DolphinPath -ArgumentList $argStr -PassThru
+            }
+        }
+        else {
+            $script:proc = Start-Process -FilePath $script:cfg.DolphinPath -PassThru
+        }
+    }
+    catch {
+        Write-Log "Start fehlgeschlagen: $_"
+        Finalize-Session
+        return
+    }
+
+    $script:lastHeartbeat = Get-Date
+    $script:lastAccounted = Get-Date
+    $script:btnPlay.Enabled = $false
+    Update-StatusUI (Get-LockState)
+    $script:timer.Start()
+    Write-Log "Viel Spass. Beim Schliessen von Dolphin wird automatisch gespeichert & freigegeben."
+}
+
+# --------------------------------------------------------------------------
+# Herzschlag + Ende-Erkennung (laeuft im Timer-Tick)
+# --------------------------------------------------------------------------
+function Do-Tick {
+    if ($null -ne $script:proc -and $script:proc.HasExited) {
+        Finalize-Session
+        return
+    }
+    if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge $script:cfg.HeartbeatSeconds) {
+        Set-LockFile
+        Capture-Saves | Out-Null
+        Add-Playtime
+        $p = Git-CommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
+        if ($p.Code -ne 0) {
+            Write-Log "Heartbeat-Warnung (Push): $($p.Text)"
+        }
+        else {
+            Write-Log "Herzschlag gesendet (Spielstand + Sperre aktualisiert)."
+        }
+        $script:lastHeartbeat = Get-Date
+    }
+}
+
+function Finalize-Session {
+    if ($script:timer) { $script:timer.Stop() }
+    if (-not $script:holdingLock) { $script:btnPlay.Enabled = $true; return }
+
+    Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
+    Capture-Saves | Out-Null
+    Add-Playtime -EndSession
+    $lf = Get-LockPath
+    Remove-Item $lf -Force -ErrorAction SilentlyContinue
+    $p = Git-CommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
+
+    if ($p.Code -ne 0) {
+        Write-Log "WARNUNG: Hochladen beim Beenden fehlgeschlagen."
+        Write-Log "Deine Aenderungen sind LOKAL committet (nicht verloren), aber noch nicht gepusht."
+        Write-Log "Moegliche Ursache: jemand hat per 'Sperre erzwingen' uebernommen. Details:"
+        Write-Log $p.Text
+    }
+    else {
+        Write-Log "Fertig. Spielstand hochgeladen, Sperre freigegeben."
+    }
+
+    $script:holdingLock = $false
+    $script:proc = $null
+    $script:btnPlay.Enabled = $true
+    Update-StatusUI (Get-LockState)
+}
+
+# --------------------------------------------------------------------------
+# Notausgang + Statusknopf
+# --------------------------------------------------------------------------
+function Force-Unlock {
+    Save-ConfigFromUI
+    if ($script:holdingLock) {
+        Write-Log "Du haeltst die Sperre selbst - beende einfach Dolphin, dann wird sie normal freigegeben."
+        return
+    }
+    if (-not (Test-Repo)) { return }
+    $r = [Windows.Forms.MessageBox]::Show(
+        "Sperre wirklich zwangsweise freigeben?`n`nNur benutzen, wenn sicher ist, dass niemand spielt (z. B. nach einem Absturz).",
+        "Sperre erzwingen", 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Sync-Remote
+    $lf = Get-LockPath
+    if (Test-Path $lf) { Remove-Item $lf -Force }
+    $p = Git-CommitPush ("force-unlock durch {0}" -f $script:cfg.PlayerName)
+    if ($p.Code -eq 0) { Write-Log "Sperre wurde zwangsweise freigegeben." }
+    else { Write-Log "Fehler beim Freigeben: $($p.Text)" }
+    Update-StatusUI (Get-LockState)
+}
+
+function Refresh-Status {
+    Save-ConfigFromUI
+    if (-not (Test-Repo)) { return }
+    Write-Log "Pruefe aktuellen Status..."
+    Sync-Remote
+    $lock = Get-LockState
+    Update-StatusUI $lock
+    if ($lock.State -eq 'free') { Write-Log "Frei - du kannst spielen." }
+    elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
+    elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
+    else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
+}
+
+# --------------------------------------------------------------------------
+# Spielstaende zwischen Dolphin-Ordner und Repo kopieren
+# --------------------------------------------------------------------------
+function Get-RepoSaveDir { Join-Path $script:cfg.RepoPath 'save' }
+
+# true = ok/uebersprungen, false = echter Fehler
+function Restore-Saves {
+    $src = Get-RepoSaveDir
+    $dst = $script:cfg.SaveFolder
+    if ([string]::IsNullOrWhiteSpace($dst)) { return $true }   # Feld leer -> Funktion aus
+    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Write-Log "Noch kein Spielstand im Repo - vorhandener Dolphin-Save bleibt unangetastet."
+        return $true
+    }
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    Write-Log "Schreibe Spielstand aus dem Repo in den Dolphin-Ordner..."
+    # /E = inkl. Unterordner, ueberschreibt; bewusst OHNE Loeschen, damit im
+    # Dolphin-Ordner nichts Fremdes geloescht wird.
+    $null = robocopy $src $dst /E /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
+    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Zurueckschreiben (robocopy-Code $LASTEXITCODE)."; return $false }
+    return $true
+}
+
+function Capture-Saves {
+    $src = $script:cfg.SaveFolder
+    $dst = Get-RepoSaveDir
+    if ([string]::IsNullOrWhiteSpace($src)) { return $true }   # Feld leer -> Funktion aus
+    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Write-Log "Dolphin-Save-Ordner ist leer/fehlt - nichts zu sichern."
+        return $true
+    }
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    # /MIR = spiegelt exakt ins repo-eigene 'save/' (dort ist Spiegeln sicher).
+    $null = robocopy $src $dst /MIR /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
+    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Sichern (robocopy-Code $LASTEXITCODE)."; return $false }
+    return $true
+}
+
+# --------------------------------------------------------------------------
+# Spielzeit-Erfassung + README-Statistik
+# --------------------------------------------------------------------------
+function Get-PlaytimePath { Join-Path $script:cfg.RepoPath 'playtime.json' }
+
+function Load-Playtime {
+    $p = Get-PlaytimePath
+    $h = @{}
+    if (Test-Path $p) {
+        try {
+            $j = Get-Content $p -Raw | ConvertFrom-Json
+            foreach ($prop in $j.PSObject.Properties) {
+                $v = $prop.Value
+                $h[$prop.Name] = @{
+                    TotalSeconds  = [double]$v.TotalSeconds
+                    Sessions      = [int]$v.Sessions
+                    LastPlayedUtc = [string]$v.LastPlayedUtc
+                }
+            }
+        }
+        catch { }
+    }
+    return $h
+}
+
+function Save-Playtime {
+    param($h)
+    ($h | ConvertTo-Json -Depth 5) | Set-Content -Path (Get-PlaytimePath) -Encoding UTF8
+}
+
+function Format-Duration {
+    param([double]$sec)
+    if ($sec -lt 0) { $sec = 0 }
+    $ts = [TimeSpan]::FromSeconds([math]::Round($sec))
+    if ($ts.TotalHours -ge 1) { return ("{0}h {1}m" -f [int][math]::Floor($ts.TotalHours), $ts.Minutes) }
+    elseif ($ts.TotalMinutes -ge 1) { return ("{0}m {1}s" -f $ts.Minutes, $ts.Seconds) }
+    else { return ("{0}s" -f $ts.Seconds) }
+}
+
+function Write-Readme {
+    param($h)
+    if ($null -eq $h) { $h = @{} }
+    $lines = @()
+    $lines += "# Gemeinsamer Animal-Crossing-Spielstand"
+    $lines += ""
+    $lines += "Verwaltet mit ``AC-SaveSync.ps1``."
+    $lines += ""
+    $lines += "## Spielzeiten"
+    $lines += ""
+    $lines += "| Spieler | Gesamt | Sitzungen | Zuletzt gespielt |"
+    $lines += "|---|---|---|---|"
+    $total = 0.0
+    if ($h.Keys.Count -eq 0) {
+        $lines += "| _noch keine Daten_ | - | - | - |"
+    }
+    else {
+        foreach ($name in ($h.Keys | Sort-Object)) {
+            $e = $h[$name]
+            $total += [double]$e.TotalSeconds
+            $last = "-"
+            if ($e.LastPlayedUtc) {
+                try { $last = [datetimeoffset]::Parse($e.LastPlayedUtc).LocalDateTime.ToString("yyyy-MM-dd HH:mm") } catch { }
+            }
+            $lines += ("| {0} | {1} | {2} | {3} |" -f $name, (Format-Duration $e.TotalSeconds), $e.Sessions, $last)
+        }
+    }
+    $lines += ""
+    $lines += ("**Gesamt zusammen:** {0}" -f (Format-Duration $total))
+    $lines += ""
+    $lines += ("_Zuletzt aktualisiert: {0}_" -f (Get-Date).ToString("yyyy-MM-dd HH:mm"))
+    ($lines -join "`r`n") | Set-Content -Path (Join-Path $script:cfg.RepoPath 'README.md') -Encoding UTF8
+}
+
+# Rechnet die seit dem letzten Zeitpunkt vergangenen Sekunden dem aktuellen
+# Spieler an und aktualisiert playtime.json + README. Mit -EndSession wird
+# zusaetzlich der Sitzungszaehler erhoeht.
+function Add-Playtime {
+    param([switch]$EndSession)
+    $now = Get-Date
+    $deltaSec = ($now - $script:lastAccounted).TotalSeconds
+    if ($deltaSec -lt 0) { $deltaSec = 0 }
+    $script:lastAccounted = $now
+
+    $name = $script:cfg.PlayerName
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unbekannt" }
+    $h = Load-Playtime
+    if (-not $h.ContainsKey($name)) {
+        $h[$name] = @{ TotalSeconds = 0.0; Sessions = 0; LastPlayedUtc = "" }
+    }
+    $h[$name].TotalSeconds = [double]$h[$name].TotalSeconds + $deltaSec
+    $h[$name].LastPlayedUtc = [datetime]::UtcNow.ToString("o")
+    if ($EndSession) { $h[$name].Sessions = [int]$h[$name].Sessions + 1 }
+    Save-Playtime $h
+    Write-Readme $h
+}
+
+# --------------------------------------------------------------------------
+# Repo-Einrichtung (gemeinsames Git-Repo erstellen / verbinden / klonen)
+# --------------------------------------------------------------------------
+function Ensure-RepoInit {
+    Save-ConfigFromUI
+    if (-not (Test-Path $script:cfg.RepoPath)) {
+        New-Item -ItemType Directory -Path $script:cfg.RepoPath -Force | Out-Null
+        Write-Log "Ordner erstellt: $($script:cfg.RepoPath)"
+    }
+    if (Test-Path (Join-Path $script:cfg.RepoPath '.git')) {
+        Write-Log "Ordner ist bereits ein Git-Repo."
+    }
+    else {
+        $r = Invoke-Git @('init')
+        Write-Log "git init: $($r.Text)"
+    }
+    $ga = Join-Path $script:cfg.RepoPath '.gitattributes'
+    if (-not (Test-Path $ga)) {
+        @"
+# Spielstaende sind Binaerdateien: keine Zeilenende-Umwandlung, kein Merge
+save/** -text -diff
+*.bin -text -diff
+*.raw -text -diff
+*.dat -text -diff
+*.sav -text -diff
+"@ | Set-Content -Path $ga -Encoding UTF8
+    }
+    Write-Readme (Load-Playtime)
+    Invoke-Git @('add', '-A') | Out-Null
+    $c = Invoke-Git @('commit', '-m', 'Repo-Setup durch AC-SaveSync')
+    if ($c.Code -eq 0) { Write-Log "Erster Commit erstellt." }
+    elseif ($c.Text -match 'nothing to commit') { Write-Log "Nichts Neues zu committen (schon eingerichtet)." }
+    else { Write-Log "commit: $($c.Text)" }
+    Invoke-Git @('branch', '-M', $script:cfg.Branch) | Out-Null
+    Write-Log "Lokales Repo bereit (Branch: $($script:cfg.Branch))."
+}
+
+function Connect-Remote {
+    param([string]$url)
+    Save-ConfigFromUI
+    if ([string]::IsNullOrWhiteSpace($url)) { Write-Log "Bitte im Fenster oben die Remote-URL eintragen."; return }
+    if (-not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) {
+        Write-Log "Erst Schritt 1 (Lokales Repo anlegen) ausfuehren."; return
+    }
+    $r = Invoke-Git @('remote')
+    if ($r.Text -match '(^|\r?\n)origin(\r?\n|$)') {
+        Invoke-Git @('remote', 'set-url', 'origin', $url) | Out-Null
+        Write-Log "origin aktualisiert."
+    }
+    else {
+        Invoke-Git @('remote', 'add', 'origin', $url) | Out-Null
+        Write-Log "origin hinzugefuegt."
+    }
+    $p = Invoke-Git @('push', '-u', 'origin', $script:cfg.Branch)
+    if ($p.Code -eq 0) { Write-Log "Hochgeladen. Das Repo ist jetzt startklar - der andere kann es nun klonen." }
+    else { Write-Log "Push fehlgeschlagen: $($p.Text)" }
+}
+
+function Clone-Repo {
+    param([string]$url)
+    Save-ConfigFromUI
+    if ([string]::IsNullOrWhiteSpace($url)) { Write-Log "Bitte im Fenster oben die Remote-URL eintragen."; return }
+    $target = $script:cfg.RepoPath
+    if (Test-Path (Join-Path $target '.git')) { Write-Log "Zielordner ist bereits ein Repo - Klonen nicht noetig."; return }
+    if ((Test-Path $target) -and (Get-ChildItem -Force $target | Select-Object -First 1)) {
+        Write-Log "Zielordner ist nicht leer. Bitte einen leeren/neuen Ordner als RepoPath waehlen."; return
+    }
+    Write-Log "Klone Repo..."
+    $out = & git clone $url $target 2>&1
+    Write-Log ("git clone: " + (($out | Out-String).Trim()))
+    if (Test-Path (Join-Path $target '.git')) { Write-Log "Klonen erfolgreich. Du kannst jetzt spielen." }
+    else { Write-Log "Klonen hat nicht geklappt - URL und Zugangsdaten pruefen." }
+}
+
+function Create-RemoteWithGh {
+    param([string]$name)
+    Save-ConfigFromUI
+    if ([string]::IsNullOrWhiteSpace($name)) { Write-Log "Bitte einen Repo-Namen eingeben."; return }
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if (-not $gh) {
+        Write-Log "GitHub CLI (gh) nicht gefunden. Erstelle das leere Repo auf github.com und nutze dann 'Verbinden & hochladen'."
+        return
+    }
+    Ensure-RepoInit
+    Write-Log "Erstelle privates GitHub-Repo '$name' und lade hoch..."
+    $out = & gh repo create $name --private --source $script:cfg.RepoPath --remote origin --push 2>&1
+    Write-Log ("gh: " + (($out | Out-String).Trim()))
+}
+
+function Show-SetupDialog {
+    Save-ConfigFromUI
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = "Gemeinsames Repo einrichten"
+    $dlg.Size = New-Object Drawing.Size(560, 430)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $info = New-Object Windows.Forms.Label
+    $info.Text = "Einer legt das Repo an (Schritte 1 + 2), der andere klont es nur (Schritt 3)." + [Environment]::NewLine + [Environment]::NewLine + "Das LEERE Remote-Repo erstellst du vorher einmalig auf github.com (o. ae.) - oder unten per GitHub CLI. Trage oben im Hauptfenster Repo-Ordner, Name und Branch ein."
+    $info.Location = New-Object Drawing.Point(15, 10)
+    $info.Size = New-Object Drawing.Size(525, 70)
+    $dlg.Controls.Add($info)
+
+    $lu = New-Object Windows.Forms.Label
+    $lu.Text = "Remote-URL:"; $lu.Location = New-Object Drawing.Point(15, 92); $lu.Size = New-Object Drawing.Size(90, 22)
+    $lu.TextAlign = 'MiddleLeft'; $dlg.Controls.Add($lu)
+    $tu = New-Object Windows.Forms.TextBox
+    $tu.Location = New-Object Drawing.Point(110, 92); $tu.Size = New-Object Drawing.Size(430, 22)
+    $dlg.Controls.Add($tu)
+
+    $b1 = New-Object Windows.Forms.Button
+    $b1.Text = "1) Lokales Repo in diesem Ordner anlegen"
+    $b1.Location = New-Object Drawing.Point(15, 128); $b1.Size = New-Object Drawing.Size(525, 32)
+    $b1.Add_Click({ Ensure-RepoInit })
+    $dlg.Controls.Add($b1)
+
+    $b2 = New-Object Windows.Forms.Button
+    $b2.Text = "2) Mit Remote-URL verbinden und hochladen"
+    $b2.Location = New-Object Drawing.Point(15, 166); $b2.Size = New-Object Drawing.Size(525, 32)
+    $b2.Add_Click({ Connect-Remote $tu.Text }.GetNewClosure())
+    $dlg.Controls.Add($b2)
+
+    $b3 = New-Object Windows.Forms.Button
+    $b3.Text = "3) Vorhandenes Repo von URL klonen (fuer den 2. Spieler)"
+    $b3.Location = New-Object Drawing.Point(15, 204); $b3.Size = New-Object Drawing.Size(525, 32)
+    $b3.Add_Click({ Clone-Repo $tu.Text }.GetNewClosure())
+    $dlg.Controls.Add($b3)
+
+    $sep = New-Object Windows.Forms.Label
+    $sep.Text = "Optional (falls GitHub CLI 'gh' installiert ist) - erstellt das Remote automatisch:"
+    $sep.Location = New-Object Drawing.Point(15, 248); $sep.Size = New-Object Drawing.Size(525, 20)
+    $dlg.Controls.Add($sep)
+
+    $ln = New-Object Windows.Forms.Label
+    $ln.Text = "Repo-Name:"; $ln.Location = New-Object Drawing.Point(15, 274); $ln.Size = New-Object Drawing.Size(90, 22)
+    $ln.TextAlign = 'MiddleLeft'; $dlg.Controls.Add($ln)
+    $tn = New-Object Windows.Forms.TextBox
+    $tn.Text = "ac-save"; $tn.Location = New-Object Drawing.Point(110, 274); $tn.Size = New-Object Drawing.Size(190, 22)
+    $dlg.Controls.Add($tn)
+
+    $b4 = New-Object Windows.Forms.Button
+    $b4.Text = "GitHub-Repo per gh erstellen und pushen"
+    $b4.Location = New-Object Drawing.Point(310, 272); $b4.Size = New-Object Drawing.Size(230, 26)
+    $b4.Add_Click({ Create-RemoteWithGh $tn.Text }.GetNewClosure())
+    $dlg.Controls.Add($b4)
+
+    $bc = New-Object Windows.Forms.Button
+    $bc.Text = "Schliessen"; $bc.Location = New-Object Drawing.Point(435, 330); $bc.Size = New-Object Drawing.Size(105, 30)
+    $bc.Add_Click({ $dlg.Close() }.GetNewClosure())
+    $dlg.Controls.Add($bc)
+
+    [void]$dlg.ShowDialog()
+}
+
+# ==========================================================================
+# Grafische Oberflaeche
+# ==========================================================================
+Load-Config
+
+$form = New-Object Windows.Forms.Form
+$form.Text = "Animal Crossing - Save-Sync & Sperre"
+$form.Size = New-Object Drawing.Size(660, 678)
+$form.StartPosition = "CenterScreen"
+$form.MinimumSize = New-Object Drawing.Size(660, 678)
+
+function New-Label {
+    param($text, $x, $y, $w = 120)
+    $l = New-Object Windows.Forms.Label
+    $l.Text = $text; $l.Location = New-Object Drawing.Point($x, $y)
+    $l.Size = New-Object Drawing.Size($w, 22); $l.TextAlign = 'MiddleLeft'
+    $form.Controls.Add($l); return $l
+}
+function New-Text {
+    param($val, $x, $y, $w)
+    $t = New-Object Windows.Forms.TextBox
+    $t.Text = "$val"; $t.Location = New-Object Drawing.Point($x, $y)
+    $t.Size = New-Object Drawing.Size($w, 22)
+    $form.Controls.Add($t); return $t
+}
+function New-Button {
+    param($text, $x, $y, $w, $h = 28)
+    $b = New-Object Windows.Forms.Button
+    $b.Text = $text; $b.Location = New-Object Drawing.Point($x, $y)
+    $b.Size = New-Object Drawing.Size($w, $h)
+    $form.Controls.Add($b); return $b
+}
+
+$y = 15
+New-Label "Dolphin.exe:" 15 $y | Out-Null
+$script:txtDolphin = New-Text $script:cfg.DolphinPath 140 $y 400
+$btnBrowseDolphin = New-Button "..." 548 $y 60 24
+
+$y += 32
+New-Label "Repo-Ordner:" 15 $y | Out-Null
+$script:txtRepo = New-Text $script:cfg.RepoPath 140 $y 400
+$btnBrowseRepo = New-Button "..." 548 $y 60 24
+
+$y += 32
+New-Label "Spiel (optional):" 15 $y | Out-Null
+$script:txtGame = New-Text $script:cfg.GamePath 140 $y 400
+$btnBrowseGame = New-Button "..." 548 $y 60 24
+
+$y += 32
+New-Label "Save-Ordner:" 15 $y | Out-Null
+$script:txtSave = New-Text $script:cfg.SaveFolder 140 $y 400
+$btnBrowseSave = New-Button "..." 548 $y 60 24
+
+$y += 32
+New-Label "Dein Name:" 15 $y | Out-Null
+$script:txtName = New-Text $script:cfg.PlayerName 140 $y 180
+New-Label "Branch:" 340 $y 60 | Out-Null
+$script:txtBranch = New-Text $script:cfg.Branch 400 $y 100
+
+$y += 32
+New-Label "Sperre gilt (Min):" 15 $y | Out-Null
+$script:txtLease = New-Text $script:cfg.LeaseMinutes 140 $y 60
+New-Label "Herzschlag (Sek):" 220 $y 120 | Out-Null
+$script:txtHeart = New-Text $script:cfg.HeartbeatSeconds 340 $y 60
+$btnSetup = New-Button "Repo einrichten..." 410 ($y - 2) 198 26
+
+# Statusanzeige
+$y += 40
+$script:lblStatus = New-Object Windows.Forms.Label
+$script:lblStatus.Text = "Noch nicht geprueft  -  klicke 'Status pruefen'"
+$script:lblStatus.Location = New-Object Drawing.Point(15, $y)
+$script:lblStatus.Size = New-Object Drawing.Size(593, 40)
+$script:lblStatus.TextAlign = 'MiddleCenter'
+$script:lblStatus.BorderStyle = 'FixedSingle'
+$script:lblStatus.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+$script:lblStatus.BackColor = [Drawing.Color]::FromArgb(230, 230, 230)
+$form.Controls.Add($script:lblStatus)
+
+# Knoepfe
+$y += 52
+$script:btnPlay = New-Button "Spielen starten" 15 $y 180 34
+$script:btnPlay.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+$btnRefresh = New-Button "Status pruefen" 205 $y 140 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 355 $y 180 34
+$btnSave = New-Button "Speichern" 545 $y 63 34
+
+# Log
+$y += 46
+New-Label "Protokoll:" 15 $y 100 | Out-Null
+$y += 24
+$script:txtLog = New-Object Windows.Forms.TextBox
+$script:txtLog.Location = New-Object Drawing.Point(15, $y)
+$script:txtLog.Size = New-Object Drawing.Size(593, 220)
+$script:txtLog.Multiline = $true
+$script:txtLog.ReadOnly = $true
+$script:txtLog.ScrollBars = 'Vertical'
+$script:txtLog.Anchor = 'Top,Bottom,Left,Right'
+$script:txtLog.Font = New-Object Drawing.Font("Consolas", 9)
+$form.Controls.Add($script:txtLog)
+
+# Timer fuer Herzschlag / Ende-Erkennung
+$script:timer = New-Object Windows.Forms.Timer
+$script:timer.Interval = 3000
+$script:timer.Add_Tick({ Do-Tick })
+
+# Ereignisse verdrahten
+$btnBrowseDolphin.Add_Click({
+        $d = New-Object Windows.Forms.OpenFileDialog
+        $d.Filter = "Dolphin (Dolphin.exe)|Dolphin.exe|Alle Dateien|*.*"
+        if ($d.ShowDialog() -eq 'OK') { $script:txtDolphin.Text = $d.FileName }
+    })
+$btnBrowseRepo.Add_Click({
+        $d = New-Object Windows.Forms.FolderBrowserDialog
+        if ($d.ShowDialog() -eq 'OK') { $script:txtRepo.Text = $d.SelectedPath }
+    })
+$btnBrowseGame.Add_Click({
+        $d = New-Object Windows.Forms.OpenFileDialog
+        $d.Filter = "Spiel/Preset/Verknuepfung|*.iso;*.wbfs;*.rvz;*.gcm;*.ciso;*.json;*.lnk;*.exe|Alle Dateien|*.*"
+        if ($d.ShowDialog() -eq 'OK') { $script:txtGame.Text = $d.FileName }
+    })
+$btnBrowseSave.Add_Click({
+        $d = New-Object Windows.Forms.FolderBrowserDialog
+        $d.Description = "Ordner mit den Dolphin-Speicherdaten waehlen (der Ordner DIESES Spiels)"
+        if ($d.ShowDialog() -eq 'OK') { $script:txtSave.Text = $d.SelectedPath }
+    })
+$script:btnPlay.Add_Click({ Start-Play })
+$btnRefresh.Add_Click({ Refresh-Status })
+$btnUnlock.Add_Click({ Force-Unlock })
+$btnSave.Add_Click({ Save-ConfigFromUI; Write-Log "Einstellungen gespeichert." })
+$btnSetup.Add_Click({ Show-SetupDialog })
+
+$form.Add_FormClosing({
+        param($s, $e)
+        if ($script:holdingLock) {
+            $r = [Windows.Forms.MessageBox]::Show(
+                ("Es laeuft noch eine Sitzung und du haeltst die Sperre.`n`n" +
+                "Beim Schliessen wird der Spielstand NICHT automatisch hochgeladen. " +
+                "Die Sperre laeuft aber spaetestens nach {0} Min automatisch ab.`n`nTrotzdem schliessen?" -f $script:cfg.LeaseMinutes),
+                "Achtung", 'YesNo', 'Warning')
+            if ($r -ne 'Yes') { $e.Cancel = $true }
+        }
+    })
+
+Write-Log "Bereit. Pruefe zuerst die Pfade oben, dann 'Speichern' und 'Status pruefen'."
+[void]$form.ShowDialog()
