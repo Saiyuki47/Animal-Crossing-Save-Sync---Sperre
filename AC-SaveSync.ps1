@@ -104,6 +104,11 @@ $script:proc = $null
 $script:holdingLock = $false
 $script:lastHeartbeat = Get-Date
 $script:lastAccounted = Get-Date
+# Meldungen, die anfallen, bevor das Protokollfeld existiert (z. B. beim Laden
+# der Konfig). Sie werden nachgetragen, sobald die Oberflaeche steht.
+$script:pendingLog = @()
+# Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
+$script:configSaved = $false
 
 function Import-Config {
     if (Test-Path $script:ConfigPath) {
@@ -113,7 +118,11 @@ function Import-Config {
                 if ($null -ne $j.$k -and "$($j.$k)" -ne "") { $script:cfg[$k] = $j.$k }
             }
         }
-        catch { }
+        catch {
+            Write-Log "WARNUNG: Einstellungsdatei unlesbar - es gelten die Standardwerte."
+            Write-Log ("  Datei: {0}" -f $script:ConfigPath)
+            Write-Log ("  Grund: {0}" -f $_.Exception.Message)
+        }
     }
 }
 
@@ -133,7 +142,18 @@ function Save-ConfigFromUI {
     $script:cfg.LeaseMinutes = $lm
     $script:cfg.HeartbeatSeconds = $hb
 
-    try { ($script:cfg | ConvertTo-Json) | Set-Content -Path $script:ConfigPath -Encoding UTF8 } catch {}
+    # Ob das Schreiben geklappt hat, merken - sonst wuerde der Speichern-Knopf
+    # "gespeichert" melden, obwohl die Datei nicht geschrieben werden konnte.
+    $script:configSaved = $false
+    try {
+        ($script:cfg | ConvertTo-Json) | Set-Content -Path $script:ConfigPath -Encoding UTF8
+        $script:configSaved = $true
+    }
+    catch {
+        Write-Log "FEHLER: Einstellungen konnten nicht gespeichert werden."
+        Write-Log ("  Datei: {0}" -f $script:ConfigPath)
+        Write-Log ("  Grund: {0}" -f $_.Exception.Message)
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -143,11 +163,20 @@ function Write-Log {
     param([string]$msg)
     $line = "[{0}] {1}`r`n" -f (Get-Date).ToString("HH:mm:ss"), $msg
     if ($script:txtLog) {
+        # Zuerst nachtragen, was vor dem Fensteraufbau gemeldet wurde
+        if ($script:pendingLog.Count -gt 0) {
+            foreach ($p in $script:pendingLog) { $script:txtLog.AppendText($p) }
+            $script:pendingLog = @()
+        }
         $script:txtLog.AppendText($line)
         $script:txtLog.SelectionStart = $script:txtLog.Text.Length
         $script:txtLog.ScrollToCaret()
     }
-    else { Write-Host $line }
+    else {
+        # Noch kein Protokollfeld -> merken und zusaetzlich in die Konsole
+        $script:pendingLog += $line
+        Write-Host $line
+    }
 }
 
 function Invoke-Git {
@@ -207,14 +236,39 @@ function Get-LockState {
     }
 }
 
+# Liegt etwas zum Committen bereit? Ueber den Exitcode statt ueber den
+# Ausgabetext ("nothing to commit"), damit es auch mit anderssprachigem Git
+# funktioniert:  0 = Index deckt sich mit HEAD,  1 = es gibt Vorgemerktes.
+function Test-Staged {
+    return ((Invoke-Git @('diff', '--cached', '--quiet')).Code -ne 0)
+}
+
+# Committet die aktuellen Aenderungen und pusht sie. Rueckgabe wie Invoke-Git,
+# damit der Aufrufer an .Code erkennt, ob wirklich alles beim Remote angekommen
+# ist. WICHTIG: Scheitert schon der Commit, wird NICHT gepusht und der Fehler
+# durchgereicht - sonst wuerde ein "Everything up-to-date" des Push einen
+# Erfolg vortaeuschen und z. B. eine Sperre als gesichert gelten, die nie
+# beim anderen Spieler ankommt.
 function Invoke-GitCommitPush {
     param([string]$msg)
     Invoke-Git @('add', '-A') | Out-Null
-    $c = Invoke-Git @('commit', '-m', $msg)
-    if ($c.Code -ne 0 -and $c.Text -notmatch 'nothing to commit') {
-        # Kein echter Fehler, nur informativ
+    if (Test-Staged) {
+        $c = Invoke-Git @('commit', '-m', $msg)
+        if ($c.Code -ne 0) {
+            Write-Log "FEHLER: Commit fehlgeschlagen - es wird nichts hochgeladen."
+            Write-Log ("  git commit: {0}" -f $c.Text)
+            if ($c.Text -match 'user\.email|user\.name|identity') {
+                Write-Log "  Tipp: Git kennt dich noch nicht. Einmalig ausfuehren:"
+                Write-Log '        git config --global user.name "Dein Name"'
+                Write-Log '        git config --global user.email "du@example.com"'
+            }
+            return [pscustomobject]@{ Code = $c.Code; Text = $c.Text; Stage = 'commit' }
+        }
     }
-    return Invoke-Git @('push', 'origin', $script:cfg.Branch)
+    # Auch ohne neuen Commit pushen: es koennen aeltere Commits liegen
+    # geblieben sein, deren Push beim letzten Mal fehlgeschlagen ist.
+    $p = Invoke-Git @('push', 'origin', $script:cfg.Branch)
+    return [pscustomobject]@{ Code = $p.Code; Text = $p.Text; Stage = 'push' }
 }
 
 function Update-StatusUI {
@@ -276,6 +330,13 @@ function Start-Play {
         Set-LockFile
         $p = Invoke-GitCommitPush ("lock: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -eq 0) { $acquired = $true; break }
+
+        # Scheitert schon der Commit, hilft kein zweiter Versuch - das ist kein
+        # Wettlauf, sondern ein Problem am lokalen Git (siehe Meldung oben).
+        if ($p.Stage -eq 'commit') {
+            Write-Log "Abbruch: die Sperre konnte lokal nicht committet werden."
+            return
+        }
 
         Write-Log "Push abgelehnt (Versuch $i) - jemand war evtl. schneller. Pruefe erneut..."
         Sync-Remote
@@ -372,7 +433,7 @@ function Invoke-Tick {
         Add-Playtime
         $p = Invoke-GitCommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -ne 0) {
-            Write-Log "Heartbeat-Warnung (Push): $($p.Text)"
+            Write-Log ("Heartbeat-Warnung ({0}): {1}" -f $p.Stage, $p.Text)
         }
         else {
             Write-Log "Herzschlag gesendet (Spielstand + Sperre aktualisiert)."
@@ -540,7 +601,10 @@ function Get-Playtime {
                 }
             }
         }
-        catch { }
+        catch {
+            Write-Log "WARNUNG: playtime.json ist beschaedigt - die Spielzeit-Statistik kann unvollstaendig sein."
+            Write-Log ("  Grund: {0}" -f $_.Exception.Message)
+        }
     }
     return $h
 }
@@ -581,7 +645,8 @@ function Write-Readme {
             $total += [double]$e.TotalSeconds
             $last = "-"
             if ($e.LastPlayedUtc) {
-                try { $last = [datetimeoffset]::Parse($e.LastPlayedUtc).LocalDateTime.ToString("yyyy-MM-dd HH:mm") } catch { }
+                try { $last = [datetimeoffset]::Parse($e.LastPlayedUtc).LocalDateTime.ToString("yyyy-MM-dd HH:mm") }
+                catch { $last = "-" }   # unlesbarer Zeitstempel -> Strich in der Tabelle
             }
             $lines += ("| {0} | {1} | {2} | {3} |" -f $name, (Format-Duration $e.TotalSeconds), $e.Sessions, $last)
         }
@@ -664,10 +729,24 @@ pics/** -text -diff
     }
     Write-Readme (Get-Playtime)
     Invoke-Git @('add', '-A') | Out-Null
-    $c = Invoke-Git @('commit', '-m', 'Repo-Setup durch AC-SaveSync')
-    if ($c.Code -eq 0) { Write-Log "Erster Commit erstellt." }
-    elseif ($c.Text -match 'nothing to commit') { Write-Log "Nichts Neues zu committen (schon eingerichtet)." }
-    else { Write-Log "commit: $($c.Text)" }
+    if (-not (Test-Staged)) {
+        Write-Log "Nichts Neues zu committen (schon eingerichtet)."
+    }
+    else {
+        $c = Invoke-Git @('commit', '-m', 'Repo-Setup durch AC-SaveSync')
+        if ($c.Code -eq 0) {
+            Write-Log "Erster Commit erstellt."
+        }
+        else {
+            Write-Log "FEHLER: Commit fehlgeschlagen - das Repo ist noch nicht startklar."
+            Write-Log ("  git commit: {0}" -f $c.Text)
+            if ($c.Text -match 'user\.email|user\.name|identity') {
+                Write-Log "  Tipp: Git kennt dich noch nicht. Einmalig ausfuehren:"
+                Write-Log '        git config --global user.name "Dein Name"'
+                Write-Log '        git config --global user.email "du@example.com"'
+            }
+        }
+    }
     Invoke-Git @('branch', '-M', $script:cfg.Branch) | Out-Null
     Write-Log "Lokales Repo bereit (Branch: $($script:cfg.Branch))."
 }
@@ -852,7 +931,10 @@ try {
     $bannerMs = New-Object IO.MemoryStream(, $bannerBytes)
     $banner.Image = [Drawing.Image]::FromStream($bannerMs)
 }
-catch { }
+catch {
+    # Rein dekorativ - ohne Banner laeuft alles normal weiter.
+    Write-Log ("Hinweis: Banner konnte nicht geladen werden ({0})." -f $_.Exception.Message)
+}
 $form.Controls.Add($banner)
 
 $y = 80
@@ -1048,7 +1130,10 @@ $btnBrowsePics.Add_Click({
 $script:btnPlay.Add_Click({ Start-Play })
 $btnRefresh.Add_Click({ Update-Status })
 $btnUnlock.Add_Click({ Unlock-Session })
-$btnSave.Add_Click({ Save-ConfigFromUI; Write-Log "Einstellungen gespeichert." })
+$btnSave.Add_Click({
+        Save-ConfigFromUI
+        if ($script:configSaved) { Write-Log "Einstellungen gespeichert." }
+    })
 $btnSetup.Add_Click({ Show-SetupDialog })
 
 $form.Add_FormClosing({
