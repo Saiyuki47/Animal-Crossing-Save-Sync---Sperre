@@ -82,7 +82,7 @@ $script:holdingLock = $false
 $script:lastHeartbeat = Get-Date
 $script:lastAccounted = Get-Date
 
-function Load-Config {
+function Import-Config {
     if (Test-Path $script:ConfigPath) {
         try {
             $j = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
@@ -184,7 +184,7 @@ function Get-LockState {
     }
 }
 
-function Git-CommitPush {
+function Invoke-GitCommitPush {
     param([string]$msg)
     Invoke-Git @('add', '-A') | Out-Null
     $c = Invoke-Git @('commit', '-m', $msg)
@@ -251,7 +251,7 @@ function Start-Play {
     $acquired = $false
     for ($i = 1; $i -le 3 -and -not $acquired; $i++) {
         Set-LockFile
-        $p = Git-CommitPush ("lock: {0}" -f $script:cfg.PlayerName)
+        $p = Invoke-GitCommitPush ("lock: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -eq 0) { $acquired = $true; break }
 
         Write-Log "Push abgelehnt (Versuch $i) - jemand war evtl. schneller. Pruefe erneut..."
@@ -323,7 +323,7 @@ function Start-Play {
     }
     catch {
         Write-Log "Start fehlgeschlagen: $_"
-        Finalize-Session
+        Complete-Session
         return
     }
 
@@ -338,16 +338,16 @@ function Start-Play {
 # --------------------------------------------------------------------------
 # Herzschlag + Ende-Erkennung (laeuft im Timer-Tick)
 # --------------------------------------------------------------------------
-function Do-Tick {
+function Invoke-Tick {
     if ($null -ne $script:proc -and $script:proc.HasExited) {
-        Finalize-Session
+        Complete-Session
         return
     }
     if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge $script:cfg.HeartbeatSeconds) {
         Set-LockFile
-        Capture-Saves | Out-Null
+        Backup-Saves | Out-Null
         Add-Playtime
-        $p = Git-CommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
+        $p = Invoke-GitCommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -ne 0) {
             Write-Log "Heartbeat-Warnung (Push): $($p.Text)"
         }
@@ -358,17 +358,17 @@ function Do-Tick {
     }
 }
 
-function Finalize-Session {
+function Complete-Session {
     if ($script:timer) { $script:timer.Stop() }
     if (-not $script:holdingLock) { $script:btnPlay.Enabled = $true; return }
 
     Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
-    Capture-Saves | Out-Null
-    Capture-Pics
+    Backup-Saves | Out-Null
+    Move-Pics
     Add-Playtime -EndSession
     $lf = Get-LockPath
     Remove-Item $lf -Force -ErrorAction SilentlyContinue
-    $p = Git-CommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
+    $p = Invoke-GitCommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
 
     if ($p.Code -ne 0) {
         Write-Log "WARNUNG: Hochladen beim Beenden fehlgeschlagen."
@@ -389,7 +389,7 @@ function Finalize-Session {
 # --------------------------------------------------------------------------
 # Notausgang + Statusknopf
 # --------------------------------------------------------------------------
-function Force-Unlock {
+function Unlock-Session {
     Save-ConfigFromUI
     if ($script:holdingLock) {
         Write-Log "Du haeltst die Sperre selbst - beende einfach Dolphin, dann wird sie normal freigegeben."
@@ -404,13 +404,13 @@ function Force-Unlock {
     Sync-Remote
     $lf = Get-LockPath
     if (Test-Path $lf) { Remove-Item $lf -Force }
-    $p = Git-CommitPush ("force-unlock durch {0}" -f $script:cfg.PlayerName)
+    $p = Invoke-GitCommitPush ("force-unlock durch {0}" -f $script:cfg.PlayerName)
     if ($p.Code -eq 0) { Write-Log "Sperre wurde zwangsweise freigegeben." }
     else { Write-Log "Fehler beim Freigeben: $($p.Text)" }
     Update-StatusUI (Get-LockState)
 }
 
-function Refresh-Status {
+function Update-Status {
     Save-ConfigFromUI
     if (-not (Test-Repo)) { return }
     Write-Log "Pruefe aktuellen Status..."
@@ -426,7 +426,7 @@ function Refresh-Status {
 # --------------------------------------------------------------------------
 # Screenshots/Fotos ins Repo verschieben (mit kollisionssicheren Namen)
 # --------------------------------------------------------------------------
-function Capture-Pics {
+function Move-Pics {
     $src = $script:cfg.PicsFolder
     if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
     if (-not (Test-Path $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
@@ -482,7 +482,7 @@ function Restore-Saves {
     return $true
 }
 
-function Capture-Saves {
+function Backup-Saves {
     $src = $script:cfg.SaveFolder
     $dst = Get-RepoSaveDir
     if ([string]::IsNullOrWhiteSpace($src)) { return $true }   # Feld leer -> Funktion aus
@@ -502,7 +502,7 @@ function Capture-Saves {
 # --------------------------------------------------------------------------
 function Get-PlaytimePath { Join-Path $script:cfg.RepoPath 'playtime.json' }
 
-function Load-Playtime {
+function Get-Playtime {
     $p = Get-PlaytimePath
     $h = @{}
     if (Test-Path $p) {
@@ -600,7 +600,7 @@ function Add-Playtime {
 
     $name = $script:cfg.PlayerName
     if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unbekannt" }
-    $h = Load-Playtime
+    $h = Get-Playtime
     if (-not $h.ContainsKey($name)) {
         $h[$name] = @{ TotalSeconds = 0.0; Sessions = 0; LastPlayedUtc = "" }
     }
@@ -614,7 +614,7 @@ function Add-Playtime {
 # --------------------------------------------------------------------------
 # Repo-Einrichtung (gemeinsames Git-Repo erstellen / verbinden / klonen)
 # --------------------------------------------------------------------------
-function Ensure-RepoInit {
+function Initialize-Repo {
     Save-ConfigFromUI
     if (-not (Test-Path $script:cfg.RepoPath)) {
         New-Item -ItemType Directory -Path $script:cfg.RepoPath -Force | Out-Null
@@ -639,7 +639,7 @@ pics/** -text -diff
 *.sav -text -diff
 "@ | Set-Content -Path $ga -Encoding UTF8
     }
-    Write-Readme (Load-Playtime)
+    Write-Readme (Get-Playtime)
     Invoke-Git @('add', '-A') | Out-Null
     $c = Invoke-Git @('commit', '-m', 'Repo-Setup durch AC-SaveSync')
     if ($c.Code -eq 0) { Write-Log "Erster Commit erstellt." }
@@ -670,7 +670,7 @@ function Connect-Remote {
     else { Write-Log "Push fehlgeschlagen: $($p.Text)" }
 }
 
-function Clone-Repo {
+function Copy-Repo {
     param([string]$url)
     Save-ConfigFromUI
     if ([string]::IsNullOrWhiteSpace($url)) { Write-Log "Bitte im Fenster oben die Remote-URL eintragen."; return }
@@ -686,7 +686,7 @@ function Clone-Repo {
     else { Write-Log "Klonen hat nicht geklappt - URL und Zugangsdaten pruefen." }
 }
 
-function Create-RemoteWithGh {
+function New-RemoteWithGh {
     param([string]$name)
     Save-ConfigFromUI
     if ([string]::IsNullOrWhiteSpace($name)) { Write-Log "Bitte einen Repo-Namen eingeben."; return }
@@ -695,7 +695,7 @@ function Create-RemoteWithGh {
         Write-Log "GitHub CLI (gh) nicht gefunden. Erstelle das leere Repo auf github.com und nutze dann 'Verbinden & hochladen'."
         return
     }
-    Ensure-RepoInit
+    Initialize-Repo
     Write-Log "Erstelle privates GitHub-Repo '$name' und lade hoch..."
     $out = & gh repo create $name --private --source $script:cfg.RepoPath --remote origin --push 2>&1
     Write-Log ("gh: " + (($out | Out-String).Trim()))
@@ -726,7 +726,7 @@ function Show-SetupDialog {
     $b1 = New-Object Windows.Forms.Button
     $b1.Text = "1) Lokales Repo in diesem Ordner anlegen"
     $b1.Location = New-Object Drawing.Point(15, 128); $b1.Size = New-Object Drawing.Size(525, 32)
-    $b1.Add_Click({ Ensure-RepoInit })
+    $b1.Add_Click({ Initialize-Repo })
     $dlg.Controls.Add($b1)
 
     $b2 = New-Object Windows.Forms.Button
@@ -738,7 +738,7 @@ function Show-SetupDialog {
     $b3 = New-Object Windows.Forms.Button
     $b3.Text = "3) Vorhandenes Repo von URL klonen (fuer den 2. Spieler)"
     $b3.Location = New-Object Drawing.Point(15, 204); $b3.Size = New-Object Drawing.Size(525, 32)
-    $b3.Add_Click({ Clone-Repo $tu.Text }.GetNewClosure())
+    $b3.Add_Click({ Copy-Repo $tu.Text }.GetNewClosure())
     $dlg.Controls.Add($b3)
 
     $sep = New-Object Windows.Forms.Label
@@ -756,7 +756,7 @@ function Show-SetupDialog {
     $b4 = New-Object Windows.Forms.Button
     $b4.Text = "GitHub-Repo per gh erstellen und pushen"
     $b4.Location = New-Object Drawing.Point(310, 272); $b4.Size = New-Object Drawing.Size(230, 26)
-    $b4.Add_Click({ Create-RemoteWithGh $tn.Text }.GetNewClosure())
+    $b4.Add_Click({ New-RemoteWithGh $tn.Text }.GetNewClosure())
     $dlg.Controls.Add($b4)
 
     $bc = New-Object Windows.Forms.Button
@@ -770,7 +770,7 @@ function Show-SetupDialog {
 # ==========================================================================
 # Grafische Oberflaeche
 # ==========================================================================
-Load-Config
+Import-Config
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre"
@@ -900,7 +900,7 @@ $script:lblStatus.Anchor = 'Top,Left,Right'
 # Timer fuer Herzschlag / Ende-Erkennung
 $script:timer = New-Object Windows.Forms.Timer
 $script:timer.Interval = 3000
-$script:timer.Add_Tick({ Do-Tick })
+$script:timer.Add_Tick({ Invoke-Tick })
 
 # Ereignisse verdrahten
 # Moderner, Explorer-artiger Ordner-Dialog (statt der alten Baum-Ansicht).
@@ -943,8 +943,8 @@ $btnBrowsePics.Add_Click({
         if ($p) { $script:txtPics.Text = $p }
     })
 $script:btnPlay.Add_Click({ Start-Play })
-$btnRefresh.Add_Click({ Refresh-Status })
-$btnUnlock.Add_Click({ Force-Unlock })
+$btnRefresh.Add_Click({ Update-Status })
+$btnUnlock.Add_Click({ Unlock-Session })
 $btnSave.Add_Click({ Save-ConfigFromUI; Write-Log "Einstellungen gespeichert." })
 $btnSetup.Add_Click({ Show-SetupDialog })
 
