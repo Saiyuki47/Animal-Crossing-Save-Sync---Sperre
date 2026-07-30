@@ -805,7 +805,14 @@ function New-RemoteWithGh {
 
 function Show-SetupDialog {
     Save-ConfigFromUI
+    # Wichtig: Die Knopf-Handler unten benutzen bewusst KEIN .GetNewClosure().
+    # Ein solcher "Closure" haengt den Klick-Code in ein eigenes kleines Modul,
+    # das je nach PowerShell-Version die Funktionen aus diesem Skript nicht mehr
+    # findet ("Copy-Repo wurde nicht als Name eines Cmdlets ... erkannt").
+    # Stattdessen merken wir uns die Eingabefelder in $script:-Variablen -
+    # genau so, wie es das Hauptfenster auch macht.
     $dlg = New-Object Windows.Forms.Form
+    $script:setupDlg = $dlg
     $dlg.Text = "Gemeinsames Repo einrichten"
     $dlg.Size = New-Object Drawing.Size(560, 430)
     $dlg.StartPosition = "CenterParent"
@@ -824,6 +831,7 @@ function Show-SetupDialog {
     $tu = New-Object Windows.Forms.TextBox
     $tu.Location = New-Object Drawing.Point(110, 92); $tu.Size = New-Object Drawing.Size(430, 22)
     $dlg.Controls.Add($tu)
+    $script:setupUrlBox = $tu
     Set-Tip ("Adresse des gemeinsamen Repos, z. B.`n" +
         "https://github.com/DEINNAME/ac-save.git`n" +
         "Wird fuer Schritt 2 und Schritt 3 gebraucht.") $lu $tu
@@ -840,7 +848,7 @@ function Show-SetupDialog {
     $b2 = New-Object Windows.Forms.Button
     $b2.Text = "2) Mit Remote-URL verbinden und hochladen"
     $b2.Location = New-Object Drawing.Point(15, 166); $b2.Size = New-Object Drawing.Size(525, 32)
-    $b2.Add_Click({ Connect-Remote $tu.Text }.GetNewClosure())
+    $b2.Add_Click({ Connect-Remote $script:setupUrlBox.Text })
     $dlg.Controls.Add($b2)
     Set-Tip ("Verbindet das lokale Repo mit der Remote-URL oben ('origin')`n" +
         "und laedt alles hoch. Das Repo im Internet muss dafuer schon`n" +
@@ -849,7 +857,7 @@ function Show-SetupDialog {
     $b3 = New-Object Windows.Forms.Button
     $b3.Text = "3) Vorhandenes Repo von URL klonen (fuer den 2. Spieler)"
     $b3.Location = New-Object Drawing.Point(15, 204); $b3.Size = New-Object Drawing.Size(525, 32)
-    $b3.Add_Click({ Copy-Repo $tu.Text }.GetNewClosure())
+    $b3.Add_Click({ Copy-Repo $script:setupUrlBox.Text })
     $dlg.Controls.Add($b3)
     Set-Tip ("Fuer den ZWEITEN Spieler: laedt das fertige Repo von der URL oben`n" +
         "in den Repo-Ordner herunter. Der Zielordner muss leer sein`n" +
@@ -866,13 +874,14 @@ function Show-SetupDialog {
     $tn = New-Object Windows.Forms.TextBox
     $tn.Text = "ac-save"; $tn.Location = New-Object Drawing.Point(110, 274); $tn.Size = New-Object Drawing.Size(190, 22)
     $dlg.Controls.Add($tn)
+    $script:setupNameBox = $tn
     Set-Tip ("Name des neuen GitHub-Repos, das per GitHub CLI angelegt wird,`n" +
         "z. B. ac-save. Nur der Name, nicht die ganze Adresse.") $ln $tn
 
     $b4 = New-Object Windows.Forms.Button
     $b4.Text = "GitHub-Repo per gh erstellen und pushen"
     $b4.Location = New-Object Drawing.Point(310, 272); $b4.Size = New-Object Drawing.Size(230, 26)
-    $b4.Add_Click({ New-RemoteWithGh $tn.Text }.GetNewClosure())
+    $b4.Add_Click({ New-RemoteWithGh $script:setupNameBox.Text })
     $dlg.Controls.Add($b4)
     Set-Tip ("Erledigt Schritt 1 und 2 auf einen Schlag: legt mit der GitHub CLI`n" +
         "('gh') ein PRIVATES Repo an und laedt den Repo-Ordner hoch.`n" +
@@ -880,7 +889,7 @@ function Show-SetupDialog {
 
     $bc = New-Object Windows.Forms.Button
     $bc.Text = "Schliessen"; $bc.Location = New-Object Drawing.Point(435, 330); $bc.Size = New-Object Drawing.Size(105, 30)
-    $bc.Add_Click({ $dlg.Close() }.GetNewClosure())
+    $bc.Add_Click({ $script:setupDlg.Close() })
     $dlg.Controls.Add($bc)
     Set-Tip "Schliesst dieses Fenster. Die Einstellungen bleiben erhalten." $bc
 
