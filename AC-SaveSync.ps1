@@ -869,6 +869,17 @@ $script:txtLog.Anchor = 'Top,Bottom,Left,Right'
 $script:txtLog.Font = New-Object Drawing.Font("Consolas", 9)
 $form.Controls.Add($script:txtLog)
 
+# Beim Breiterziehen des Fensters mitwachsen lassen:
+# - die Pfad-Textfelder dehnen sich nach rechts (lange Pfade werden sichtbar),
+# - die "..."-Knoepfe bleiben rechts kleben.
+foreach ($tb in @($script:txtDolphin, $script:txtRepo, $script:txtGame, $script:txtSave, $script:txtPics)) {
+    $tb.Anchor = 'Top,Left,Right'
+}
+foreach ($bb in @($btnBrowseDolphin, $btnBrowseRepo, $btnBrowseGame, $btnBrowseSave, $btnBrowsePics)) {
+    $bb.Anchor = 'Top,Right'
+}
+$script:lblStatus.Anchor = 'Top,Left,Right'
+
 # Timer fuer Herzschlag / Ende-Erkennung
 $script:timer = New-Object Windows.Forms.Timer
 $script:timer.Interval = 3000
