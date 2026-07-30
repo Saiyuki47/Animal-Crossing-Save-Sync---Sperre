@@ -65,6 +65,7 @@ $script:defaults = @{
     RepoPath         = "$env:USERPROFILE\Documents\ACSave"
     GamePath         = ""
     SaveFolder       = ""
+    PicsFolder       = ""
     PlayerName       = $env:USERNAME
     Branch           = "main"
     LeaseMinutes     = 5
@@ -95,6 +96,7 @@ function Save-ConfigFromUI {
     $script:cfg.RepoPath = $script:txtRepo.Text
     $script:cfg.GamePath = $script:txtGame.Text
     $script:cfg.SaveFolder = $script:txtSave.Text
+    $script:cfg.PicsFolder = $script:txtPics.Text
     $script:cfg.PlayerName = $script:txtName.Text
     $script:cfg.Branch = $script:txtBranch.Text
 
@@ -359,6 +361,7 @@ function Finalize-Session {
 
     Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
     Capture-Saves | Out-Null
+    Capture-Pics
     Add-Playtime -EndSession
     $lf = Get-LockPath
     Remove-Item $lf -Force -ErrorAction SilentlyContinue
@@ -415,6 +418,42 @@ function Refresh-Status {
     elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
     elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
     else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
+}
+
+# --------------------------------------------------------------------------
+# Screenshots/Fotos ins Repo verschieben (mit kollisionssicheren Namen)
+# --------------------------------------------------------------------------
+function Capture-Pics {
+    $src = $script:cfg.PicsFolder
+    if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
+    if (-not (Test-Path $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
+    $dst = Join-Path $script:cfg.RepoPath 'pics'
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+
+    $exts = @('.jpg', '.jpeg', '.png')
+    $files = Get-ChildItem -Path $src -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $exts -contains $_.Extension.ToLowerInvariant() }
+    if (-not $files) { Write-Log "Keine neuen Bilder gefunden."; return }
+
+    $safe = ($script:cfg.PlayerName -replace '[^\w\-]', '_')
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "Unbekannt" }
+
+    $moved = 0
+    foreach ($f in $files) {
+        # Eindeutiger Name: Spieler + Aufnahme-Zeit + Originalname (alles bereinigt)
+        $stamp = $f.LastWriteTime.ToString("yyyyMMdd-HHmmss")
+        $stem = ("{0}_{1}_{2}" -f $safe, $stamp, $f.BaseName) -replace '[^\w\-]', '_'
+        $ext = $f.Extension.ToLowerInvariant()
+        $target = Join-Path $dst ($stem + $ext)
+        $i = 1
+        while (Test-Path $target) {
+            $target = Join-Path $dst ("{0}_{1}{2}" -f $stem, $i, $ext)
+            $i++
+        }
+        try { Move-Item -LiteralPath $f.FullName -Destination $target -Force; $moved++ }
+        catch { Write-Log "Bild konnte nicht verschoben werden: $($f.Name)" }
+    }
+    Write-Log ("{0} Bild(er) ins Repo verschoben und lokal entfernt." -f $moved)
 }
 
 # --------------------------------------------------------------------------
@@ -523,6 +562,24 @@ function Write-Readme {
     }
     $lines += ""
     $lines += ("**Gesamt zusammen:** {0}" -f (Format-Duration $total))
+
+    # Fotos-Galerie (falls Bilder im Repo liegen), neueste zuerst
+    $picsDir = Join-Path $script:cfg.RepoPath 'pics'
+    if (Test-Path $picsDir) {
+        $imgExts = @('.jpg', '.jpeg', '.png')
+        $imgs = Get-ChildItem -Path $picsDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $imgExts -contains $_.Extension.ToLowerInvariant() } |
+        Sort-Object Name -Descending
+        if ($imgs -and $imgs.Count -gt 0) {
+            $lines += ""
+            $lines += ("## Fotos ({0})" -f $imgs.Count)
+            $lines += ""
+            foreach ($img in $imgs) {
+                $lines += ("![{0}](pics/{1})" -f $img.BaseName, $img.Name)
+            }
+        }
+    }
+
     $lines += ""
     $lines += ("_Zuletzt aktualisiert: {0}_" -f (Get-Date).ToString("yyyy-MM-dd HH:mm"))
     ($lines -join "`r`n") | Set-Content -Path (Join-Path $script:cfg.RepoPath 'README.md') -Encoding UTF8
@@ -572,6 +629,7 @@ function Ensure-RepoInit {
         @"
 # Spielstaende sind Binaerdateien: keine Zeilenende-Umwandlung, kein Merge
 save/** -text -diff
+pics/** -text -diff
 *.bin -text -diff
 *.raw -text -diff
 *.dat -text -diff
@@ -713,9 +771,9 @@ Load-Config
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre"
-$form.Size = New-Object Drawing.Size(660, 678)
+$form.Size = New-Object Drawing.Size(660, 710)
 $form.StartPosition = "CenterScreen"
-$form.MinimumSize = New-Object Drawing.Size(660, 678)
+$form.MinimumSize = New-Object Drawing.Size(660, 710)
 
 function New-Label {
     param($text, $x, $y, $w = 120)
@@ -758,6 +816,11 @@ $y += 32
 New-Label "Save-Ordner:" 15 $y | Out-Null
 $script:txtSave = New-Text $script:cfg.SaveFolder 140 $y 400
 $btnBrowseSave = New-Button "..." 548 $y 60 24
+
+$y += 32
+New-Label "Bilder-Ordner:" 15 $y | Out-Null
+$script:txtPics = New-Text $script:cfg.PicsFolder 140 $y 400
+$btnBrowsePics = New-Button "..." 548 $y 60 24
 
 $y += 32
 New-Label "Dein Name:" 15 $y | Out-Null
@@ -812,14 +875,31 @@ $script:timer.Interval = 3000
 $script:timer.Add_Tick({ Do-Tick })
 
 # Ereignisse verdrahten
+# Moderner, Explorer-artiger Ordner-Dialog (statt der alten Baum-Ansicht).
+# Trick: OpenFileDialog als Ordnerauswahl nutzen -> in den gewuenschten Ordner
+# wechseln und unten auf "Oeffnen" klicken; wir nehmen dann dessen Verzeichnis.
+function Select-FolderModern {
+    param([string]$InitialPath = "", [string]$Title = "Ordner auswaehlen")
+    $d = New-Object Windows.Forms.OpenFileDialog
+    $d.Title = $Title
+    $d.ValidateNames = $false
+    $d.CheckFileExists = $false
+    $d.CheckPathExists = $true
+    $d.Multiselect = $false
+    $d.FileName = "Diesen Ordner waehlen"
+    if ($InitialPath -and (Test-Path $InitialPath)) { $d.InitialDirectory = $InitialPath }
+    if ($d.ShowDialog() -eq 'OK') { return [IO.Path]::GetDirectoryName($d.FileName) }
+    return $null
+}
+
 $btnBrowseDolphin.Add_Click({
         $d = New-Object Windows.Forms.OpenFileDialog
         $d.Filter = "Dolphin (Dolphin.exe)|Dolphin.exe|Alle Dateien|*.*"
         if ($d.ShowDialog() -eq 'OK') { $script:txtDolphin.Text = $d.FileName }
     })
 $btnBrowseRepo.Add_Click({
-        $d = New-Object Windows.Forms.FolderBrowserDialog
-        if ($d.ShowDialog() -eq 'OK') { $script:txtRepo.Text = $d.SelectedPath }
+        $p = Select-FolderModern $script:txtRepo.Text "Repo-Ordner waehlen (in den Ordner wechseln, dann 'Oeffnen')"
+        if ($p) { $script:txtRepo.Text = $p }
     })
 $btnBrowseGame.Add_Click({
         $d = New-Object Windows.Forms.OpenFileDialog
@@ -827,9 +907,12 @@ $btnBrowseGame.Add_Click({
         if ($d.ShowDialog() -eq 'OK') { $script:txtGame.Text = $d.FileName }
     })
 $btnBrowseSave.Add_Click({
-        $d = New-Object Windows.Forms.FolderBrowserDialog
-        $d.Description = "Ordner mit den Dolphin-Speicherdaten waehlen (der Ordner DIESES Spiels)"
-        if ($d.ShowDialog() -eq 'OK') { $script:txtSave.Text = $d.SelectedPath }
+        $p = Select-FolderModern $script:txtSave.Text "Save-Ordner dieses Spiels waehlen (in den Ordner wechseln, dann 'Oeffnen')"
+        if ($p) { $script:txtSave.Text = $p }
+    })
+$btnBrowsePics.Add_Click({
+        $p = Select-FolderModern $script:txtPics.Text "Bilder-Ordner waehlen, z. B. ...\Load\WiiSDSync (in den Ordner wechseln, dann 'Oeffnen')"
+        if ($p) { $script:txtPics.Text = $p }
     })
 $script:btnPlay.Add_Click({ Start-Play })
 $btnRefresh.Add_Click({ Refresh-Status })
