@@ -43,6 +43,29 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# --------------------------------------------------------------------------
+# Kurzhilfen (Tooltips), die beim Ueberfahren mit der Maus erscheinen
+# --------------------------------------------------------------------------
+# EIN ToolTip-Bauteil reicht fuer alle Fenster; es merkt sich pro Control
+# einen Text. Wird weiter unten mit Set-Tip befuellt.
+$script:tips = New-Object Windows.Forms.ToolTip
+$script:tips.InitialDelay = 350       # ms, bis der Hinweis aufgeht
+$script:tips.ReshowDelay = 120        # ms beim Wechsel zum naechsten Feld
+$script:tips.AutoPopDelay = 30000     # ms, so lange bleibt er stehen
+$script:tips.ShowAlways = $true       # auch wenn das Fenster nicht aktiv ist
+
+# Haengt denselben Hinweis an mehrere Controls (Beschriftung + Feld + Knopf),
+# damit es egal ist, worueber die Maus steht.
+function Set-Tip {
+    param(
+        [string]$Text,
+        [Parameter(ValueFromRemainingArguments = $true)]$Controls
+    )
+    foreach ($c in $Controls) {
+        if ($c) { $script:tips.SetToolTip($c, $Text) }
+    }
+}
+
 # Eingebettetes Deko-Banner (Base64-PNG, 192x64)
 $script:BannerBase64 = "iVBORw0KGgoAAAANSUhEUgAAAMAAAABACAIAAADDDu+IAAAACXBIWXMAAA7EAAAOxAGVKw4bAAAgAElEQVR4nO19TYgcSZbmV7MR8AyUYAaV4AabS1qDFlygAg/YggjYBsUxG/qQukl9qpzDMmqYXboGdqiqw9BVh2a6DgOdBdN06rBs5qGg4tCw0VDLhqAFkVCC9IMG2YCatQQ1mEOJNYPOxV5DNOzBPf7yTyllqlS9XY+iFOkRbv6e2Wfvz56Zv/V//tcGXh/JjEid9SVzQKyussHowfHlGrzcEy9PsXTMfCFGjKRMX+ZZHFN0FS72uAvSX11hWy9NryDJ+bcQvTIvZz8xAunqm63bdv5C6CGSeXZJ9AAgKbIioyvtpdcNoPN5fYWpcJWz52IPZI7V68AQxxCrC+hLoizPSF6VFhTySjH01syE/Wine1WNHqP0Bob9DdEp43IZ0U80963px03jb5tDAK3Fq4nuXeVDFAQ1M/c1mJZvjsSM+0UxxBvg5BSaacYpttI3ADK2wG79sXX+L1+FCEI1cr0u3+E1UIOSGUS+Jfh4IYnjH+aML2PrNQGrBVyR70nA1Ex/m3Hz5wqUV6BlbDV/1WNzdZBqUZZfqgECxLfORAlCpqAkEUEqqBM2KDCYwQkh8uFVB/7fahLz/88hdQk8XcKELZiqbwkZDbNOWiM7EbIIalQPA4lTNv+GAMQEX8F6vkhU9P8biUvh6eUBtKBy3jh6BDWc5Ia6OUg0FwmCCLTo/y7fV/+TGAwwQ1CSArmhKuDA/oXppGO0iKcLgOllAPQtUDkzxMwMPBE2CqpVjiah5Mu1JlA3KAD4CKi00aMHT2APvzUR8xukE2A6iaSLAUi9SZVzEjSLVKNHkdAvA51TSUtoCBdx60ZKEX/ReugkCUA0SEqRZ97kiwCk3oyD3IDmAiHSVaFn3iDBMbSmw/idEjpOmUQFgPEiAL0Ja3Vx0CwSA4GTvrpwvGIA8P479AAAEQpDJoNeiEuSJ2Ub9+gEgAhCAYRMwWQEQC8v4XmPyHCew1Vo+PPN00Vo/wlu3cCTKr2sA3SSAsPHBODBk+/sFwBkEps9UiSImlQINWGsbD4dA1CnR5mByaCa4WximbkVY+QGzAkg5zEq2ftX4ezVlM2pZA85RfQKApKvIEjI8+KvM2mGnu80z4w2CtIn3IMaD4mawasBlJh5YyPLe6Aabmdlp5uLIjCIkEncH76EKrpC3CzSYcThA16XMIaMTouRgprKOZtDZ5EiqEzUMLp1A5miB+VLY+mUTrukB7nMwpVW8ryAMgml8ELnshWt48gyQ65zI8UFVzUUQRGYRWEwelFHvybcHKPDiMOSH5TIJLQkKaAkKqQmqchQ2Ys5qGHkI3KdrMMsrzjvlhP98zpqkBZaP+MvPqEpp39fFcjqdvhFU6DFkQHECjK/KHpmdP7vvxncnKQqoloOoLo5FQaJX2DXZqlqrv8gSPmtW6VpiE7wRUv/zmE0xcHL2ubIcB4EmHOV0KsvZQQGc3LVcb7eFG7OIes4N+RiUiQk1anqZRIAwAmBETkBsH4Koz9POqYyT6LqIpAaW84UEMVJDCktSWXs46sAiBmewZyGY7ipE/0txE1NRGBgMOZeTkKnqtEwIFrglevIAAA8wzq48GfvTDPzrPKQGYFLLYvmu3oKzezgGXiqIgZj3ijAEJnEsQVGkoqkejkAMTdzNCSM9mEd41sGHVqo1liKH4Gx4wMHrUhKaAKQ6txGYHBCZASGD4jfpKf6OunAf8xsc/2homLsfsR4Iuh/SFrIysw08Uk8Tfugitjb534OGEQIeQJGLwYQMxLAjMgAUkjYL3FgWRCEfPO4mSHmGFxOJQZcYASUr52vN0+RhwBKvwUoIBBw4D7p578484ZT8cRgxrDksUUvx7pGRUBgMwXbHEAuJI7NMPDcpZ8q9gDnYCv2Hm8WOi+FmL9Y8tHNPhPCXRMlYduObbXHKQBRiq7J+uc1Me1hApjBwMgyl8gzkoikkGXAIoBGJWtOdd6ZGSEAQGSEyIuOzhuBDtHpVuk7ughtmpjVRS8KZfh5fTGwfwGAFmg+aRmOmT00ozgGoNLCMp+l3L9R3AQLLgEQElCnYojMJuRlN0a9QWpmsyBMs+R1wpMTn5LUeVVy1ciFgaKxUdzTSExVgplOOU1cTuefVr1XeUCtlsR8X9CLfaCrgw4jBQDNYhuA5BEfAAB7qvtQdgGEOKySTcxx2rEaMgeouNJNI98USQUl55mDWe14mIaDAMAIkWO47LMYkTHuas6p7rqliGDxsw9DQnZxJXQWnQegq4FO8lQNAC8bXYIIw6QBED/ZlAOjUWcZImEcxwKc554IRqD5gnF7kJgdMb/mvO/Vk9ZEEhLQApLmSyszCpwiwwPISNBlqwAkGQAuUp417Sz2V1dyVzID+5EO/BMb3nfhRj//75d54ukAuix0whhsiSsAknxPjvoGVKNBwHqgXmqZQQQAoAADd0prhLt5HNpL8PON0MnEY6aJCLmCWcTN8m8UCQUYwMVkAUlURT6/koZOYKxO+bhqZMP7AMqAXM4t1ycDDWBrw2dTP/KWZAkMPSm67G7S4wC6Aq3jd7o02ChcU0FyIomZv3zRRS5peDmmLkl8TPGJi3ktBClg5IU61EgRkRCgMvKRT2T4F5hZbi8Ea91dSRt13F7TwMmO5luSXSREIMB5ykzTaARGnjTdLsxlvYIFABHE5Z3UMO7SYKvvXiVWik3oZysCoCTnGrtDbb1kUmTy122/llAiwEBKQ7AXauvV27zAeuSMCilyiYMqARSriyY0fTXANOuz3BoDMJK37njrqGsYgGNUTGNPDGTqzsUFOYsWAKSuIBSguL956zT0MMI0F6AMrIW1ygcJsK00EX7+k4Mfb/dCmLuRQoh/fO/ggdUpJaECXV2CeMnWnKZLUirZbxNtMA80hRAA0sylovdeapLFyAo0rpKR0HShCiUCNCGmae3WBYjTvCarUDCS9z1lgmeKPiNkedOWjVSGhhHr39fyiwtLs/xQrkdKXOnW5uQlOaWBiN2hjqB7G25nqPetTmlu1Xd/brcHnRBmu+bTlKelDivWvTIzfvHKlV5zuFzQ7gBgBwTm3ULGG4pHfuBj7T683JSNDBdZg2yCRZJiXteHqTyEuXMdOFUMF5rNRi9LucJGFgGwWlLWjuf+UC55BiDA2TgAwBwkGS37L6XhOVYkTUsayZ6ZmeQAmQOQIp1aTi4lAxosATCDAC17MRYLTbpcOgCffpEfWAAoDMWERfQACA7d3NXJSaOSlgwCIv7xvQMAc9AskQCHixiDV4HLSaKsvvmGYgC5it5nAAJvExtBmxfXQ5ERK5YEIgRQPNM7nn8R+Hg5ymk/j08OP0YqjfAdBQAHngrZxLmOSYPreMRGWQZsTXOJvNCDuULpP64/e0CZg6aD0/LvziJmILUo05QBnOCbCEhI5thYDFosDGACQmx0F/J1cJxui6b6Z8KQR4Q9FLMe2ej4QvsiB+otfxoA7pqFjEft+hCqCO8BC+spsBCg9za8lEgJKaVG/BNyvSxiliSaJukXKYWBoaHWzWAkFyThrkFiVIhj7wS99JlusSkB4MOT/NCcJeZT+DmDZAxlrsLGNFy/Jec6KybYQIt9tevkpomG4CIA9DUb4gSUQU7ZaPKKjGYHz0XAxMxTE0YiMrg6GSEiN/OwzE/PpNMSSsBHqhcZGvmTV5Kdn6scTiLPOZMAUFoAiPu4VcBVGIy18/N47Bf37OjAjO0Sq+/BGx28JyEEErPdnn83XfdjnZPpn9/pBEgJRXRWPBQTAnMVkVLJvNPREQBx2hiwTcgj2IThhiJmUA5xupJ8wZw941tetM2Lg36+SAlE2oYQs3mYu/iERStZf9hzUhPqKhVDXO9eWqQQrFJLByUsgWl6KsOSHHMAAZvSLPrxdMD9Xj5kd+iRawBIHr4EDAhY10gwoN5SYMQMoHEXAACuysYHaXu41OOZdkhYRA+AKlL3hvMx1zICpFXMdFIa9zbcnW7D+snjD2PCyOsyOOpsndrhBJiswU1T6w3IRQ0ERAYRJJMmuFi4qIYeGzr2RwyPukfJwTNGXgKHgIfUYA/o17Uwxy7VJihZoY9H2il6a3/M7ACMKrmZNf3ywNK4VL0ivJdHAJZp4Objcy+PNtLIEwG1OdOEn+QxMizT2I+tHRP1OvkvTs3j8PxUhggugcP68hxAVOFe0RvBVjGkIdgh72hDajc+SRI32PhR5H0nC0Ifh57kBU6jYrBSACCEALCeBUUwGWsFCAegTpgq1aSLOt0T6UJCs1nHnzIpNcHAb/uhdR2Y4vjXQJ4RCWiCoeUKsuVGANiYXIrgHSAFpl2XdSloAAYgkIFLdX1rSuHvOACcSN8VtPnCTngFSvBIpRJcaIz8pwCgumJqZSo/5MbDgQ24n+SmiRJwkeDxJKNbOQPIifsaNpBn9DUTUEguJA+sHJSylzdeUUbIiHPiHSeZz9xkQwBhKGkHsCAmSOAGQAvlHDbkBW2iGI7KQx8YiIHXjbxHHa4giTxFIuhITB+epWElIc8Ztx0ARcgNQ2K3OCWL3Oue3sJs5X9UMYDIsJ7q7uguT3fblCghwIEtcBxAkkAChi6QyhOgWI3tFuoKRoYmLnuke0y5AjDyMDG6mBFxTrGMEgCSh7x4lufixIIrEk0xshbwCeAI+NqFNPkWAO8ag56rJmJ/rxuHEj0TAUTAM9XoAVAnfrqSmWFLAQ9FPIvtARxECajiDPWT0Q5h+5RBpwUAHfpGEzKn2rPzPqznGYGoPoRgmsggorN6TStAngkOMFwAABe5NsAuoIoE4CCo8wPXMbBz9rd9CkjMp6VaTtRszz4lAk9X+0HTVZSOijnxQSAmMYAYjuW64htT5/C2roeHCex4GOyI9F0hr1APMeJ2V865ziXnEo5LxzxTeCbfMua296NQDbpyPPvxRj4TBwNHC402/hUR7m36nZFen8aRFWMcpUOvKD4QJ6JLibGkj4DTNRMtAihxs6RiXVREigiAqtcj6uxFSQAinVelbz1TorJqQrX9qQxjf9lDRomwYfymgVpwu5iRExCx4wZlVcD0ZtwCqJP4AEJMipARC0QkTwg1bjxDzCOgxkYaCgxEyJEnzwQgeLLU+ADkA1veKFJUogP+wkshr/ig7ZTIE2uCZ5SONvJGEwtaVrEktdlENQ8s6tWP2YJX3QIAyUoQd6dBviT8ZKMBxH6kkScAUmsx24NcB+CMwv7IFwdnMkq0lEgUwPanI22kzihUTEQhHg/gFBHO8CRq+vFYer7kWtoplOv0RZ+XvN9F0ijY7/Mh5PEaFxesoVEmwFBnHtjCfODGisvbenoezpgNxzI3RGAmAD0VNSEfhtzBE2nLBxtxKA3UBxcxYR8o5ZDKBMtMgASqhW/v0KcMOeCtFAdIHmAbSGnWBJ0zAMsUEoB9gIEwc4ZCtJxCrcvrBYpc8Sywn20L0CBScxVScQMyAIXkGkDRf4Hig+YqQcLqcHtrzAcHeHAX6ZRFJEEyw7HF1Nt3eutGMvNwaCsfmBkxzfrH2epEK98Q/arPS4uy/vixISaDtE94rquHEiPwqC7YqpMfgvSx/TyBnQAA7RxrHQggz/0hWaLNCHi/cxs2KRelT2RSyB0A6HrALMpcEuxJ1J4kSShY5AIeMEo8CGk4Ndi3aFTwrgIX2Pso9ROoo9gzzeJwAggMkIb3wQMEPX+iZ+y5edfUWeZ+xnVX6Kg+MH0uaGAb+19GGnm6O80rLpL3I637ADJ8qt32x05Co+P5xi5GhgEcLGSqiaj2BlrgVCsVIlo3EoCS8uOf3nMuQJDJhHNPAkfU9dEvWs68Qn+yp6cZS81KNnnEgzE/cAUJBUDC3u4GMgCgNPSh9XE7oxFweuVHYn8yD5wAsAfU2CvosFUSGI1zGcH1qVOINlJuRJ0GoR5AYGPgwHEo1AbovMT03xi6oZAA52CEEMD6wkqXEaVSDA8d/a/ULggD9AO0ZYrBAX5dRAC5gJGSKGdW3m8LtTl7KKkeh8YN0mZLMG3b7XrNpBvk5r3uttsfexr7pbxijaHaxpHq6ayvVYcQM94CbNAEC0jSGcHFLY8Dhg2cThw32arKQ2DqCBAA5HmHlESVAECQudEJByMcu+8MCtAzt/Qk5TqpqVPbnZYWGIKZ2iZz+nFEzaXhEA73SDWrZiyL7VF5rz+uMWRQBm9xRpLvHKpC4yGPvOpLn4NQgBSQz/PCuWSFMN5Cnmkl2PnkmQGQ3jofPQAeRPxAQQA3DADU02IWL6vaedeo13MQISkqcAgWnAgQggXgAzF8ThakYrpVP1TJvLdxAOBgdJvZSX3b5PeK0XDT3tgl701QUMjUySIrZbZ2/X4untSDrNc3te5LjCX/uHEEy2l0yaj3x5M7fVinJow5M1IZTSSlyQAQiXpLBhEp0oE9ACkE5fmZAAFumyiVB9CfqsjFwkJbYux0DDpTrk9Bv8z5sMHC8ibAXfNFL+cQMNjvSN39Yt8uLYy8PGWKKXFkIsD1SPahlWKkkWvC44KyCPYcDhK2SwZJM60JFnQBGRJCmh14AgX0tPhsWnlYpFGzGlOHGRED5430uYJi2EAJMIQ0XU92IWRiQKgifhKbNCdM52MASuYAECNcuqdyilIVCsDdotA7wXv3Sd8BqHFm8nvO7viwBwQp8gw7xJ+eI4RVSKcdT7HoRDO7AAVWDEARPIPDfIJtbm5oYygzJWM0S4PP1pQBKNrIQm5OU1KMwQCetkAgDabuXulvxb1O96JGz3qWUhMPewWDoRS2Ng4+HeZAHtwYhCeBaJ3BJ/YtL3K4eHFBGUuCBFceAIYR+y4RkKvm5ru6V5Lftc3EUfBQ+pBzqpOMp7S49JjA7BzDKBJNDmHRm/esVR0k104Fo9C+zkXZ+bI5jG7urJiIkdFYYixps8I9hm6gAwDodynv92SeV0P/ZOgASNLGaHZuU3XK9Tu1o4M6F5BvhTjO5UfgaS6AAQLLqaqcSXLGQC2E8UDCdDsPOE2P6KyzQEpp0hlzBMdC64zAwMjhMA4TKkFdKIOozzrO01l42mL2m8VQEmxF+/H2A7fZyYcnSxaXaKrubAVIGO3BgFwcBPmJBQikGQAnpsbFa7ojJgYg59vmwMycQAk02yXP4MSBsWMJpAAoSt5T5RnCB4SuzlNZueCt9hKMENeFg+5VuMtA4hJsQeuz+AjgFMdAJahbkdmv2EevtVQkSGLbjjFVHvtebyg/g59lRHA9eIk5lzngmGET5DTPNXvvCsc9SnsQmyw/nJV+kqpBILM7OjhGFZCp4l6hc85N/gnNquhjiiMBX2AwM6iznrGE7WG8t9G0mWwcL6S6GPONJAtRGEdwTCSdHZu8o0hExMTBOQ8JonpNGQzWBNKCGR1+YmPFBMY+BS8AG3XntKRT6RSAzWJYz6Se4iqMPffHB9zrUEh1DoNdpAAFwHoJMBFHTswREiDKmUvX6+WjGlXWEREFrkiBcswqJTgBiUnQwoZ3xBpYIE5N/MMAN0dtNSATqOuNPUNKisqhU0lpTByXnVzf7W4c7H8hpPPze8cZehGdhC6gwIeJWcgewCmOaown3gf8roeyD7rFJgjDaicCJr8HMomH7z94MiT+aZ9c4mGFSlJgiHrBjtFTas/7Q3CKzBIckZihAJ4LQmlAacTqQ6aNFMfa29GO7d2V2Z2O6Wv3hTX3emAmTSWHhLGgHtgl3lcYUxrGJtBb6hkQPlTYLuNmF2ML7sMQKHBdFccL2nYOIJ1JIIGT9z6GikiOHlgkLnoNDAXlIEUyueiJCGDHFc+n+iEQyiDvRj9zemqY2oAAidkqpmxcxQDai737B3L+/gFZHwNKIg+S95oxrxsr2cdSU/HpsNc1BzGoA99VChWeEM2BMp8iJ5Qhp1M2YMWFn0kJiXpyRQAwWO8YbUx8Ep21ZAgGWZJ+tr2kuXesMQZMFP0EpDg8nv3mQ9I0HuyMyx0UGkhF//3EQ8X7Mo1FjtEuRswAihyCGUAGKAupiDncIuUO3WEGIhBBni5IpPA+4VOIDW8DOLmRy+50KJNu/wDiwNxSAFIA1GHiCgg67WHqXZ/aM7KAL7FdQefNHsJ5ry78dg4gRQtZfg7MYX80klL1ek3h/heDPUVab3Z9ZBARKHAsFs8lVFJQ78Nx844ehmCQJCkEeT7MJQ1Lc3fDNaiqCiYviVT/lEwuwVNcDqgKcqULkbQsbCgACOE9RsYoaa70jYIzb1eRCJodmU7uRh4gRVol5OKsKGIEkkwbjFPiMnPvg8H2Jwje3Mh7dEBcAoAwMHA97wP3Oqa7IHFhjJAyRTaGcmVKPm2/ygnSZHW3y4Hy2x0AsYoq19Hz/v2DlJg3dEdKIEoe1Eyd05TpYzs4EG129HEHUgY5VUFv/e9fNeP3xKVO//bi7z79dChJbt4plBIAdnfHzsV7H98x+XkPZg4xsFS0+KbIvcGOtUxkwI7gI4yUhtn2u3m3d9G9bZX3o/2R81VdDykldTpFN+/8uWwW23flx/tf3Cs2NvKl3KP19pMHg19s/o18ne/WfAXadyWA7okyB/Yl4pO6Subf/O0Pr9dXr5lVfeM/kpL1f3t+VNx8+3tr+arR196WrWvX+C38+nePOu/eWFs4uNV5t/d4+M7qWqs1PXWxJX79+4eBn5uF6tQWvfXl17/lyG1aQ8tMJhPg96T5McWevj67F8DQjh49L2+uLoXH2+PdP03+lK9dv5m/8+/XzLs3b+bX175k+4N3vn/t2rzTS28Hj798d+2dxXv37PDZ82fXV+fMMIeffbW31lJqZX5vLci7q2tYZMaNHh6WhT7OTLvV1iurxxp8Z0UTrcwuWm8/X2ZmTem3WkzAIjNA+OXjL/+2+KFWy736u+E7au1Yzzz8/Qlmyt02jjPzT1/tfW9FX1tgpu6ZxWECMHTDp9Xxnvmnr/b0tGfWlF5T2nn32ePBu6tmdu/kqGJ+VpfHzAH0yzju3fxh65oC8UfjzzD5bYTVRuV5v7Wy8uzo+d/97v7Rv+U/yMdrK3KV1gAM7fC/jH75+Pnh08mjd1dvUmsFCNvlXvn01+D9I35uVq6jJVx0/7C/+5Sfv3X9+fXVSesoat2arD4f/uHp01g9Onp4U+WKFICB2/388efXJmWMj6+rAi3BHP7Tl588cP/yVXyk9cRQfm1l5euj3/31w38+DNXD+OD6tbf1yhqAfT/82YNtTY8r/8is3my1VpjDP/z2s88fP3z4/LG49uymehdAjO4//3Z73/3r6PkjLcmsGABlHH3y6H6bH1Xh4drKzVp3bpc7n41/U/qnLJ6+u5oDgtn/1y9/9hv3L8On+0L94aZ6pwbKJ+XPjp7bGL7U6nvXSAMYuOHff3n/8fNDy1+9u5pTawUctr/67H758OGzx/GtZz39LgAX3X23/fiw5KPRCqnVFQNg5EcfPbj/6NnvHj1/9O7a9WstBWBodz4Z/6b0T218/H19s9USzOGfn33yoHw04S8FJrpmJpZ//eWn5bPDLw/3O2vNMJVu+OOH9x/7w0fPH39/LafWCnP4b08/+/zpQ46/xWQ+TH//1fbDp/86ePrwhr62tmIAOD/+aP+Xj54d/s/fP/oP+no9TJ8/HnzNT9fEtcmzam7CtsLY5HpT37lfDjNys2xORKcwxX23EyLlmdAq+SA64tY6xdKPBpUiJJUxge6Y2wN7ENl1JU/zbEaq/sDvBmaw6uWJIWTo9hQO/HBYUUxCmwDgPXN36A5sVW1kYZpUUlLd2fM7DA6RegZEYH9j0+Rjt1tGskFIHQRh02y6WA2t7cpQsy1A62Zr4IcVuxnbzGZT9kq3+4R53ytSSUm+pfsABmVpKNUbqQQoN3d3/ahilxgKKjcJrPtyw7qdAJ6J3NUdTes75VABM5E7ZnPoK8vjxKhFJoiC7kQ/9OxmIq+T6evefTsMETORc923QT7gAYCZyAXdjX4U2M1ENlJtmjv37Z6rMBPZqJypt+N2BGEmckG3Y3QhjB2jFllL3DG3R35cHsaZyJoMqf59NwCFmci57HFFIQwZmIn8nrm7Hw9G4/KO1nczw9WCD3TXj6Elh+m5uAKGkiF2TK4ZUVGYBCCwED5IQmR4JsdQGSemGMVsc4FWaZ2giQeVIkrMop83a7reISeuGAnY90qbkBgciVPzaCmSIRjJo4qYwIw8E0YnAM6hII4MBsZRkQwAmOkibHsvDALqIjWmAFCzfWDKtoChlBEDKGN9MI7oF9+JfFxk9uGOVHeVwaIT/YODMd2oi59R5MkeinlsLEBInAQJKAlJsA4k5s5rZCABIiGJOtPjFpJBpFItrVaQEj4iLpRmLN4rFbSErRZ2uYgECKT6jAsww/uFTBqD0zRuOpdtLQGCcwv3AtPNcQlJ5AY+YvF8jIZtAf2dyMtss+c7pO5qg0UfaC8+W8snkwkm3Db/rn1jLbVa7ecREElmR5NJa/JWe4J0FNrPIwBcW0EvT2urk6NJO34NqZOSfPRHIYCb19Pa6iRwmxm1pTiKAiIdTdrPvwYz0EbvJsxqarUmlW+TSqtv8+QtHHH73etpTbd5gqMjNNePMGm3eYL4NY6OACA36cbaZHW1/bQC2klnRy9kO4Z2jACgNTomra1O/PM2vwW5GogmfCRWFd4x6dq1SfV/22hDroZWa8JHgtopfifyssgckUO8s6Kw+N74+sQyJesFgQZxpJLO5hViOmNtgtSJRIoBPoAZzkHqJKhe90jT1+2KyJA61A1CgAg6C1IHUgmpma/2UNTdDYCIkcD1K4WmwwDU24bS/F4BVwkA1gFIui7LfxHb0szuBUM4LyJDyiAIggDRZGGZBZBkFmbFsSS/E/mkyPNM4lwD/ZqftVULwOQttFvt3z9v+4jJpN1qod2aABMOoiW43UK7NeFJa8Jt/lM7xvZEpJVrsxYn8Wvx9mp7f1aTQ5M2MDkCWhA0abcAtPioHf+ICdpHR0m93dzbbuHoj0IS7CEiozWZoE2KJeQAAAF2SURBVDVpt8DcYhYr17jdAjBhFvwHtFpt9xw6O5pJcj7bogVBk6MjILUxwbPnuCbnXTaZtCaT9mTSthWANiYNq0dRoF1//k7kBZH/ODG8UmugBR/IjhdXlpGQGwRG5ZvJxAFSgwgxAgyT1RNiSgIEgMCh+VwY7DsggVSz0zvLwIzoUdxA6Rat/vTemsOEbgelndW6gVPz6KqCyRAWLbfARdmumjdmLDkrTanzlEMJRbBufi8pSPmdyEuPNhI/1b26mTmAXpqIsiJ7TScncuXjGRVML0tZsX5+HfcrE8cU7eELfkQgCRKAzOgFiebEsXrxoQoXaad6EVcXIw6nbOY8Rn/1gu/Pa57j66mS5piuCj0A4lKEc4WUoruA+AyuEB3Yv1AiQTI7b1mG6ALoAcdLd10CB0T3YvTgUgACODK7M/cyvmqjFxuYi7fHHMsrx1CK5QW0xSIbFfPZZ3NMSZA0OAmjGjoXQM/8RcuvRJzAHrG6EHRq+n/hkq7IPQ+AGgAAAABJRU5ErkJggg=="
 
@@ -722,24 +745,36 @@ function Show-SetupDialog {
     $tu = New-Object Windows.Forms.TextBox
     $tu.Location = New-Object Drawing.Point(110, 92); $tu.Size = New-Object Drawing.Size(430, 22)
     $dlg.Controls.Add($tu)
+    Set-Tip ("Adresse des gemeinsamen Repos, z. B.`n" +
+        "https://github.com/DEINNAME/ac-save.git`n" +
+        "Wird fuer Schritt 2 und Schritt 3 gebraucht.") $lu $tu
 
     $b1 = New-Object Windows.Forms.Button
     $b1.Text = "1) Lokales Repo in diesem Ordner anlegen"
     $b1.Location = New-Object Drawing.Point(15, 128); $b1.Size = New-Object Drawing.Size(525, 32)
     $b1.Add_Click({ Initialize-Repo })
     $dlg.Controls.Add($b1)
+    Set-Tip ("Fuer den ERSTEN Spieler: macht aus dem oben eingetragenen`n" +
+        "Repo-Ordner ein Git-Repo (legt .gitattributes, die README und`n" +
+        "den ersten Commit an). Aendert nichts, wenn es schon eins ist.") $b1
 
     $b2 = New-Object Windows.Forms.Button
     $b2.Text = "2) Mit Remote-URL verbinden und hochladen"
     $b2.Location = New-Object Drawing.Point(15, 166); $b2.Size = New-Object Drawing.Size(525, 32)
     $b2.Add_Click({ Connect-Remote $tu.Text }.GetNewClosure())
     $dlg.Controls.Add($b2)
+    Set-Tip ("Verbindet das lokale Repo mit der Remote-URL oben ('origin')`n" +
+        "und laedt alles hoch. Das Repo im Internet muss dafuer schon`n" +
+        "existieren - am besten leer angelegt.") $b2
 
     $b3 = New-Object Windows.Forms.Button
     $b3.Text = "3) Vorhandenes Repo von URL klonen (fuer den 2. Spieler)"
     $b3.Location = New-Object Drawing.Point(15, 204); $b3.Size = New-Object Drawing.Size(525, 32)
     $b3.Add_Click({ Copy-Repo $tu.Text }.GetNewClosure())
     $dlg.Controls.Add($b3)
+    Set-Tip ("Fuer den ZWEITEN Spieler: laedt das fertige Repo von der URL oben`n" +
+        "in den Repo-Ordner herunter. Der Zielordner muss leer sein`n" +
+        "(oder darf noch nicht existieren).") $b3
 
     $sep = New-Object Windows.Forms.Label
     $sep.Text = "Optional (falls GitHub CLI 'gh' installiert ist) - erstellt das Remote automatisch:"
@@ -752,17 +787,23 @@ function Show-SetupDialog {
     $tn = New-Object Windows.Forms.TextBox
     $tn.Text = "ac-save"; $tn.Location = New-Object Drawing.Point(110, 274); $tn.Size = New-Object Drawing.Size(190, 22)
     $dlg.Controls.Add($tn)
+    Set-Tip ("Name des neuen GitHub-Repos, das per GitHub CLI angelegt wird,`n" +
+        "z. B. ac-save. Nur der Name, nicht die ganze Adresse.") $ln $tn
 
     $b4 = New-Object Windows.Forms.Button
     $b4.Text = "GitHub-Repo per gh erstellen und pushen"
     $b4.Location = New-Object Drawing.Point(310, 272); $b4.Size = New-Object Drawing.Size(230, 26)
     $b4.Add_Click({ New-RemoteWithGh $tn.Text }.GetNewClosure())
     $dlg.Controls.Add($b4)
+    Set-Tip ("Erledigt Schritt 1 und 2 auf einen Schlag: legt mit der GitHub CLI`n" +
+        "('gh') ein PRIVATES Repo an und laedt den Repo-Ordner hoch.`n" +
+        "Klappt nur, wenn 'gh' installiert und angemeldet ist.") $b4
 
     $bc = New-Object Windows.Forms.Button
     $bc.Text = "Schliessen"; $bc.Location = New-Object Drawing.Point(435, 330); $bc.Size = New-Object Drawing.Size(105, 30)
     $bc.Add_Click({ $dlg.Close() }.GetNewClosure())
     $dlg.Controls.Add($bc)
+    Set-Tip "Schliesst dieses Fenster. Die Einstellungen bleiben erhalten." $bc
 
     [void]$dlg.ShowDialog()
 }
@@ -815,42 +856,82 @@ catch { }
 $form.Controls.Add($banner)
 
 $y = 80
-New-Label "Dolphin.exe:" 15 $y | Out-Null
+$lblDolphin = New-Label "Dolphin.exe:" 15 $y
 $script:txtDolphin = New-Text $script:cfg.DolphinPath 140 $y 400
 $btnBrowseDolphin = New-Button "..." 548 $y 60 24
+Set-Tip ("Der Emulator, mit dem gespielt wird - die Datei Dolphin.exe.`n" +
+    "Beispiel: C:\Program Files\Dolphin-x64\Dolphin.exe") $lblDolphin $script:txtDolphin
+Set-Tip "Dolphin.exe per Dateidialog auswaehlen." $btnBrowseDolphin
 
 $y += 32
-New-Label "Repo-Ordner:" 15 $y | Out-Null
+$lblRepo = New-Label "Repo-Ordner:" 15 $y
 $script:txtRepo = New-Text $script:cfg.RepoPath 140 $y 400
 $btnBrowseRepo = New-Button "..." 548 $y 60 24
+Set-Tip ("Dein oertlicher Ordner des gemeinsamen Git-Repos (enthaelt einen Unterordner .git).`n" +
+    "Darueber tauscht ihr Spielstand, Sperre und Bilder aus.`n" +
+    "Beide Spieler brauchen dasselbe Repo - jeder in seinem eigenen Ordner.`n" +
+    "Noch keins da? Unten auf 'Repo einrichten...' klicken.") $lblRepo $script:txtRepo
+Set-Tip "Repo-Ordner auswaehlen: in den Ordner wechseln, dann unten auf 'Oeffnen'." $btnBrowseRepo
 
 $y += 32
-New-Label "Spiel (optional):" 15 $y | Out-Null
+$lblGame = New-Label "Spiel (optional):" 15 $y
 $script:txtGame = New-Text $script:cfg.GamePath 140 $y 400
 $btnBrowseGame = New-Button "..." 548 $y 60 24
+Set-Tip ("Was beim Klick auf 'Spielen starten' geoeffnet werden soll:`n" +
+    "eine Spieldatei (.iso/.rvz/.wbfs/.gcm), eine Verknuepfung (.lnk)`n" +
+    "oder ein eigenes Startprogramm (.exe/.bat) fuer Dolphin mit Mods.`n" +
+    "Leer lassen = Dolphin startet einfach ohne Spiel.") $lblGame $script:txtGame
+Set-Tip "Spieldatei, Verknuepfung oder Startprogramm auswaehlen." $btnBrowseGame
 
 $y += 32
-New-Label "Save-Ordner:" 15 $y | Out-Null
+$lblSave = New-Label "Save-Ordner:" 15 $y
 $script:txtSave = New-Text $script:cfg.SaveFolder 140 $y 400
 $btnBrowseSave = New-Button "..." 548 $y 60 24
+Set-Tip ("Der Ordner, in dem Dolphin den Spielstand dieses Spiels ablegt.`n" +
+    "Vor dem Spielen wird er aus dem Repo befuellt, waehrend und nach dem`n" +
+    "Spielen wieder ins Repo gesichert.`n" +
+    "Leer lassen = Spielstaende werden NICHT synchronisiert.") $lblSave $script:txtSave
+Set-Tip "Save-Ordner auswaehlen: in den Ordner wechseln, dann unten auf 'Oeffnen'." $btnBrowseSave
 
 $y += 32
-New-Label "Bilder-Ordner:" 15 $y | Out-Null
+$lblPics = New-Label "Bilder-Ordner:" 15 $y
 $script:txtPics = New-Text $script:cfg.PicsFolder 140 $y 400
 $btnBrowsePics = New-Button "..." 548 $y 60 24
+Set-Tip ("Ordner mit deinen Screenshots/Fotos, z. B. ...\Load\WiiSDSync.`n" +
+    "Nach dem Spielen werden die Bilder ins Repo VERSCHOBEN (Unterordner 'pics')`n" +
+    "und sind danach hier lokal nicht mehr vorhanden.`n" +
+    "Leer lassen = Bilder bleiben unangetastet.") $lblPics $script:txtPics
+Set-Tip "Bilder-Ordner auswaehlen: in den Ordner wechseln, dann unten auf 'Oeffnen'." $btnBrowsePics
 
 $y += 32
-New-Label "Dein Name:" 15 $y | Out-Null
+$lblName = New-Label "Dein Name:" 15 $y
 $script:txtName = New-Text $script:cfg.PlayerName 140 $y 180
-New-Label "Branch:" 340 $y 60 | Out-Null
+$lblBranch = New-Label "Branch:" 340 $y 60
 $script:txtBranch = New-Text $script:cfg.Branch 400 $y 100
+Set-Tip ("Dein Spielername. Er steht in der Sperre und in der Spielzeit-Statistik.`n" +
+    "WICHTIG: Beide Spieler muessen UNTERSCHIEDLICHE Namen benutzen,`n" +
+    "sonst haelt jeder die Sperre des anderen fuer die eigene.") $lblName $script:txtName
+Set-Tip ("Der Git-Zweig, auf dem synchronisiert wird - normalerweise 'main'.`n" +
+    "Beide Spieler muessen denselben Branch eingetragen haben.") $lblBranch $script:txtBranch
 
 $y += 32
-New-Label "Sperre gilt (Min):" 15 $y | Out-Null
+$lblLease = New-Label "Sperre gilt (Min):" 15 $y
 $script:txtLease = New-Text $script:cfg.LeaseMinutes 140 $y 60
-New-Label "Herzschlag (Sek):" 220 $y 120 | Out-Null
+$lblHeart = New-Label "Herzschlag (Sek):" 220 $y 120
 $script:txtHeart = New-Text $script:cfg.HeartbeatSeconds 340 $y 60
 $btnSetup = New-Button "Repo einrichten..." 410 ($y - 2) 198 26
+Set-Tip ("Wie lange eine Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
+    "Danach gilt sie als abgelaufen und darf uebernommen werden - so bleibt`n" +
+    "sie nach einem Absturz nicht ewig haengen.`n" +
+    "Standard: 5, Minimum 1.") $lblLease $script:txtLease
+Set-Tip ("Wie oft waehrend des Spielens gespeichert und hochgeladen wird (in Sekunden).`n" +
+    "Kleiner = bei einem Absturz geht weniger verloren, aber mehr Git-Verkehr.`n" +
+    "Sollte deutlich kleiner sein als 'Sperre gilt', sonst laeuft die Sperre`n" +
+    "zwischendurch ab.`n" +
+    "Standard: 60, Minimum 10.") $lblHeart $script:txtHeart
+Set-Tip ("Hilfe fuer die einmalige Einrichtung:`n" +
+    "lokales Repo anlegen, mit GitHub verbinden und hochladen,`n" +
+    "oder ein vorhandenes Repo klonen (fuer den zweiten Spieler).") $btnSetup
 
 # Statusanzeige
 $y += 40
@@ -863,6 +944,11 @@ $script:lblStatus.BorderStyle = 'FixedSingle'
 $script:lblStatus.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(230, 230, 230)
 $form.Controls.Add($script:lblStatus)
+Set-Tip ("Zeigt an, ob gerade jemand spielt (Stand der letzten Pruefung).`n" +
+    "Gruen = frei, Blau = die Sperre liegt bei dir,`n" +
+    "Gelb = abgelaufene Sperre (darf uebernommen werden),`n" +
+    "Rot = jemand anderes spielt gerade.`n" +
+    "Mit 'Status pruefen' aktualisieren.") $script:lblStatus
 
 # Knoepfe
 $y += 52
@@ -871,10 +957,24 @@ $script:btnPlay.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyl
 $btnRefresh = New-Button "Status pruefen" 205 $y 140 34
 $btnUnlock = New-Button "Sperre erzwingen freigeben" 355 $y 180 34
 $btnSave = New-Button "Speichern" 545 $y 63 34
+Set-Tip ("Der normale Weg zum Spielen:`n" +
+    "holt den neuesten Spielstand, setzt die Sperre auf deinen Namen`n" +
+    "und startet Dolphin. Bricht ab, wenn jemand anderes gerade spielt.`n" +
+    "Beim Beenden von Dolphin wird automatisch gesichert, hochgeladen`n" +
+    "und die Sperre wieder freigegeben.") $script:btnPlay
+Set-Tip ("Holt den aktuellen Stand vom Server und zeigt oben an,`n" +
+    "ob gerade jemand spielt. Aendert sonst nichts.") $btnRefresh
+Set-Tip ("Notausgang: loescht die Sperre, obwohl niemand Dolphin`n" +
+    "sauber beendet hat.`n" +
+    "Nur benutzen, wenn sicher ist, dass niemand spielt (z. B. nach`n" +
+    "einem Absturz) - sonst kann Fortschritt des anderen verloren gehen.`n" +
+    "Normalerweise unnoetig: die Sperre laeuft von allein ab.") $btnUnlock
+Set-Tip ("Speichert die Einstellungen dauerhaft, damit sie beim naechsten`n" +
+    "Start wieder da sind (in %APPDATA%\AC-SaveSync\acsync-config.json).") $btnSave
 
 # Log
 $y += 46
-New-Label "Protokoll:" 15 $y 100 | Out-Null
+$lblLog = New-Label "Protokoll:" 15 $y 100
 $y += 24
 $script:txtLog = New-Object Windows.Forms.TextBox
 $script:txtLog.Location = New-Object Drawing.Point(15, $y)
@@ -885,6 +985,9 @@ $script:txtLog.ScrollBars = 'Vertical'
 $script:txtLog.Anchor = 'Top,Bottom,Left,Right'
 $script:txtLog.Font = New-Object Drawing.Font("Consolas", 9)
 $form.Controls.Add($script:txtLog)
+Set-Tip ("Protokoll dieser Sitzung: was das Skript gerade tut.`n" +
+    "Wenn etwas nicht klappt, steht hier die Meldung von Git im Klartext -`n" +
+    "diesen Text am besten mitkopieren, wenn du nachfragst.") $lblLog $script:txtLog
 
 # Beim Breiterziehen des Fensters mitwachsen lassen:
 # - die Pfad-Textfelder dehnen sich nach rechts (lange Pfade werden sichtbar),
