@@ -495,7 +495,11 @@ function Unlock-Session {
 }
 
 function Update-Status {
-    Save-ConfigFromUI
+    # Beim Klick auf "Status pruefen" werden die Felder mitgespeichert.
+    # Beim automatischen Start-Check nicht: sonst wuerde das blosse Oeffnen
+    # des Fensters die Einstellungen ueberschreiben.
+    param([switch]$SkipSave)
+    if (-not $SkipSave) { Save-ConfigFromUI }
     if (-not (Test-Repo)) { return }
     Write-Log "Pruefe aktuellen Status..."
     Sync-Remote
@@ -1027,7 +1031,7 @@ Set-Tip ("Hilfe fuer die einmalige Einrichtung:`n" +
 # Statusanzeige
 $y += 40
 $script:lblStatus = New-Object Windows.Forms.Label
-$script:lblStatus.Text = "Noch nicht geprueft  -  klicke 'Status pruefen'"
+$script:lblStatus.Text = "Noch nicht geprueft"
 $script:lblStatus.Location = New-Object Drawing.Point(15, $y)
 $script:lblStatus.Size = New-Object Drawing.Size(593, 40)
 $script:lblStatus.TextAlign = 'MiddleCenter'
@@ -1096,6 +1100,29 @@ $script:timer = New-Object Windows.Forms.Timer
 $script:timer.Interval = 3000
 $script:timer.Add_Tick({ Invoke-Tick })
 
+# Einmaliger Timer fuer die automatische Pruefung beim Start.
+# Warum ein Timer und nicht direkt im "Shown"-Ereignis? Git braucht ein paar
+# Sekunden, und in dieser Zeit waere das Fenster noch nicht gezeichnet. So
+# erscheint erst die fertige Oberflaeche, dann laeuft die Pruefung.
+$script:startTimer = New-Object Windows.Forms.Timer
+$script:startTimer.Interval = 200
+$script:startTimer.Add_Tick({
+        $script:startTimer.Stop()
+
+        if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
+            -not (Test-Path (Join-Path $script:cfg.RepoPath ".git"))) {
+            # Erster Start: noch kein Repo. Hier bewusst keine Fehlermeldung,
+            # sondern ein Hinweis - der Nutzer hat ja noch nichts falsch gemacht.
+            $script:lblStatus.Text = "Noch kein Repo eingerichtet"
+            Write-Log "Noch kein Repo eingerichtet - Status wurde nicht geprueft."
+            Write-Log "Pfade oben ausfuellen (oder 'Repo einrichten...'), dann 'Speichern'."
+            return
+        }
+
+        $script:lblStatus.Text = "Wird geprueft..."
+        Update-Status -SkipSave
+    })
+
 # Ereignisse verdrahten
 # Moderner, Explorer-artiger Ordner-Dialog (statt der alten Baum-Ansicht).
 # Trick: OpenFileDialog als Ordnerauswahl nutzen -> in den gewuenschten Ordner
@@ -1157,5 +1184,7 @@ $form.Add_FormClosing({
         }
     })
 
-Write-Log "Bereit. Pruefe zuerst die Pfade oben, dann 'Speichern' und 'Status pruefen'."
+$form.Add_Shown({ $script:startTimer.Start() })
+
+Write-Log "Bereit."
 [void]$form.ShowDialog()
