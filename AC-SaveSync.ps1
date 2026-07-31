@@ -414,9 +414,10 @@ function Start-Play {
     $script:lastHeartbeat = Get-Date
     $script:lastAccounted = Get-Date
     $script:btnPlay.Enabled = $false
+    $script:btnStop.Enabled = $true
     Update-StatusUI (Get-LockState)
     $script:timer.Start()
-    Write-Log "Viel Spass. Beim Schliessen von Dolphin wird automatisch gespeichert & freigegeben."
+    Write-Log "Viel Spass. Beim Schliessen von Dolphin - oder mit 'Spielen beenden' - wird automatisch gespeichert & freigegeben."
 }
 
 # --------------------------------------------------------------------------
@@ -444,7 +445,11 @@ function Invoke-Tick {
 
 function Complete-Session {
     if ($script:timer) { $script:timer.Stop() }
-    if (-not $script:holdingLock) { $script:btnPlay.Enabled = $true; return }
+    if (-not $script:holdingLock) {
+        $script:btnPlay.Enabled = $true
+        $script:btnStop.Enabled = $false
+        return
+    }
 
     Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
     Backup-Saves | Out-Null
@@ -467,7 +472,83 @@ function Complete-Session {
     $script:holdingLock = $false
     $script:proc = $null
     $script:btnPlay.Enabled = $true
+    $script:btnStop.Enabled = $false
     Update-StatusUI (Get-LockState)
+}
+
+# Dolphin aus dem Programm heraus beenden (Knopf "Spielen beenden").
+# Erst hoeflich bitten (CloseMainWindow = wie auf das X klicken), damit Dolphin
+# sauber herunterfaehrt. Nur wenn das nichts bringt, auf Nachfrage hart abbrechen.
+# Danach laeuft alles Weitere ueber Complete-Session - also genau derselbe Weg
+# wie beim Schliessen von Hand: sichern, hochladen, Sperre freigeben.
+function Stop-Play {
+    if (-not $script:holdingLock -or $null -eq $script:proc) {
+        Write-Log "Es laeuft gerade keine Sitzung."
+        return
+    }
+    if ($script:proc.HasExited) { Complete-Session; return }
+
+    $r = [Windows.Forms.MessageBox]::Show(
+        ("Dolphin jetzt beenden?`n`n" +
+        "WICHTIG: Speichere vorher IM SPIEL. Alles seit dem letzten Speichern " +
+        "im Spiel ist sonst weg - das Skript kann nur sichern, was Dolphin " +
+        "bereits auf die Festplatte geschrieben hat.`n`n" +
+        "Danach wird der Spielstand hochgeladen und die Sperre freigegeben."),
+        "Spielen beenden", 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    # Timer anhalten, damit die Ende-Erkennung nicht parallel Complete-Session
+    # aufruft, waehrend wir hier noch warten.
+    $script:timer.Stop()
+    $script:btnStop.Enabled = $false
+    Write-Log "Beende Dolphin..."
+
+    $asked = $false
+    try {
+        $script:proc.Refresh()
+        if ($script:proc.MainWindowHandle -ne [IntPtr]::Zero) {
+            $asked = $script:proc.CloseMainWindow()
+        }
+    }
+    catch { $asked = $false }
+
+    if (-not $asked) {
+        Write-Log "Dolphin hat kein normales Fenster zum Schliessen (z. B. bei einem Starter-Skript)."
+    }
+    else {
+        # Bis zu 20 s Zeit lassen. DoEvents haelt unser Fenster bedienbar und
+        # laesst Dolphin seine eigene Rueckfrage anzeigen.
+        $ende = (Get-Date).AddSeconds(20)
+        while (-not $script:proc.HasExited -and (Get-Date) -lt $ende) {
+            [Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 200
+        }
+    }
+
+    if (-not $script:proc.HasExited) {
+        $f = [Windows.Forms.MessageBox]::Show(
+            ("Dolphin laesst sich nicht normal beenden.`n`n" +
+            "Hart abbrechen? Was Dolphin noch nicht auf die Festplatte " +
+            "geschrieben hat, geht dabei verloren."),
+            "Beenden erzwingen", 'YesNo', 'Warning')
+        if ($f -eq 'Yes') {
+            try {
+                $script:proc.Kill()
+                [void]$script:proc.WaitForExit(5000)
+            }
+            catch { Write-Log "Konnte Dolphin nicht beenden: $($_.Exception.Message)" }
+        }
+    }
+
+    if (-not $script:proc.HasExited) {
+        # Nichts kaputtgemacht: Sitzung laeuft weiter wie vorher.
+        Write-Log "Dolphin laeuft weiter - Sitzung bleibt offen."
+        $script:btnStop.Enabled = $true
+        $script:timer.Start()
+        return
+    }
+
+    Complete-Session
 }
 
 # --------------------------------------------------------------------------
@@ -476,7 +557,7 @@ function Complete-Session {
 function Unlock-Session {
     Save-ConfigFromUI
     if ($script:holdingLock) {
-        Write-Log "Du haeltst die Sperre selbst - beende einfach Dolphin, dann wird sie normal freigegeben."
+        Write-Log "Du haeltst die Sperre selbst - nimm 'Spielen beenden' (oder schliesse Dolphin), dann wird sie normal freigegeben."
         return
     }
     if (-not (Test-Repo)) { return }
@@ -907,9 +988,11 @@ Import-Config
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre"
-$form.Size = New-Object Drawing.Size(660, 780)
+# 42 px hoeher als frueher: die Knoepfe stehen jetzt in zwei Reihen,
+# das Protokollfeld darunter soll dadurch nicht kleiner werden.
+$form.Size = New-Object Drawing.Size(660, 822)
 $form.StartPosition = "CenterScreen"
-$form.MinimumSize = New-Object Drawing.Size(660, 780)
+$form.MinimumSize = New-Object Drawing.Size(660, 822)
 
 function New-Label {
     param($text, $x, $y, $w = 120)
@@ -1045,18 +1128,28 @@ Set-Tip ("Zeigt an, ob gerade jemand spielt (Stand der letzten Pruefung).`n" +
     "Rot = jemand anderes spielt gerade.`n" +
     "Mit 'Status pruefen' aktualisieren.") $script:lblStatus
 
-# Knoepfe
+# Knoepfe - erste Reihe: die beiden Sitzungs-Knoepfe, gross und nebeneinander
 $y += 52
-$script:btnPlay = New-Button "Spielen starten" 15 $y 180 34
+$script:btnPlay = New-Button "Spielen starten" 15 $y 289 34
 $script:btnPlay.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
-$btnRefresh = New-Button "Status pruefen" 205 $y 140 34
-$btnUnlock = New-Button "Sperre erzwingen freigeben" 355 $y 180 34
-$btnSave = New-Button "Speichern" 545 $y 63 34
+$script:btnStop = New-Button "Spielen beenden" 319 $y 289 34
+$script:btnStop.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+$script:btnStop.Enabled = $false          # erst waehrend einer Sitzung nutzbar
+
+# zweite Reihe: alles, was man seltener braucht
+$y += 42
+$btnRefresh = New-Button "Status pruefen" 15 $y 180 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 205 $y 220 34
+$btnSave = New-Button "Speichern" 435 $y 173 34
 Set-Tip ("Der normale Weg zum Spielen:`n" +
     "holt den neuesten Spielstand, setzt die Sperre auf deinen Namen`n" +
     "und startet Dolphin. Bricht ab, wenn jemand anderes gerade spielt.`n" +
     "Beim Beenden von Dolphin wird automatisch gesichert, hochgeladen`n" +
     "und die Sperre wieder freigegeben.") $script:btnPlay
+Set-Tip ("Beendet Dolphin aus dem Programm heraus und schliesst die Sitzung`n" +
+    "genauso ab wie das Schliessen von Hand: sichern, hochladen, Sperre frei.`n" +
+    "Vorher unbedingt IM SPIEL speichern!`n" +
+    "Nur waehrend einer laufenden Sitzung anklickbar.") $script:btnStop
 Set-Tip ("Holt den aktuellen Stand vom Server und zeigt oben an,`n" +
     "ob gerade jemand spielt. Aendert sonst nichts.") $btnRefresh
 Set-Tip ("Notausgang: loescht die Sperre, obwohl niemand Dolphin`n" +
@@ -1164,6 +1257,7 @@ $btnBrowsePics.Add_Click({
         if ($p) { $script:txtPics.Text = $p }
     })
 $script:btnPlay.Add_Click({ Start-Play })
+$script:btnStop.Add_Click({ Stop-Play })
 $btnRefresh.Add_Click({ Update-Status })
 $btnUnlock.Add_Click({ Unlock-Session })
 $btnSave.Add_Click({
@@ -1177,6 +1271,7 @@ $form.Add_FormClosing({
         if ($script:holdingLock) {
             $r = [Windows.Forms.MessageBox]::Show(
                 ("Es laeuft noch eine Sitzung und du haeltst die Sperre.`n`n" +
+                "Sauberer waere 'Spielen beenden' - dann wird hochgeladen und die Sperre freigegeben.`n`n" +
                 "Beim Schliessen wird der Spielstand NICHT automatisch hochgeladen. " +
                 "Die Sperre laeuft aber spaetestens nach {0} Min automatisch ab.`n`nTrotzdem schliessen?" -f $script:cfg.LeaseMinutes),
                 "Achtung", 'YesNo', 'Warning')

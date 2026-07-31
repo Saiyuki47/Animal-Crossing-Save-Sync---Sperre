@@ -160,6 +160,7 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 | Knopf                          | Funktion                                                                                         |
 | ------------------------------ | ------------------------------------------------------------------------------------------------ |
 | **Spielen starten**            | Holt den Stand, setzt die Sperre, schreibt den Save in den Dolphin-Ordner und startet das Spiel. |
+| **Spielen beenden**            | Beendet Dolphin aus dem Programm heraus und schließt die Sitzung ab: sichern, hochladen, Sperre freigeben. **Vorher im Spiel speichern!** Nur während einer laufenden Sitzung anklickbar. |
 | **Status prüfen**              | Aktualisiert die Anzeige: frei, du spielst, jemand anderes spielt, oder abgelaufene Sperre. Läuft beim Programmstart automatisch einmal. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
 | **Speichern**                  | Speichert die Einstellungen.                                                                     |
@@ -186,7 +187,9 @@ erste Stelle zum Nachschauen.
 2. **„Status prüfen"** nur, wenn ihr die Anzeige zwischendurch aktualisieren wollt.
 3. **„Spielen starten"** – Dolphin öffnet sich mit dem aktuellen gemeinsamen Stand.
 4. Ganz normal spielen und im Spiel speichern.
-5. Dolphin schließen. Das Skript sichert automatisch, lädt hoch und gibt die Sperre frei.
+5. Im Spiel speichern, dann entweder Dolphin schließen **oder** im Programm auf
+   **„Spielen beenden"** drücken. Beides führt zum selben Ergebnis: Das Skript
+   sichert automatisch, lädt hoch und gibt die Sperre frei.
 
 Mehr ist im Alltag nicht nötig.
 
