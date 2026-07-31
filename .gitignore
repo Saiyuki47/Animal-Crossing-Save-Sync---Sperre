@@ -1,0 +1,2 @@
+# Wird aus AC-SaveSync.ps1 gebaut (tools/Build-Cmd.ps1) und im Release angehaengt.
+AC-SaveSync.cmd

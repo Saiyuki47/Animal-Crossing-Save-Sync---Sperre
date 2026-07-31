@@ -76,11 +76,24 @@ die es nur klont. Beides geht bequem über den Knopf **„Repo einrichten…"**.
 
 ### Schritt 0 – Skript starten
 
-Rechtsklick auf `AC-SaveSync.ps1` → **„Mit PowerShell ausführen"**.
-Alternativ in PowerShell:
+**Der bequeme Weg:** Unter [Releases](../../releases) die Datei **`AC-SaveSync.cmd`**
+herunterladen und **doppelklicken**. Fertig. Diese Datei enthält das komplette
+Skript und startet PowerShell selbst – eine separate `.ps1` braucht ihr nicht.
+Beim ersten Start fragt Windows einmal nach, ob die Datei aus dem Internet
+ausgeführt werden darf; das ist normal (ggf. Rechtsklick → *Eigenschaften* →
+*Zulassen* → *OK*).
+
+**Wenn ihr das Repo geklont habt:** Rechtsklick auf `AC-SaveSync.ps1` →
+**„Mit PowerShell ausführen"**. Alternativ in PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\AC-SaveSync.ps1
+```
+
+Die `.cmd` lässt sich jederzeit selbst bauen:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\Build-Cmd.ps1
 ```
 
 ### Erste Person (bringt den Spielstand mit)

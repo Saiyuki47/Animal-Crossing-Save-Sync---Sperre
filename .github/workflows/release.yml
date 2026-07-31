@@ -1,0 +1,73 @@
+name: Release
+
+# Loest aus, sobald ein Tag wie "v1.0" oder "v1.2.3" gepusht wird:
+#   git tag v1.0
+#   git push origin v1.0
+# Ergebnis: ein GitHub-Release mit der doppelklickbaren AC-SaveSync.cmd.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:          # erlaubt auch manuelles Starten ueber die Actions-Seite
+
+permissions:
+  contents: write             # noetig, damit das Release angelegt werden darf
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AC-SaveSync.cmd bauen
+        shell: pwsh
+        run: ./tools/Build-Cmd.ps1
+
+      - name: Pruefen, dass der PowerShell-Teil unveraendert drinsteckt
+        shell: pwsh
+        run: |
+          $raw  = [IO.File]::ReadAllText("$PWD/AC-SaveSync.cmd", [Text.UTF8Encoding]::new($false))
+          $m    = [char]10 + '@@AC-SAVESYNC-POWERSHELL-BODY@@'
+          $i    = $raw.IndexOf($m)
+          if ($i -lt 0) { throw 'Marker fehlt in AC-SaveSync.cmd' }
+          $body = $raw.Substring($i + $m.Length).TrimStart([char]13, [char]10)
+          $orig = [IO.File]::ReadAllText("$PWD/AC-SaveSync.ps1", [Text.UTF8Encoding]::new($false)).TrimStart([char]13, [char]10)
+          if ($body -cne $orig) { throw 'Rumpf weicht von AC-SaveSync.ps1 ab' }
+          $tokens = $null; $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseInput($body, [ref]$tokens, [ref]$errs)
+          if ($errs.Count) { throw "Syntaxfehler im Rumpf: $($errs -join '; ')" }
+          # Ein BOM wuerde cmd.exe die erste Zeile zerreissen.
+          $b = [IO.File]::ReadAllBytes("$PWD/AC-SaveSync.cmd")
+          if ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { throw 'BOM in AC-SaveSync.cmd' }
+          Write-Host 'OK'
+
+      - name: Release anlegen
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file - \
+            AC-SaveSync.cmd AC-SaveSync.ps1 <<'EOF'
+          ## Installation
+
+          1. **AC-SaveSync.cmd** herunterladen (unten unter *Assets*).
+          2. Doppelklick. Windows fragt einmal nach ("Ausfuehren") - das ist normal
+             bei Dateien aus dem Internet.
+          3. Falls SmartScreen meckert: *Weitere Informationen* -> *Trotzdem ausfuehren*,
+             oder Rechtsklick auf die Datei -> *Eigenschaften* -> *Zulassen* -> *OK*.
+
+          Die `.cmd` enthaelt das komplette PowerShell-Skript und startet es direkt -
+          eine separate `.ps1` wird nicht gebraucht. Die `AC-SaveSync.ps1` liegt nur
+          fuer alle bei, die den Code lieber direkt lesen oder selbst starten wollen.
+
+          **Voraussetzung bleibt:** Git muss installiert und im PATH sein.
+          EOF
+
+      - name: Datei auch ohne Tag zum Download anbieten
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: AC-SaveSync-cmd
+          path: AC-SaveSync.cmd
