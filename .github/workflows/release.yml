@@ -32,7 +32,10 @@ jobs:
           if ($i -lt 0) { throw 'Marker fehlt in AC-SaveSync.cmd' }
           $body = $raw.Substring($i + $m.Length).TrimStart([char]13, [char]10)
           $orig = [IO.File]::ReadAllText("$PWD/AC-SaveSync.ps1", [Text.UTF8Encoding]::new($false)).TrimStart([char]13, [char]10)
-          if ($body -cne $orig) { throw 'Rumpf weicht von AC-SaveSync.ps1 ab' }
+          # Zeilenenden angleichen: der Build schreibt bewusst CRLF, im Repo liegt
+          # die .ps1 aber mit LF. Verglichen wird der Inhalt, nicht die Umbrueche.
+          $norm = { param($t) $t -replace "`r`n", "`n" }
+          if ((& $norm $body) -cne (& $norm $orig)) { throw 'Rumpf weicht von AC-SaveSync.ps1 ab' }
           $tokens = $null; $errs = $null
           [void][System.Management.Automation.Language.Parser]::ParseInput($body, [ref]$tokens, [ref]$errs)
           if ($errs.Count) { throw "Syntaxfehler im Rumpf: $($errs -join '; ')" }
