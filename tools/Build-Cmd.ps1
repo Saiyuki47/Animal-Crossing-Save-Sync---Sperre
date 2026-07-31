@@ -29,9 +29,9 @@ param(
     # Ziel: die doppelklickbare Datei
     [string]$Output,
 
-    # Konsolenfenster verstecken (GUI startet dann ohne schwarzes Fenster).
-    # Nachteil: Fehlermeldungen ausserhalb der GUI sieht man nicht mehr.
-    [switch]$HideConsole
+    # Konsolenfenster sichtbar lassen - nur zum Suchen von Fehlern.
+    # Normalfall: versteckt, damit nur die GUI erscheint.
+    [switch]$ShowConsole
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,27 +49,54 @@ if (-not (Test-Path -LiteralPath $Source)) {
 # Die Marker-Zeile trennt Batch-Kopf und PowerShell-Rumpf.
 $marker = '@@AC-SAVESYNC-POWERSHELL-BODY@@'
 
-# Der Kopf sucht den Marker zur Laufzeit zusammengesetzt ('...BODY' + '@@'),
-# damit er nicht sich selbst findet - im Kopftext steht der Marker ja auch.
-$launch = if ($HideConsole) {
-    'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -Command'
-} else {
-    'powershell -NoProfile -ExecutionPolicy Bypass -Sta -Command'
-}
-
+# Der Bootstrap darf KEINE doppelten Anfuehrungszeichen enthalten - er steht im
+# Batch-Kopf selbst in doppelten Anfuehrungszeichen. Deshalb ueberall ' statt ".
+# Den Marker setzt er zur Laufzeit zusammen ('...POWERSHELL-' + 'BODY@@'), damit
+# er nicht sich selbst findet: im Kopf steht der Suchbegriff ja ebenfalls.
 $psCommand = @(
+    'try{'
     '$f=$env:ACSS_SELF;'
     '$raw=Get-Content -LiteralPath $f -Raw -Encoding UTF8;'
     "`$m=[char]10 + '@@AC-SAVESYNC-POWERSHELL-' + 'BODY@@';"
     '$i=$raw.IndexOf($m);'
-    'if($i -lt 0){throw ''Marker nicht gefunden - Datei beschaedigt?''};'
+    'if($i -lt 0){throw ''Markerzeile nicht gefunden - Datei beschaedigt?''};'
     # $PSScriptRoot/$PSCommandPath muessen IM Scriptblock gesetzt werden, sonst
     # sind sie dort leer. Der Prolog haengt ohne Zeilenumbruch vorne dran,
     # damit die Zeilennummern in Fehlermeldungen zur .ps1 passen.
     '$pre=''$PSCommandPath=$env:ACSS_SELF; $PSScriptRoot=Split-Path -Parent $env:ACSS_SELF; '';'
     '$body=$pre+$raw.Substring($i+$m.Length).TrimStart([char]13,[char]10);'
     '& ([scriptblock]::Create($body))'
+    '}catch{'
+    # Ohne Konsole waere ein Fehler sonst unsichtbar - daher zusaetzlich ein Dialog.
+    '$e=$_|Out-String;'
+    'Write-Host $e;'
+    'try{Add-Type -AssemblyName System.Windows.Forms;'
+    '[void][Windows.Forms.MessageBox]::Show($e,''AC-SaveSync - Fehler'',''OK'',''Error'')}catch{};'
+    'exit 1}'
 ) -join ' '
+
+# Versteckt (Standard): "start" oeffnet eine EIGENE Konsole fuer PowerShell, und
+# -WindowStyle Hidden laesst Windows sie gar nicht erst sichtbar anlegen - es
+# blitzt also nichts auf. Das Fenster des Doppelklicks schliesst sich sofort.
+# Sichtbar (-ShowConsole): PowerShell laeuft in der vorhandenen Konsole, und bei
+# einem Fehler bleibt das Fenster mit "pause" stehen.
+$runner = if ($ShowConsole) {
+    @"
+powershell -NoProfile -ExecutionPolicy Bypass -Sta -Command "$psCommand"
+set "ACSS_RC=%ERRORLEVEL%"
+if not "%ACSS_RC%"=="0" (
+  echo.
+  echo [Fehler] Beendet mit Code %ACSS_RC%.
+  pause
+)
+endlocal & exit /b %ACSS_RC%
+"@
+} else {
+    @"
+start "AC-SaveSync" powershell -NoProfile -ExecutionPolicy Bypass -Sta -WindowStyle Hidden -Command "$psCommand"
+endlocal & exit /b 0
+"@
+}
 
 $header = @"
 @echo off
@@ -81,14 +108,7 @@ rem  Nicht mit einem Editor speichern, der die Zeilenenden aendert.
 rem ===========================================================================
 setlocal EnableExtensions
 set "ACSS_SELF=%~f0"
-$launch "$psCommand"
-set "ACSS_RC=%ERRORLEVEL%"
-if not "%ACSS_RC%"=="0" (
-  echo.
-  echo [Fehler] Beendet mit Code %ACSS_RC%.
-  pause
-)
-endlocal & exit /b %ACSS_RC%
+$runner
 $marker
 "@
 
