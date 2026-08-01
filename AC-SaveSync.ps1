@@ -43,6 +43,13 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Git darf NIE in der Konsole nach Benutzername/Passwort fragen: das Programm
+# startet ohne sichtbare Konsole, die Frage waere unsichtbar und Git wuerde
+# ewig warten. Mit 0 bricht Git stattdessen mit einer Meldung ab - und die
+# uebersetzt Write-GitProblem weiter unten in Klartext.
+# Der Windows-Anmelde-Dialog (Credential Manager) erscheint weiterhin normal.
+$env:GIT_TERMINAL_PROMPT = '0'
+
 # --------------------------------------------------------------------------
 # Kurzhilfen (Tooltips), die beim Ueberfahren mit der Maus erscheinen
 # --------------------------------------------------------------------------
@@ -179,10 +186,235 @@ function Write-Log {
     }
 }
 
+# Macht aus der Ausgabe von git sauberen Text.
+# Ohne das verpackt PowerShell alles, was git nach stderr schreibt, in
+# ErrorRecords - und die werden mit "At C:\...:815 char:32", "CategoryInfo"
+# usw. ausgegeben. Dieser Ballast verwirrt nur; uns interessiert der Satz,
+# den git wirklich geschrieben hat.
+function ConvertTo-GitText {
+    param($Ausgabe)
+    if ($null -eq $Ausgabe) { return "" }
+    $zeilen = foreach ($z in @($Ausgabe)) {
+        if ($z -is [System.Management.Automation.ErrorRecord]) { $z.Exception.Message }
+        else { "$z" }
+    }
+    return (($zeilen -join "`r`n").Trim())
+}
+
 function Invoke-Git {
     param([string[]]$GitArgs)
     $out = & git -C $script:cfg.RepoPath @GitArgs 2>&1
-    [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($out | Out-String).Trim() }
+    [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
+}
+
+# --------------------------------------------------------------------------
+# Automatisch finden, was man sonst von Hand zusammensuchen muesste
+# --------------------------------------------------------------------------
+# Sucht Dolphin an den ueblichen Stellen. Rueckgabe: Pfad zur Dolphin.exe
+# oder "" - dann muss der Nutzer sie selbst auswaehlen.
+function Find-DolphinExe {
+    $orte = @(
+        "$env:ProgramFiles\Dolphin-x64\Dolphin.exe"
+        "$env:ProgramFiles\Dolphin\Dolphin.exe"
+        "${env:ProgramFiles(x86)}\Dolphin-x64\Dolphin.exe"
+        "${env:ProgramFiles(x86)}\Dolphin\Dolphin.exe"
+        "$env:LOCALAPPDATA\Programs\Dolphin-x64\Dolphin.exe"
+        "$env:LOCALAPPDATA\Programs\Dolphin\Dolphin.exe"
+    )
+    foreach ($o in $orte) {
+        if ($o -and (Test-Path -LiteralPath $o)) { return $o }
+    }
+
+    # Portable Entpack-Installationen: irgendwo ein Ordner "Dolphin*" mit der
+    # exe darin. Nur eine Ebene tief suchen - das bleibt schnell.
+    $eltern = @(
+        ([Environment]::GetFolderPath('MyDocuments'))
+        ([Environment]::GetFolderPath('Desktop'))
+        "$env:USERPROFILE\Downloads"
+        "$env:ProgramFiles"
+        "${env:ProgramFiles(x86)}"
+        "$env:LOCALAPPDATA\Programs"
+        "C:\", "C:\Games", "D:\", "D:\Games", "E:\"
+    )
+    foreach ($p in $eltern) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        try {
+            foreach ($d in (Get-ChildItem -LiteralPath $p -Directory -Filter 'Dolphin*' -ErrorAction SilentlyContinue)) {
+                $exe = Join-Path $d.FullName 'Dolphin.exe'
+                if (Test-Path -LiteralPath $exe) { return $exe }
+            }
+        }
+        catch { }
+    }
+
+    # Ueber die Deinstallations-Eintraege der Registry (deckt eigene Pfade ab)
+    $wurzeln = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($w in $wurzeln) {
+        try {
+            foreach ($k in (Get-ItemProperty $w -ErrorAction SilentlyContinue)) {
+                if ("$($k.DisplayName)" -like '*Dolphin*') {
+                    $d = "$($k.InstallLocation)".Trim('"')
+                    if ($d) {
+                        $exe = Join-Path $d 'Dolphin.exe'
+                        if (Test-Path -LiteralPath $exe) { return $exe }
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    $c = Get-Command 'Dolphin.exe' -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    return ""
+}
+
+# Sucht den Ordner, in dem Dolphin den Spielstand ablegt.
+# Wenn moeglich wird direkt der Ordner von Animal Crossing zurueckgegeben -
+# die Ordnernamen unter Wii\title\00010000 sind die Spielkuerzel in Hex:
+#   52555545 = RUUE (USA), 52555550 = RUUP (Europa), 5255554A = RUUJ (Japan)
+# Das ist deutlich besser als der Sammelordner, in dem ALLE Wii-Spiele liegen.
+function Find-DolphinSaveFolder {
+    param([string]$DolphinExe)
+    $wurzeln = @()
+    # Portable Installation: der User-Ordner liegt neben der Dolphin.exe
+    if ($DolphinExe -and (Test-Path -LiteralPath $DolphinExe)) {
+        $wurzeln += (Join-Path (Split-Path -Parent $DolphinExe) 'User')
+    }
+    $wurzeln += (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Dolphin Emulator')
+    if ($env:APPDATA) { $wurzeln += (Join-Path $env:APPDATA 'Dolphin Emulator') }
+
+    $acKuerzel = @('52555545', '52555550', '5255554a')
+
+    # Von mehreren Kandidaten den zuletzt bespielten nehmen: wer zwei Regionen
+    # installiert hat, spielt hoechstens eine davon wirklich.
+    function Neuester($ordner) {
+        $best = $null; $zeit = [datetime]::MinValue
+        foreach ($o in $ordner) {
+            $f = Get-ChildItem -LiteralPath $o -Recurse -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($f -and $f.LastWriteTime -gt $zeit) { $zeit = $f.LastWriteTime; $best = $o }
+        }
+        if ($best) { return $best }
+        return ($ordner | Select-Object -First 1)
+    }
+
+    foreach ($w in $wurzeln) {
+        $titel = Join-Path $w 'Wii\title\00010000'
+        if (Test-Path -LiteralPath $titel) {
+            # a) Animal Crossing direkt treffen
+            $kandidaten = @()
+            foreach ($k in $acKuerzel) {
+                $p = Join-Path $titel $k
+                if (Test-Path -LiteralPath $p) { $kandidaten += $p }
+            }
+            if ($kandidaten.Count -gt 0) { return (Neuester $kandidaten) }
+            # b) genau ein Spiel vorhanden -> das ist es dann wohl
+            $unter = @(Get-ChildItem -LiteralPath $titel -Directory -ErrorAction SilentlyContinue)
+            if ($unter.Count -eq 1) { return $unter[0].FullName }
+            # c) sonst der Sammelordner als grober Vorschlag
+            if ($unter.Count -gt 1) { return $titel }
+        }
+        foreach ($u in @('Wii', 'GC')) {
+            $p = Join-Path $w $u
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+    }
+    return ""
+}
+
+# Fuellt leere oder ins Leere zeigende Pfade mit dem, was gefunden wurde.
+# Aendert NIE etwas, das der Nutzer selbst eingetragen hat und das existiert.
+function Set-AutoPaths {
+    $gefunden = @()
+
+    if ([string]::IsNullOrWhiteSpace($script:cfg.DolphinPath) -or
+        -not (Test-Path -LiteralPath $script:cfg.DolphinPath)) {
+        $d = Find-DolphinExe
+        if ($d) { $script:cfg.DolphinPath = $d; $gefunden += "Dolphin: $d" }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder) -or
+        -not (Test-Path -LiteralPath $script:cfg.SaveFolder)) {
+        $s = Find-DolphinSaveFolder $script:cfg.DolphinPath
+        if ($s) { $script:cfg.SaveFolder = $s; $gefunden += "Save-Ordner (Vorschlag): $s" }
+    }
+
+    foreach ($g in $gefunden) { Write-Log ("Automatisch gefunden - {0}" -f $g) }
+    return $gefunden.Count
+}
+
+# --------------------------------------------------------------------------
+# Git-Meldungen in Klartext uebersetzen
+# --------------------------------------------------------------------------
+# Git meldet Probleme knapp und auf Englisch. Diese Tabelle uebersetzt die
+# haeufigsten Faelle in verstaendliches Deutsch samt Loesungsvorschlag.
+# Die Originalmeldung wird IMMER zusaetzlich ausgegeben: sie deckt die Faelle
+# ab, die hier fehlen, und ist beim Nachfragen in einem Forum Gold wert.
+$script:GitKlartext = @(
+    @{ Muster = 'could not read Username|could not read Password|Authentication failed|Invalid username or password|terminal prompts disabled|Permission denied \(publickey\)'
+        Text  = 'Git kommt nicht auf den Server - die Zugangsdaten fehlen oder stimmen nicht.'
+        Tipp  = 'Eingabeaufforderung im Repo-Ordner oeffnen und einmal "git push" ausfuehren, dann die Anmeldung abschliessen. Bei GitHub per Browser-Login oder mit einem Token als Passwort.' }
+    @{ Muster = 'Could not resolve host|Failed to connect|Connection timed out|unable to access.*(Could not|Failed)|network is unreachable'
+        Text  = 'Der Server ist nicht erreichbar - meist fehlt gerade die Internetverbindung.'
+        Tipp  = 'Internetverbindung pruefen und es danach erneut versuchen. Der Spielstand bleibt solange lokal erhalten.' }
+    @{ Muster = 'Repository not found|repository .* not found|remote: Not Found'
+        Text  = 'Das Repo gibt es unter dieser Adresse nicht - oder dein Konto hat keinen Zugriff darauf.'
+        Tipp  = 'Adresse auf Tippfehler pruefen. Bei einem privaten Repo muss dein Konto als Mitarbeiter eingetragen sein.' }
+    @{ Muster = 'non-fast-forward|fetch first|Updates were rejected|behind its remote'
+        Text  = 'Auf dem Server liegt ein neuerer Stand - jemand anderes war schneller.'
+        Tipp  = 'Auf "Status pruefen" klicken, damit der neue Stand geholt wird, und es dann noch einmal versuchen.' }
+    @{ Muster = 'Please tell me who you are|user\.email|user\.name|empty ident|unable to auto-detect email'
+        Text  = 'Git weiss noch nicht, wer du bist - ohne Namen und E-Mail kann es nichts speichern.'
+        Tipp  = 'Einmalig in einer Eingabeaufforderung ausfuehren:  git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"' }
+    @{ Muster = 'not a git repository|does not appear to be a git repository'
+        Text  = 'Der eingetragene Ordner ist kein Git-Repo.'
+        Tipp  = 'Pfad beim Repo-Ordner pruefen, oder unten auf "Repo einrichten..." klicken.' }
+    @{ Muster = "'origin' does not appear|No such remote|remote origin already exists"
+        Text  = 'Die Verbindung zum gemeinsamen Repo im Internet ("origin") ist nicht richtig eingerichtet.'
+        Tipp  = 'Ueber "Repo einrichten..." Schritt 2 die Adresse des gemeinsamen Repos eintragen.' }
+    @{ Muster = 'src refspec .* does not match any|couldn.t find remote ref'
+        Text  = 'Den eingetragenen Branch gibt es noch nicht.'
+        Tipp  = 'Pruefen, ob beide Spieler denselben Branch eingetragen haben (normalerweise "main").' }
+    @{ Muster = 'index\.lock|Unable to create .*index\.lock'
+        Text  = 'Git blockiert sich selbst - vermutlich laeuft noch ein anderer Git-Vorgang oder einer ist abgestuerzt.'
+        Tipp  = 'Kurz warten und erneut versuchen. Hilft das nicht, die Datei .git\index.lock im Repo-Ordner loeschen.' }
+    @{ Muster = 'would be overwritten by merge|local changes.*would be overwritten|CONFLICT|Automatic merge failed'
+        Text  = 'Lokale Aenderungen stehen dem Stand vom Server im Weg.'
+        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Achtung: dabei werden lokale Aenderungen verworfen.' }
+    @{ Muster = 'detected dubious ownership|safe\.directory'
+        Text  = 'Git traut dem Ordner nicht, weil er einem anderen Benutzerkonto gehoert.'
+        Tipp  = 'Einmalig ausfuehren:  git config --global --add safe.directory "<Pfad zum Repo-Ordner>"' }
+)
+
+# Gibt einen Git-Fehler verstaendlich aus: erst Klartext + Tipp, danach immer
+# die unveraenderte Originalmeldung.
+function Write-GitProblem {
+    param([string]$Titel, $Ergebnis)
+    Write-Log "FEHLER: $Titel"
+    $t = "$($Ergebnis.Text)"
+    $erklaert = $false
+    foreach ($e in $script:GitKlartext) {
+        if ($t -match $e.Muster) {
+            Write-Log ("  Das heisst: {0}" -f $e.Text)
+            Write-Log ("  Das hilft:  {0}" -f $e.Tipp)
+            $erklaert = $true
+            break
+        }
+    }
+    if (-not $erklaert) {
+        Write-Log "  Fuer diesen Fall habe ich keine Uebersetzung - die Originalmeldung steht direkt darunter."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($t)) {
+        Write-Log "  Originalmeldung von Git:"
+        foreach ($z in ($t -split "`r?`n")) {
+            if ($z.Trim()) { Write-Log ("    {0}" -f $z.TrimEnd()) }
+        }
+    }
 }
 
 function Test-Repo {
@@ -198,9 +430,9 @@ function Test-Repo {
 # Fortschritt verwerfen).
 function Sync-Remote {
     $f = Invoke-Git @('fetch', 'origin')
-    if ($f.Code -ne 0) { Write-Log "fetch-Warnung: $($f.Text)" }
+    if ($f.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht geholt werden." $f }
     $r = Invoke-Git @('reset', '--hard', "origin/$($script:cfg.Branch)")
-    if ($r.Code -ne 0) { Write-Log "reset-Warnung: $($r.Text)" }
+    if ($r.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht uebernommen werden." $r }
 }
 
 function Get-LockPath { Join-Path $script:cfg.RepoPath "PLAYING.lock" }
@@ -255,13 +487,7 @@ function Invoke-GitCommitPush {
     if (Test-Staged) {
         $c = Invoke-Git @('commit', '-m', $msg)
         if ($c.Code -ne 0) {
-            Write-Log "FEHLER: Commit fehlgeschlagen - es wird nichts hochgeladen."
-            Write-Log ("  git commit: {0}" -f $c.Text)
-            if ($c.Text -match 'user\.email|user\.name|identity') {
-                Write-Log "  Tipp: Git kennt dich noch nicht. Einmalig ausfuehren:"
-                Write-Log '        git config --global user.name "Dein Name"'
-                Write-Log '        git config --global user.email "du@example.com"'
-            }
+            Write-GitProblem "Speichern fehlgeschlagen - es wird nichts hochgeladen." $c
             return [pscustomobject]@{ Code = $c.Code; Text = $c.Text; Stage = 'commit' }
         }
     }
@@ -348,7 +574,8 @@ function Start-Play {
         }
     }
     if (-not $acquired) {
-        Write-Log "Konnte die Sperre nicht sichern (Push-Problem?). Abbruch. Siehe Log."
+        Write-Log "Abbruch: die Sperre konnte nicht gesichert werden."
+        Write-Log "Tipp: 'Selbsttest' zeigt, woran es liegt."
         return
     }
 
@@ -434,7 +661,8 @@ function Invoke-Tick {
         Add-Playtime
         $p = Invoke-GitCommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -ne 0) {
-            Write-Log ("Heartbeat-Warnung ({0}): {1}" -f $p.Stage, $p.Text)
+            Write-GitProblem "Zwischenspeichern waehrend des Spielens hat nicht geklappt." $p
+            Write-Log "  Das Spiel laeuft normal weiter - es wird beim naechsten Herzschlag erneut versucht."
         }
         else {
             Write-Log "Herzschlag gesendet (Spielstand + Sperre aktualisiert)."
@@ -460,10 +688,9 @@ function Complete-Session {
     $p = Invoke-GitCommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
 
     if ($p.Code -ne 0) {
-        Write-Log "WARNUNG: Hochladen beim Beenden fehlgeschlagen."
-        Write-Log "Deine Aenderungen sind LOKAL committet (nicht verloren), aber noch nicht gepusht."
-        Write-Log "Moegliche Ursache: jemand hat per 'Sperre erzwingen' uebernommen. Details:"
-        Write-Log $p.Text
+        Write-GitProblem "Hochladen beim Beenden fehlgeschlagen." $p
+        Write-Log "  Keine Panik: dein Fortschritt ist lokal gespeichert und nicht verloren."
+        Write-Log "  Er wird beim naechsten erfolgreichen Hochladen mitgenommen."
     }
     else {
         Write-Log "Fertig. Spielstand hochgeladen, Sperre freigegeben."
@@ -571,7 +798,7 @@ function Unlock-Session {
     if (Test-Path $lf) { Remove-Item $lf -Force }
     $p = Invoke-GitCommitPush ("force-unlock durch {0}" -f $script:cfg.PlayerName)
     if ($p.Code -eq 0) { Write-Log "Sperre wurde zwangsweise freigegeben." }
-    else { Write-Log "Fehler beim Freigeben: $($p.Text)" }
+    else { Write-GitProblem "Die Sperre konnte nicht freigegeben werden." $p }
     Update-StatusUI (Get-LockState)
 }
 
@@ -590,6 +817,236 @@ function Update-Status {
     elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
     elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
     else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
+}
+
+# --------------------------------------------------------------------------
+# Selbsttest: "Ist alles startklar?"
+# --------------------------------------------------------------------------
+# Ruft git auch ausserhalb des Repos auf (fuer --version und --global config)
+# und faengt ab, dass git ueberhaupt fehlt.
+function Invoke-GitRaw {
+    param([string[]]$GitArgs, [string]$WorkDir)
+    try {
+        if ($WorkDir) { $out = & git -C $WorkDir @GitArgs 2>&1 }
+        else { $out = & git @GitArgs 2>&1 }
+        return [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
+    }
+    catch {
+        # git nicht gefunden -> 9009 ist Windows' "Befehl nicht gefunden"
+        return [pscustomobject]@{ Code = 9009; Text = $_.Exception.Message }
+    }
+}
+
+# Prueft der Reihe nach alles, was zum Spielen noetig ist.
+# Rueckgabe: Liste aus Name / Ok / Hinweis / Roh (Originalmeldung von Git).
+function Test-Setup {
+    $e = @()
+    function Neu($name, $ok, $hinweis, $roh = "") {
+        [pscustomobject]@{ Name = $name; Ok = $ok; Hinweis = $hinweis; Roh = $roh }
+    }
+
+    # 1) Git ueberhaupt da?
+    $v = Invoke-GitRaw @('--version')
+    if ($v.Code -ne 0) {
+        $e += Neu "Git installiert" $false ("Git fehlt - ohne Git kann nichts ausgetauscht werden. " +
+            "Kostenlos herunterladen unter https://git-scm.com/download/win, installieren, " +
+            "danach dieses Programm neu starten.") $v.Text
+        # Alles Weitere braucht Git - hier ist Schluss.
+        $e += Neu "Weitere Pruefungen" $false "Uebersprungen, weil Git fehlt." ""
+        return $e
+    }
+    $e += Neu "Git installiert" $true $v.Text
+
+    # 2) Kennt Git meinen Namen? (sonst schlaegt jeder Commit fehl)
+    $n = Invoke-GitRaw @('config', '--global', 'user.name')
+    $m = Invoke-GitRaw @('config', '--global', 'user.email')
+    if ([string]::IsNullOrWhiteSpace($n.Text) -or [string]::IsNullOrWhiteSpace($m.Text)) {
+        $e += Neu "Git kennt dich" $false ('Git fehlen Name und E-Mail. Einmalig in einer Eingabeaufforderung: ' +
+            'git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"') ""
+    }
+    else {
+        $e += Neu "Git kennt dich" $true ("{0} <{1}>" -f $n.Text, $m.Text)
+    }
+
+    # 3) Spielername im Programm
+    if ([string]::IsNullOrWhiteSpace($script:cfg.PlayerName)) {
+        $e += Neu "Dein Name" $false "Oben bei 'Dein Name' etwas eintragen. Wichtig: beide Spieler brauchen UNTERSCHIEDLICHE Namen." ""
+    }
+    else {
+        $e += Neu "Dein Name" $true $script:cfg.PlayerName
+    }
+
+    # 4) Dolphin
+    if ([string]::IsNullOrWhiteSpace($script:cfg.DolphinPath) -or -not (Test-Path -LiteralPath $script:cfg.DolphinPath)) {
+        $e += Neu "Dolphin gefunden" $false ("Unter '" + $script:cfg.DolphinPath + "' liegt keine Dolphin.exe. " +
+            "Oben ueber '...' die richtige Datei auswaehlen.") ""
+    }
+    else {
+        $e += Neu "Dolphin gefunden" $true $script:cfg.DolphinPath
+    }
+
+    # 5) Save-Ordner. Bewusst hier und nicht am Ende: die Pruefungen danach
+    # koennen abbrechen, dieser Punkt ist aber immer feststellbar.
+    if ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder)) {
+        $e += Neu "Save-Ordner" $false "Leer - Spielstaende werden NICHT synchronisiert. Nur sinnvoll, wenn ihr das absichtlich so wollt." ""
+    }
+    elseif (-not (Test-Path -LiteralPath $script:cfg.SaveFolder)) {
+        $e += Neu "Save-Ordner" $false ("'" + $script:cfg.SaveFolder + "' gibt es nicht. Oben ueber '...' den Ordner auswaehlen, in dem Dolphin die Spielstaende ablegt.") ""
+    }
+    else {
+        $e += Neu "Save-Ordner" $true $script:cfg.SaveFolder
+    }
+
+    # 6) Repo-Ordner
+    $istRepo = (-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
+               (Test-Path (Join-Path $script:cfg.RepoPath '.git'))
+    if (-not $istRepo) {
+        $e += Neu "Gemeinsamer Ordner" $false ("Unter '" + $script:cfg.RepoPath + "' liegt kein Git-Repo. " +
+            "Unten auf 'Repo einrichten...' klicken - oder den Ordner korrigieren.") ""
+        $e += Neu "Verbindung zum Server" $false "Uebersprungen, weil noch kein Repo da ist." ""
+        return $e
+    }
+    $e += Neu "Gemeinsamer Ordner" $true $script:cfg.RepoPath
+
+    # 6) Ist eine Adresse im Internet hinterlegt?
+    $o = Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath
+    if ($o.Code -ne 0 -or [string]::IsNullOrWhiteSpace($o.Text)) {
+        $e += Neu "Adresse des Repos" $false ("Es ist keine Adresse ('origin') hinterlegt - der Austausch mit dem " +
+            "anderen Spieler kann so nicht funktionieren. Ueber 'Repo einrichten...', Schritt 2.") $o.Text
+        return $e
+    }
+    $e += Neu "Adresse des Repos" $true $o.Text
+
+    # 7) Server erreichbar + Zugangsdaten in Ordnung?
+    $ls = Invoke-GitRaw @('ls-remote', '--heads', 'origin') $script:cfg.RepoPath
+    if ($ls.Code -ne 0) {
+        $klar = "Der Server antwortet nicht wie erwartet."
+        foreach ($k in $script:GitKlartext) {
+            if ("$($ls.Text)" -match $k.Muster) { $klar = $k.Text + " " + $k.Tipp; break }
+        }
+        $e += Neu "Verbindung zum Server" $false $klar $ls.Text
+        return $e
+    }
+    $e += Neu "Verbindung zum Server" $true "Server erreichbar, Zugang funktioniert."
+
+    # 8) Gibt es den eingetragenen Branch dort?
+    if ($ls.Text -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '\s*$') -or
+        $ls.Text -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '[\r\n]')) {
+        $e += Neu "Branch vorhanden" $true $script:cfg.Branch
+    }
+    else {
+        $e += Neu "Branch vorhanden" $false ("Auf dem Server gibt es keinen Branch '" + $script:cfg.Branch +
+            "'. Pruefen, ob beide Spieler denselben Branch eingetragen haben (meist 'main').") $ls.Text
+    }
+
+    return $e
+}
+
+# Zeigt das Ergebnis als Ampel-Liste. Zu jedem Punkt der Klartext-Hinweis und,
+# wo vorhanden, die Originalmeldung von Git.
+function Show-SelfTest {
+    Save-ConfigFromUI
+    Write-Log "Selbsttest laeuft..."
+    [Windows.Forms.Application]::DoEvents()
+    $erg = Test-Setup
+
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = "Selbsttest - ist alles startklar?"
+    $dlg.Size = New-Object Drawing.Size(660, 560)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.MinimumSize = New-Object Drawing.Size(520, 360)
+
+    $kopf = New-Object Windows.Forms.Label
+    $anzahlFehler = @($erg | Where-Object { -not $_.Ok }).Count
+    $kopf.Text = if ($anzahlFehler -eq 0) { "Alles in Ordnung - ihr koennt loslegen." }
+    else { "$anzahlFehler Punkt(e) brauchen noch Aufmerksamkeit. Details stehen darunter." }
+    $kopf.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+    $kopf.Location = New-Object Drawing.Point(15, 12)
+    $kopf.Size = New-Object Drawing.Size(610, 24)
+    $kopf.Anchor = 'Top,Left,Right'
+    $dlg.Controls.Add($kopf)
+
+    $panel = New-Object Windows.Forms.Panel
+    $panel.Location = New-Object Drawing.Point(15, 44)
+    $panel.Size = New-Object Drawing.Size(612, 430)
+    $panel.AutoScroll = $true
+    $panel.BorderStyle = 'FixedSingle'
+    $panel.Anchor = 'Top,Bottom,Left,Right'
+    $dlg.Controls.Add($panel)
+
+    $py = 8
+    foreach ($p in $erg) {
+        $zeile = New-Object Windows.Forms.Label
+        $zeile.Text = if ($p.Ok) { "OK      " + $p.Name } else { "FEHLT   " + $p.Name }
+        $zeile.ForeColor = if ($p.Ok) { [Drawing.Color]::FromArgb(0, 110, 0) } else { [Drawing.Color]::FromArgb(170, 0, 0) }
+        $zeile.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+        $zeile.Location = New-Object Drawing.Point(10, $py)
+        $zeile.Size = New-Object Drawing.Size(570, 20)
+        $panel.Controls.Add($zeile)
+        $py += 20
+
+        if ($p.Hinweis) {
+            $h = New-Object Windows.Forms.Label
+            $h.Text = $p.Hinweis
+            $h.Location = New-Object Drawing.Point(28, $py)
+            $h.Size = New-Object Drawing.Size(550, 0)
+            $h.AutoSize = $false
+            $h.MaximumSize = New-Object Drawing.Size(550, 0)
+            $h.AutoSize = $true
+            $h.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
+            $panel.Controls.Add($h)
+            $py += $h.Height + 4
+        }
+
+        # Originalmeldung von Git immer mit anzeigen, wenn es eine gibt
+        if ($p.Roh -and -not $p.Ok) {
+            $r = New-Object Windows.Forms.TextBox
+            $r.Text = $p.Roh
+            $r.Multiline = $true
+            $r.ReadOnly = $true
+            $r.ScrollBars = 'Vertical'
+            $r.Font = New-Object Drawing.Font("Consolas", 8.5)
+            $r.BackColor = [Drawing.Color]::FromArgb(245, 245, 245)
+            $r.Location = New-Object Drawing.Point(28, $py)
+            $zeilen = @($p.Roh -split "`r?`n").Count
+            $r.Size = New-Object Drawing.Size(550, [Math]::Min(90, 16 + 13 * $zeilen))
+            $panel.Controls.Add($r)
+            $py += $r.Height + 4
+        }
+        $py += 8
+    }
+
+    $btnKopieren = New-Object Windows.Forms.Button
+    $btnKopieren.Text = "Bericht kopieren"
+    $btnKopieren.Location = New-Object Drawing.Point(15, 484)
+    $btnKopieren.Size = New-Object Drawing.Size(150, 30)
+    $btnKopieren.Anchor = 'Bottom,Left'
+    $script:selfTestBericht = ($erg | ForEach-Object {
+            $k = if ($_.Ok) { "OK   " } else { "FEHLT" }
+            "[$k] $($_.Name)`r`n       $($_.Hinweis)" + $(if ($_.Roh -and -not $_.Ok) { "`r`n       git: " + ($_.Roh -replace "`r?`n", "`r`n            ") } else { "" })
+        }) -join "`r`n"
+    $btnKopieren.Add_Click({
+            try { [Windows.Forms.Clipboard]::SetText($script:selfTestBericht) } catch { }
+        })
+    $dlg.Controls.Add($btnKopieren)
+    Set-Tip ("Kopiert das ganze Ergebnis als Text - praktisch, wenn du`n" +
+        "jemanden um Hilfe bittest.") $btnKopieren
+
+    $btnZu = New-Object Windows.Forms.Button
+    $btnZu.Text = "Schliessen"
+    $btnZu.Location = New-Object Drawing.Point(497, 484)
+    $btnZu.Size = New-Object Drawing.Size(130, 30)
+    $btnZu.Anchor = 'Bottom,Right'
+    $btnZu.Add_Click({ $script:selfTestDlg.Close() })
+    $dlg.Controls.Add($btnZu)
+    $script:selfTestDlg = $dlg
+
+    foreach ($p in $erg) {
+        Write-Log ("  [{0}] {1}" -f $(if ($p.Ok) { "OK" } else { "FEHLT" }), $p.Name)
+    }
+    Write-Log ("Selbsttest fertig: {0} Punkt(e) offen." -f $anzahlFehler)
+
+    [void]$dlg.ShowDialog()
 }
 
 # --------------------------------------------------------------------------
@@ -985,6 +1442,9 @@ function Show-SetupDialog {
 # Grafische Oberflaeche
 # ==========================================================================
 Import-Config
+# Was fehlt oder ins Leere zeigt, selbst suchen - spart dem Nutzer die
+# Sucherei nach Dolphin und dem Save-Ordner.
+[void](Set-AutoPaths)
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre"
@@ -1138,9 +1598,14 @@ $script:btnStop.Enabled = $false          # erst waehrend einer Sitzung nutzbar
 
 # zweite Reihe: alles, was man seltener braucht
 $y += 42
-$btnRefresh = New-Button "Status pruefen" 15 $y 180 34
-$btnUnlock = New-Button "Sperre erzwingen freigeben" 205 $y 220 34
-$btnSave = New-Button "Speichern" 435 $y 173 34
+$btnRefresh = New-Button "Status pruefen" 15 $y 140 34
+$btnSelfTest = New-Button "Selbsttest" 163 $y 140 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 311 $y 180 34
+$btnSave = New-Button "Speichern" 499 $y 109 34
+Set-Tip ("Prueft der Reihe nach alles, was zum Spielen noetig ist:`n" +
+    "Git, deine Angaben, Dolphin, den gemeinsamen Ordner und die`n" +
+    "Verbindung zum Server. Zu jedem Problem steht dabei, was zu tun ist.`n" +
+    "Der erste Anlaufpunkt, wenn irgendetwas nicht klappt.") $btnSelfTest
 Set-Tip ("Der normale Weg zum Spielen:`n" +
     "holt den neuesten Spielstand, setzt die Sperre auf deinen Namen`n" +
     "und startet Dolphin. Bricht ab, wenn jemand anderes gerade spielt.`n" +
@@ -1202,6 +1667,15 @@ $script:startTimer.Interval = 200
 $script:startTimer.Add_Tick({
         $script:startTimer.Stop()
 
+        # Ohne Git geht gar nichts - dann sofort den Selbsttest zeigen, statt
+        # den Nutzer spaeter in eine unverstaendliche Fehlermeldung laufen zu lassen.
+        if ((Invoke-GitRaw @('--version')).Code -ne 0) {
+            $script:lblStatus.Text = "Git fehlt - siehe Selbsttest"
+            Write-Log "Git ist nicht installiert - ohne Git kann das Programm nichts austauschen."
+            Show-SelfTest
+            return
+        }
+
         if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
             -not (Test-Path (Join-Path $script:cfg.RepoPath ".git"))) {
             # Erster Start: noch kein Repo. Hier bewusst keine Fehlermeldung,
@@ -1209,6 +1683,7 @@ $script:startTimer.Add_Tick({
             $script:lblStatus.Text = "Noch kein Repo eingerichtet"
             Write-Log "Noch kein Repo eingerichtet - Status wurde nicht geprueft."
             Write-Log "Pfade oben ausfuellen (oder 'Repo einrichten...'), dann 'Speichern'."
+            Write-Log "Der Knopf 'Selbsttest' zeigt jederzeit, was noch fehlt."
             return
         }
 
@@ -1259,6 +1734,7 @@ $btnBrowsePics.Add_Click({
 $script:btnPlay.Add_Click({ Start-Play })
 $script:btnStop.Add_Click({ Stop-Play })
 $btnRefresh.Add_Click({ Update-Status })
+$btnSelfTest.Add_Click({ Show-SelfTest })
 $btnUnlock.Add_Click({ Unlock-Session })
 $btnSave.Add_Click({
         Save-ConfigFromUI
