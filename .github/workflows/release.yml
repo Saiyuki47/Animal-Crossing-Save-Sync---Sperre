@@ -52,7 +52,7 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file - \
-            AC-SaveSync.cmd AC-SaveSync.ps1 <<'EOF'
+            AC-SaveSync.cmd AC-SaveSync.ps1 assets/ac-savesync.ico <<'EOF'
           ## Installation
 
           1. **AC-SaveSync.cmd** herunterladen (unten unter *Assets*).
@@ -64,6 +64,14 @@ jobs:
           Die `.cmd` enthaelt das komplette PowerShell-Skript und startet es direkt -
           eine separate `.ps1` wird nicht gebraucht. Die `AC-SaveSync.ps1` liegt nur
           fuer alle bei, die den Code lieber direkt lesen oder selbst starten wollen.
+
+          ## Symbol
+
+          Beim ersten Start bietet das Programm an, eine Verknuepfung mit Symbol auf
+          dem Desktop anzulegen - spaeter jederzeit ueber *Erweitert...*. Die `.cmd`
+          selbst kann kein Symbol tragen: Windows legt das fuer alle Dateien dieser
+          Art gemeinsam fest. `ac-savesync.ico` liegt fuer alle bei, die es lieber
+          von Hand vergeben wollen.
 
           **Voraussetzung bleibt:** Git muss installiert und im PATH sein.
           EOF

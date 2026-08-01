@@ -1,2 +1,5 @@
 # Wird aus AC-SaveSync.ps1 gebaut (tools/Build-Cmd.ps1) und im Release angehaengt.
 AC-SaveSync.cmd
+
+# Zwischenschritt von tools/New-Icon.ps1: der Text steckt bereits im Skript.
+assets/icon-base64.txt

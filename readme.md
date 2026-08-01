@@ -96,6 +96,13 @@ Die `.cmd` lässt sich jederzeit selbst bauen:
 powershell -ExecutionPolicy Bypass -File .\tools\Build-Cmd.ps1
 ```
 
+**Zum Symbol:** Eine `.cmd`-Datei kann kein eigenes Symbol tragen – Windows legt das
+für alle Dateien dieser Art gemeinsam über die Dateizuordnung fest. Das Programm bietet
+deshalb beim ersten Start an, eine **Verknüpfung mit Symbol auf dem Desktop** anzulegen
+(später jederzeit über **„Erweitert…"**). Fenster und Taskleiste tragen das Symbol
+ohnehin. Das Motiv ist selbst gezeichnet (`tools/New-Icon.ps1`), es steckt kein
+Material aus dem Spiel darin.
+
 ### Schritt 1 – Der Assistent
 
 Beim **allerersten Start** führt euch ein Assistent in vier Schritten durch das Nötigste:
@@ -188,7 +195,7 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 | **Status prüfen**              | Aktualisiert die Anzeige: frei, du spielst, jemand anderes spielt, oder abgelaufene Sperre. Läuft beim Programmstart automatisch einmal. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
-| **Erweitert…**                 | Selten gebrauchte Einstellungen: Bilder-Ordner, Branch, Sperre, Herzschlag.                      |
+| **Erweitert…**                 | Selten gebrauchte Einstellungen: Bilder-Ordner, Branch, Sperre, Herzschlag. Dort liegt auch **„Verknüpfung auf dem Desktop anlegen"**. |
 | **Repo einrichten…**           | Öffnet den Einrichtungs-Dialog (anlegen / verbinden / klonen).                                   |
 
 „Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
