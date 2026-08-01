@@ -100,8 +100,17 @@ powershell -ExecutionPolicy Bypass -File .\tools\Build-Cmd.ps1
 für alle Dateien dieser Art gemeinsam über die Dateizuordnung fest. Das Programm bietet
 deshalb beim ersten Start an, eine **Verknüpfung mit Symbol auf dem Desktop** anzulegen
 (später jederzeit über **„Erweitert…"**). Fenster und Taskleiste tragen das Symbol
-ohnehin. Das Motiv ist selbst gezeichnet (`tools/New-Icon.ps1`), es steckt kein
-Material aus dem Spiel darin.
+ohnehin.
+
+Das Symbol kommt aus `icon.ico` im Projektordner. Zum Austauschen einfach diese Datei
+ersetzen und danach ausführen:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\Set-Icon.ps1
+```
+
+Das schreibt `assets/ac-savesync.ico` (verlustfrei, aber PNG-komprimiert – aus 360 KB
+werden 46 KB) und trägt es gleich ins Skript ein.
 
 ### Schritt 1 – Der Assistent
 
