@@ -108,29 +108,30 @@ Wer das Repo erst noch anlegen muss, lässt den letzten Schritt leer und macht d
 unten beschrieben weiter. Der Assistent erscheint nur einmal; alles lässt sich später im
 Hauptfenster ändern.
 
-### Erste Person (bringt den Spielstand mit)
+### Schritt 2 – Der gemeinsame Ordner
 
-1. Auf **github.com** ein neues, **leeres, privates** Repo anlegen und dessen URL kopieren
-   (z. B. `https://github.com/deinname/ac-save.git`).
-2. Im Hauptfenster oben eintragen: **Repo-Ordner** (ein neuer, leerer Ordner auf der Platte),
-   **Dein Name**, **Branch** (meist `main`), sowie **Save-Ordner** (siehe unten).
-3. **„Repo einrichten…"** öffnen.
-4. Knopf **1) Lokales Repo in diesem Ordner anlegen** – macht aus dem Ordner ein Git-Repo.
-5. Die kopierte URL oben ins Feld **Remote-URL** einfügen.
-6. Knopf **2) Mit Remote-URL verbinden und hochladen** – lädt alles hoch.
+Klickt im Hauptfenster auf **„Repo einrichten…"**. Das Fenster fragt zuerst, **wer ihr seid**,
+und zeigt danach nur noch die Schritte, die für euch gelten. Ihr müsst also nicht raten,
+welcher Knopf für wen ist.
 
-> Wenn du die **GitHub CLI** (`gh`) installiert und angemeldet hast, kannst du dir Schritt 1
-> sparen: unten im Setup-Fenster einen Namen eintragen und
-> **„GitHub-Repo per gh erstellen und pushen"** klicken. Das legt das Remote automatisch an.
+**„Ich bin der Erste – ich lege ihn an"** (einer von euch beiden):
 
-### Zweite Person (klont nur)
+1. **„github.com/new öffnen"** – dort ein Repo anlegen, auf **Private** stellen und
+   **keinen Haken** bei „Add a README file" setzen (der Ordner muss leer sein).
+   Habt ihr die **GitHub CLI** (`gh`) installiert und angemeldet, erledigt
+   **„Automatisch anlegen"** das für euch.
+2. Die Adresse des neuen Repos einfügen und den Ordner auf eurem PC wählen.
+3. **„Einrichten und hochladen"** – legt das lokale Repo an, verbindet es und lädt euren
+   Spielstand hoch. Danach **„Adresse kopieren"** und dem Mitspieler schicken.
 
-1. Dieselbe **Remote-URL** ins Setup-Fenster eintragen.
-2. Als **Repo-Ordner** einen leeren/neuen Ordner wählen.
-3. Knopf **3) Vorhandenes Repo von URL klonen**.
+**„Mein Mitspieler hat ihn schon – ich hole ihn mir"** (der andere):
 
-Danach eigenen **Namen**, **Save-Ordner** und ggf. **Spiel** eintragen, **„Speichern"** klicken –
-fertig.
+1. Die Adresse einfügen, die ihr bekommen habt.
+2. Einen leeren oder neuen Ordner auf eurem PC wählen.
+3. **„Jetzt holen"** – fertig.
+
+> Achtung für die zweite Person: Es wird der Spielstand des Ersten geholt. Ein eigener
+> Spielstand auf diesem PC wird dabei **nicht** hochgeladen.
 
 ---
 

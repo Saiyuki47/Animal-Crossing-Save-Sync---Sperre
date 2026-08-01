@@ -392,6 +392,9 @@ $script:GitKlartext = @(
     @{ Muster = 'would be overwritten by merge|local changes.*would be overwritten|CONFLICT|Automatic merge failed'
         Text  = 'Lokale Aenderungen stehen dem Stand vom Server im Weg.'
         Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Achtung: dabei werden lokale Aenderungen verworfen.' }
+    @{ Muster = 'Filename too long|unable to write file.*too long|path too long'
+        Text  = 'Ein Dateiname wird zu lang - Windows steigt bei sehr langen Pfaden aus.'
+        Tipp  = 'Einmalig ausfuehren:  git config --global core.longpaths true  - oder den Repo-Ordner naeher an die Laufwerkswurzel legen, z. B. C:\ACSave.' }
     @{ Muster = 'detected dubious ownership|safe\.directory'
         Text  = 'Git traut dem Ordner nicht, weil er einem anderen Benutzerkonto gehoert.'
         Tipp  = 'Einmalig ausfuehren:  git config --global --add safe.directory "<Pfad zum Repo-Ordner>"' }
@@ -1358,12 +1361,26 @@ function Copy-Repo {
     Write-Log "Klone Repo..."
     $out = & git clone $url $target 2>&1
     $text = ConvertTo-GitText $out
-    if (Test-Path (Join-Path $target '.git')) {
-        Write-Log "Klonen erfolgreich. Du kannst jetzt spielen."
-    }
-    else {
+    if (-not (Test-Path (Join-Path $target '.git'))) {
         Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." ([pscustomobject]@{ Text = $text })
+        return
     }
+
+    # Nach dem Klonen sicherstellen, dass der eingestellte Branch auch wirklich
+    # ausgecheckt ist. Zeigt der Server auf einen anders benannten Standard-
+    # Branch (z. B. 'master' statt 'main'), ist der Ordner sonst LEER - und das
+    # faellt sonst erst beim Spielen auf, wenn der Spielstand fehlt.
+    $cur = Invoke-Git @('rev-parse', '--abbrev-ref', 'HEAD')
+    if ($cur.Code -ne 0 -or $cur.Text -ne $script:cfg.Branch) {
+        $co = Invoke-Git @('checkout', '-B', $script:cfg.Branch, "origin/$($script:cfg.Branch)")
+        if ($co.Code -ne 0) {
+            Write-GitProblem ("Der Ordner wurde geholt, aber der Branch '{0}' konnte nicht ausgecheckt werden - er ist noch leer." -f $script:cfg.Branch) $co
+            Write-Log "  Tipp: Pruefe unter 'Erweitert...', ob der Branch stimmt (meist 'main')."
+            return
+        }
+        Write-Log ("Branch '{0}' ausgecheckt." -f $script:cfg.Branch)
+    }
+    Write-Log "Klonen erfolgreich. Du kannst jetzt spielen."
 }
 
 function New-RemoteWithGh {
@@ -1611,21 +1628,18 @@ function Invoke-WizClone {
     $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
     [Windows.Forms.Application]::DoEvents()
 
-    $out = & git clone $url $ziel 2>&1
-    $text = ConvertTo-GitText $out
-    if (Test-Path (Join-Path $ziel '.git')) {
+    # Denselben Weg nehmen wie "Repo einrichten..." - inklusive der Pruefung,
+    # dass der Branch danach auch wirklich ausgecheckt ist.
+    $script:txtRepo.Text = $ziel
+    Copy-Repo $url
+
+    if ((Invoke-GitRaw @('rev-parse', '--verify', 'HEAD') $ziel).Code -eq 0) {
         $script:wizHolStatus.Text = "Geklappt - der gemeinsame Ordner ist da."
         $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
-        Write-Log "Repo geklont nach: $ziel"
     }
     else {
-        $klar = "Das Holen hat nicht geklappt."
-        foreach ($k in $script:GitKlartext) {
-            if ($text -match $k.Muster) { $klar = $k.Text; break }
-        }
-        $script:wizHolStatus.Text = $klar
+        $script:wizHolStatus.Text = "Hat nicht geklappt - Einzelheiten stehen im Protokoll im Hauptfenster."
         $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
-        Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." ([pscustomobject]@{ Text = $text })
     }
 }
 
@@ -1714,96 +1728,323 @@ function Show-AdvancedDialog {
     }
 }
 
+# --------------------------------------------------------------------------
+# Repo einrichten - erst die Rolle, dann nur der passende Weg
+# --------------------------------------------------------------------------
+# Frueher standen alle vier Knoepfe gleichzeitig da und man musste selbst
+# herausfinden, welche Schritte fuer einen gelten. Jetzt wird zuerst gefragt,
+# WER man ist - danach sieht man nur noch die eigenen Schritte.
+#
+# Wie im Rest des Programms bewusst OHNE GetNewClosure(): die Knopf-Handler
+# merken sich ihre Felder in $script:-Variablen.
+
+function Show-SetupSeite {
+    param([int]$Nr)
+    $script:setupSeite = $Nr
+    for ($i = 0; $i -lt $script:setupPanels.Count; $i++) {
+        $script:setupPanels[$i].Visible = ($i -eq $Nr)
+    }
+    $script:setupZurueck.Visible = ($Nr -ne 0)
+    $script:setupKopf.Text = @(
+        "Wer bist du?"
+        "Du legst den gemeinsamen Ordner an"
+        "Du holst dir den vorhandenen Ordner"
+    )[$Nr]
+}
+
+# Setzt den Ordner im Hauptfenster, damit alle Funktionen damit arbeiten.
+function Set-SetupRepoPfad {
+    param([string]$Pfad)
+    if ($Pfad) { $script:txtRepo.Text = $Pfad }
+    Save-ConfigFromUI
+}
+
+# Erster Spieler: lokal anlegen UND hochladen in einem Rutsch.
+function Invoke-SetupErstellen {
+    $url = $script:setupUrlA.Text.Trim()
+    if (-not $url) {
+        $script:setupStatusA.Text = "Bitte oben die Adresse des leeren Repos einfuegen."
+        $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+    if (-not $script:setupDirA.Text.Trim()) {
+        $script:setupStatusA.Text = "Bitte einen Ordner auf deinem PC angeben."
+        $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+    Set-SetupRepoPfad $script:setupDirA.Text.Trim()
+    $script:setupStatusA.Text = "Wird eingerichtet, einen Moment..."
+    $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
+    [Windows.Forms.Application]::DoEvents()
+
+    Initialize-Repo
+    Connect-Remote $url
+
+    # Erfolg daran erkennen, dass der Branch jetzt beim Server bekannt ist
+    $ls = Invoke-GitRaw @('ls-remote', '--heads', 'origin', $script:cfg.Branch) $script:cfg.RepoPath
+    if ($ls.Code -eq 0 -and $ls.Text) {
+        $script:setupStatusA.Text = "Fertig! Schick die Adresse jetzt an deinen Mitspieler."
+        $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+        $script:setupKopierA.Enabled = $true
+    }
+    else {
+        $script:setupStatusA.Text = "Hat nicht geklappt - die Einzelheiten stehen im Protokoll im Hauptfenster."
+        $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+    }
+    # Damit "Spielen starten" sofort freigegeben wird und nicht erst, wenn
+    # zufaellig noch etwas im Hauptfenster geaendert wird.
+    [void](Update-ReadyState)
+}
+
+# Zweiter Spieler: fertiges Repo herunterladen.
+function Invoke-SetupHolen {
+    $url = $script:setupUrlB.Text.Trim()
+    if (-not $url) {
+        $script:setupStatusB.Text = "Bitte die Adresse einfuegen, die du bekommen hast."
+        $script:setupStatusB.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+    if (-not $script:setupDirB.Text.Trim()) {
+        $script:setupStatusB.Text = "Bitte einen Ordner auf deinem PC angeben."
+        $script:setupStatusB.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+    Set-SetupRepoPfad $script:setupDirB.Text.Trim()
+    $script:setupStatusB.Text = "Wird geholt, einen Moment..."
+    $script:setupStatusB.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
+    [Windows.Forms.Application]::DoEvents()
+
+    Copy-Repo $url
+
+    # Nicht nur auf .git pruefen: der Ordner kann geklont und trotzdem leer
+    # sein. Erst wenn HEAD auf einen echten Stand zeigt, ist es wirklich fertig.
+    if ((Invoke-GitRaw @('rev-parse', '--verify', 'HEAD') $script:cfg.RepoPath).Code -eq 0) {
+        $script:setupStatusB.Text = "Fertig! Du kannst das Fenster schliessen und spielen."
+        $script:setupStatusB.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+    }
+    else {
+        $script:setupStatusB.Text = "Hat nicht geklappt - die Einzelheiten stehen im Protokoll im Hauptfenster."
+        $script:setupStatusB.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+    }
+    [void](Update-ReadyState)
+}
+
+function Invoke-SetupGh {
+    Set-SetupRepoPfad $script:setupDirA.Text.Trim()
+    $script:setupStatusA.Text = "Repo wird bei GitHub angelegt..."
+    $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
+    [Windows.Forms.Application]::DoEvents()
+    New-RemoteWithGh $script:setupNameBox.Text
+    $u = Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath
+    if ($u.Code -eq 0 -and $u.Text) {
+        $script:setupUrlA.Text = $u.Text
+        $script:setupStatusA.Text = "Fertig! Schick die Adresse oben an deinen Mitspieler."
+        $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+        $script:setupKopierA.Enabled = $true
+    }
+    else {
+        $script:setupStatusA.Text = "Hat nicht geklappt - Einzelheiten im Protokoll im Hauptfenster."
+        $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+    }
+}
+
 function Show-SetupDialog {
     Save-ConfigFromUI
-    # Wichtig: Die Knopf-Handler unten benutzen bewusst KEIN .GetNewClosure().
-    # Ein solcher "Closure" haengt den Klick-Code in ein eigenes kleines Modul,
-    # das je nach PowerShell-Version die Funktionen aus diesem Skript nicht mehr
-    # findet ("Copy-Repo wurde nicht als Name eines Cmdlets ... erkannt").
-    # Stattdessen merken wir uns die Eingabefelder in $script:-Variablen -
-    # genau so, wie es das Hauptfenster auch macht.
     $dlg = New-Object Windows.Forms.Form
     $script:setupDlg = $dlg
-    $dlg.Text = "Gemeinsames Repo einrichten"
-    $dlg.Size = New-Object Drawing.Size(560, 430)
+    $dlg.Text = "Gemeinsamen Ordner einrichten"
+    $dlg.Size = New-Object Drawing.Size(640, 500)
     $dlg.StartPosition = "CenterParent"
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
 
-    $info = New-Object Windows.Forms.Label
-    $info.Text = "Einer legt das Repo an (Schritte 1 + 2), der andere klont es nur (Schritt 3)." + [Environment]::NewLine + [Environment]::NewLine + "Das LEERE Remote-Repo erstellst du vorher einmalig auf github.com (o. ae.) - oder unten per GitHub CLI. Trage oben im Hauptfenster Repo-Ordner, Name und Branch ein."
-    $info.Location = New-Object Drawing.Point(15, 10)
-    $info.Size = New-Object Drawing.Size(525, 70)
-    $dlg.Controls.Add($info)
+    $script:setupKopf = New-Object Windows.Forms.Label
+    $script:setupKopf.Location = New-Object Drawing.Point(18, 14)
+    $script:setupKopf.Size = New-Object Drawing.Size(590, 26)
+    $script:setupKopf.Font = New-Object Drawing.Font("Segoe UI", 12, [Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($script:setupKopf)
 
-    $lu = New-Object Windows.Forms.Label
-    $lu.Text = "Remote-URL:"; $lu.Location = New-Object Drawing.Point(15, 92); $lu.Size = New-Object Drawing.Size(90, 22)
-    $lu.TextAlign = 'MiddleLeft'; $dlg.Controls.Add($lu)
-    $tu = New-Object Windows.Forms.TextBox
-    $tu.Location = New-Object Drawing.Point(110, 92); $tu.Size = New-Object Drawing.Size(430, 22)
-    $dlg.Controls.Add($tu)
-    $script:setupUrlBox = $tu
-    Set-Tip ("Adresse des gemeinsamen Repos, z. B.`n" +
-        "https://github.com/DEINNAME/ac-save.git`n" +
-        "Wird fuer Schritt 2 und Schritt 3 gebraucht.") $lu $tu
+    function NeuSeite {
+        $p = New-Object Windows.Forms.Panel
+        $p.Location = New-Object Drawing.Point(18, 46)
+        $p.Size = New-Object Drawing.Size(596, 350)
+        $p.Visible = $false
+        $dlg.Controls.Add($p)
+        return $p
+    }
+    function SeitenText($panel, $text, $y, $h = 40) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $text
+        $l.Location = New-Object Drawing.Point(2, $y)
+        $l.Size = New-Object Drawing.Size(590, $h)
+        $panel.Controls.Add($l)
+        return $l
+    }
+    function SeitenFeld($panel, $beschriftung, $wert, $y, $breite = 420) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $beschriftung
+        $l.Location = New-Object Drawing.Point(2, $y)
+        $l.Size = New-Object Drawing.Size(590, 18)
+        $panel.Controls.Add($l)
+        $t = New-Object Windows.Forms.TextBox
+        $t.Text = "$wert"
+        $t.Location = New-Object Drawing.Point(2, ($y + 20))
+        $t.Size = New-Object Drawing.Size($breite, 22)
+        $panel.Controls.Add($t)
+        return $t
+    }
 
-    $b1 = New-Object Windows.Forms.Button
-    $b1.Text = "1) Lokales Repo in diesem Ordner anlegen"
-    $b1.Location = New-Object Drawing.Point(15, 128); $b1.Size = New-Object Drawing.Size(525, 32)
-    $b1.Add_Click({ Initialize-Repo })
-    $dlg.Controls.Add($b1)
-    Set-Tip ("Fuer den ERSTEN Spieler: macht aus dem oben eingetragenen`n" +
-        "Repo-Ordner ein Git-Repo (legt .gitattributes, die README und`n" +
-        "den ersten Commit an). Aendert nichts, wenn es schon eins ist.") $b1
+    # ================= Seite 0: Rollenwahl =================================
+    $s0 = NeuSeite
+    SeitenText $s0 ("Ihr braucht EINEN gemeinsamen Ordner im Internet (ein privates Repo," + [Environment]::NewLine +
+        "z. B. bei github.com). Einer von euch legt ihn an, der andere holt ihn sich." + [Environment]::NewLine + [Environment]::NewLine +
+        "Was trifft auf dich zu?") 4 76 | Out-Null
 
-    $b2 = New-Object Windows.Forms.Button
-    $b2.Text = "2) Mit Remote-URL verbinden und hochladen"
-    $b2.Location = New-Object Drawing.Point(15, 166); $b2.Size = New-Object Drawing.Size(525, 32)
-    $b2.Add_Click({ Connect-Remote $script:setupUrlBox.Text })
-    $dlg.Controls.Add($b2)
-    Set-Tip ("Verbindet das lokale Repo mit der Remote-URL oben ('origin')`n" +
-        "und laedt alles hoch. Das Repo im Internet muss dafuer schon`n" +
-        "existieren - am besten leer angelegt.") $b2
+    $r1 = New-Object Windows.Forms.Button
+    $r1.Text = "Ich bin der Erste - ich lege ihn an"
+    $r1.Location = New-Object Drawing.Point(2, 92)
+    $r1.Size = New-Object Drawing.Size(590, 46)
+    $r1.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+    $r1.Add_Click({ Show-SetupSeite 1 })
+    $s0.Controls.Add($r1)
+    SeitenText $s0 ("Waehle das, wenn ihr noch gar nichts habt. Dein Spielstand wird dabei" + [Environment]::NewLine +
+        "hochgeladen und ist danach der gemeinsame Ausgangsstand.") 142 40 | Out-Null
 
-    $b3 = New-Object Windows.Forms.Button
-    $b3.Text = "3) Vorhandenes Repo von URL klonen (fuer den 2. Spieler)"
-    $b3.Location = New-Object Drawing.Point(15, 204); $b3.Size = New-Object Drawing.Size(525, 32)
-    $b3.Add_Click({ Copy-Repo $script:setupUrlBox.Text })
-    $dlg.Controls.Add($b3)
-    Set-Tip ("Fuer den ZWEITEN Spieler: laedt das fertige Repo von der URL oben`n" +
-        "in den Repo-Ordner herunter. Der Zielordner muss leer sein`n" +
-        "(oder darf noch nicht existieren).") $b3
+    $r2 = New-Object Windows.Forms.Button
+    $r2.Text = "Mein Mitspieler hat ihn schon - ich hole ihn mir"
+    $r2.Location = New-Object Drawing.Point(2, 196)
+    $r2.Size = New-Object Drawing.Size(590, 46)
+    $r2.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+    $r2.Add_Click({ Show-SetupSeite 2 })
+    $s0.Controls.Add($r2)
+    SeitenText $s0 ("Waehle das, wenn du von deinem Mitspieler eine Adresse bekommen hast." + [Environment]::NewLine +
+        "Achtung: Dein eigener Spielstand wird dabei NICHT hochgeladen.") 246 40 | Out-Null
 
-    $sep = New-Object Windows.Forms.Label
-    $sep.Text = "Optional (falls GitHub CLI 'gh' installiert ist) - erstellt das Remote automatisch:"
-    $sep.Location = New-Object Drawing.Point(15, 248); $sep.Size = New-Object Drawing.Size(525, 20)
-    $dlg.Controls.Add($sep)
+    # Hinweis, falls hier schon alles eingerichtet ist.
+    # Die Pruefung auf einen leeren Pfad muss zuerst kommen: Join-Path wirft
+    # bei einem leeren Pfad einen Fehler - der Dialog wuerde gar nicht aufgehen.
+    if ((-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
+        (Test-Path (Join-Path $script:cfg.RepoPath '.git')) -and
+        (Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath).Code -eq 0) {
+        $fertig = SeitenText $s0 "Uebrigens: Auf diesem PC ist bereits alles eingerichtet." 300 20
+        $fertig.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+    }
 
-    $ln = New-Object Windows.Forms.Label
-    $ln.Text = "Repo-Name:"; $ln.Location = New-Object Drawing.Point(15, 274); $ln.Size = New-Object Drawing.Size(90, 22)
-    $ln.TextAlign = 'MiddleLeft'; $dlg.Controls.Add($ln)
-    $tn = New-Object Windows.Forms.TextBox
-    $tn.Text = "ac-save"; $tn.Location = New-Object Drawing.Point(110, 274); $tn.Size = New-Object Drawing.Size(190, 22)
-    $dlg.Controls.Add($tn)
-    $script:setupNameBox = $tn
-    Set-Tip ("Name des neuen GitHub-Repos, das per GitHub CLI angelegt wird,`n" +
-        "z. B. ac-save. Nur der Name, nicht die ganze Adresse.") $ln $tn
+    # ================= Seite 1: Erster Spieler =============================
+    $s1 = NeuSeite
+    SeitenText $s1 "Schritt 1 - Leeren Ordner im Internet anlegen" 2 18 |
+    ForEach-Object { $_.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold) }
+    SeitenText $s1 ("Auf github.com anmelden und ein NEUES Repo anlegen: auf 'Private' stellen" + [Environment]::NewLine +
+        "und KEINEN Haken bei 'Add a README file' setzen - der Ordner muss leer sein.") 22 36 | Out-Null
+    $bWeb = New-Object Windows.Forms.Button
+    $bWeb.Text = "github.com/new oeffnen"
+    $bWeb.Location = New-Object Drawing.Point(2, 60)
+    $bWeb.Size = New-Object Drawing.Size(190, 28)
+    $bWeb.Add_Click({ Start-Process "https://github.com/new" })
+    $s1.Controls.Add($bWeb)
 
-    $b4 = New-Object Windows.Forms.Button
-    $b4.Text = "GitHub-Repo per gh erstellen und pushen"
-    $b4.Location = New-Object Drawing.Point(310, 272); $b4.Size = New-Object Drawing.Size(230, 26)
-    $b4.Add_Click({ New-RemoteWithGh $script:setupNameBox.Text })
-    $dlg.Controls.Add($b4)
-    Set-Tip ("Erledigt Schritt 1 und 2 auf einen Schlag: legt mit der GitHub CLI`n" +
-        "('gh') ein PRIVATES Repo an und laedt den Repo-Ordner hoch.`n" +
-        "Klappt nur, wenn 'gh' installiert und angemeldet ist.") $b4
+    # Falls die GitHub CLI da ist, geht Schritt 1 auch automatisch
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        $lgh = SeitenText $s1 "oder automatisch (GitHub CLI erkannt) - Name:" 96 18
+        $lgh.Size = New-Object Drawing.Size(280, 18)
+        $script:setupNameBox = New-Object Windows.Forms.TextBox
+        $script:setupNameBox.Text = "ac-save"
+        $script:setupNameBox.Location = New-Object Drawing.Point(288, 94)
+        $script:setupNameBox.Size = New-Object Drawing.Size(120, 22)
+        $s1.Controls.Add($script:setupNameBox)
+        $bgh = New-Object Windows.Forms.Button
+        $bgh.Text = "Automatisch anlegen"
+        $bgh.Location = New-Object Drawing.Point(416, 92)
+        $bgh.Size = New-Object Drawing.Size(176, 26)
+        $bgh.Add_Click({ Invoke-SetupGh })
+        $s1.Controls.Add($bgh)
+    }
+    else {
+        $script:setupNameBox = New-Object Windows.Forms.TextBox   # Platzhalter
+    }
+
+    SeitenText $s1 "Schritt 2 - Adresse und Ordner angeben" 126 18 |
+    ForEach-Object { $_.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold) }
+    $script:setupUrlA = SeitenFeld $s1 "Adresse des neuen, leeren Repos:" "" 148 590
+    $script:setupDirA = SeitenFeld $s1 "Ordner auf deinem PC (wird angelegt, falls noetig):" $script:cfg.RepoPath 196 520
+    $bDirA = New-Object Windows.Forms.Button
+    $bDirA.Text = "..."; $bDirA.Location = New-Object Drawing.Point(528, 216); $bDirA.Size = New-Object Drawing.Size(64, 22)
+    $bDirA.Add_Click({
+            $p = Select-FolderModern $script:setupDirA.Text "Ordner fuer den gemeinsamen Spielstand"
+            if ($p) { $script:setupDirA.Text = $p }
+        })
+    $s1.Controls.Add($bDirA)
+
+    SeitenText $s1 "Schritt 3 - Loslegen" 246 18 |
+    ForEach-Object { $_.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold) }
+    $bGo = New-Object Windows.Forms.Button
+    $bGo.Text = "Einrichten und hochladen"
+    $bGo.Location = New-Object Drawing.Point(2, 268)
+    $bGo.Size = New-Object Drawing.Size(230, 34)
+    $bGo.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+    $bGo.Add_Click({ Invoke-SetupErstellen })
+    $s1.Controls.Add($bGo)
+
+    $script:setupKopierA = New-Object Windows.Forms.Button
+    $script:setupKopierA.Text = "Adresse kopieren"
+    $script:setupKopierA.Location = New-Object Drawing.Point(242, 268)
+    $script:setupKopierA.Size = New-Object Drawing.Size(160, 34)
+    $script:setupKopierA.Enabled = $false
+    $script:setupKopierA.Add_Click({
+            try { [Windows.Forms.Clipboard]::SetText($script:setupUrlA.Text.Trim()) } catch { }
+        })
+    $s1.Controls.Add($script:setupKopierA)
+    Set-Tip ("Kopiert die Adresse in die Zwischenablage - schick sie deinem`n" +
+        "Mitspieler, damit er sich den Ordner holen kann.") $script:setupKopierA
+
+    $script:setupStatusA = SeitenText $s1 "" 310 34
+
+    # ================= Seite 2: Zweiter Spieler ============================
+    $s2 = NeuSeite
+    SeitenText $s2 ("Dein Mitspieler hat den gemeinsamen Ordner schon angelegt und dir eine" + [Environment]::NewLine +
+        "Adresse geschickt. Die brauchst du jetzt - mehr nicht." + [Environment]::NewLine + [Environment]::NewLine +
+        "Wichtig: Es wird SEIN Spielstand geholt. Ein eigener Spielstand auf" + [Environment]::NewLine +
+        "diesem PC wird dabei nicht hochgeladen.") 4 96 | Out-Null
+
+    $script:setupUrlB = SeitenFeld $s2 "Adresse von deinem Mitspieler:" "" 108 590
+    $script:setupDirB = SeitenFeld $s2 "Ordner auf deinem PC (muss leer sein oder neu):" $script:cfg.RepoPath 156 520
+    $bDirB = New-Object Windows.Forms.Button
+    $bDirB.Text = "..."; $bDirB.Location = New-Object Drawing.Point(528, 176); $bDirB.Size = New-Object Drawing.Size(64, 22)
+    $bDirB.Add_Click({
+            $p = Select-FolderModern $script:setupDirB.Text "Ordner fuer den gemeinsamen Spielstand"
+            if ($p) { $script:setupDirB.Text = $p }
+        })
+    $s2.Controls.Add($bDirB)
+
+    $bHol = New-Object Windows.Forms.Button
+    $bHol.Text = "Jetzt holen"
+    $bHol.Location = New-Object Drawing.Point(2, 214)
+    $bHol.Size = New-Object Drawing.Size(230, 34)
+    $bHol.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+    $bHol.Add_Click({ Invoke-SetupHolen })
+    $s2.Controls.Add($bHol)
+
+    $script:setupStatusB = SeitenText $s2 "" 256 34
+
+    # ================= Navigation ==========================================
+    $script:setupPanels = @($s0, $s1, $s2)
+
+    $script:setupZurueck = New-Object Windows.Forms.Button
+    $script:setupZurueck.Text = "< Zurueck"
+    $script:setupZurueck.Location = New-Object Drawing.Point(18, 412)
+    $script:setupZurueck.Size = New-Object Drawing.Size(120, 32)
+    $script:setupZurueck.Add_Click({ Show-SetupSeite 0 })
+    $dlg.Controls.Add($script:setupZurueck)
 
     $bc = New-Object Windows.Forms.Button
-    $bc.Text = "Schliessen"; $bc.Location = New-Object Drawing.Point(435, 330); $bc.Size = New-Object Drawing.Size(105, 30)
+    $bc.Text = "Schliessen"
+    $bc.Location = New-Object Drawing.Point(494, 412)
+    $bc.Size = New-Object Drawing.Size(120, 32)
     $bc.Add_Click({ $script:setupDlg.Close() })
     $dlg.Controls.Add($bc)
     Set-Tip "Schliesst dieses Fenster. Die Einstellungen bleiben erhalten." $bc
 
+    Show-SetupSeite 0
     [void]$dlg.ShowDialog()
 }
 
