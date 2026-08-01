@@ -510,13 +510,70 @@ function Sync-Remote {
 
 function Get-LockPath { Join-Path $script:cfg.RepoPath "PLAYING.lock" }
 
+# In der Sperrdatei stecken ZWEI Zeitpunkte, und sie haben verschiedene Aufgaben:
+#   startedUtc - wann die Sitzung begonnen hat. Bleibt die ganze Sitzung stehen.
+#                Nur dafuer da, anzuzeigen "spielt seit ...".
+#   updatedUtc - wann zuletzt ein Herzschlag kam. Wird laufend erneuert und
+#                entscheidet, ob die Sperre abgelaufen ist.
+# Frueher gab es nur updatedUtc, und die Anzeige rechnete damit - dadurch
+# sprang "spielt seit" bei jedem Herzschlag zurueck auf null.
+# Liest einen Zeitstempel aus der Sperrdatei zuverlaessig als UTC.
+#
+# Warum eine eigene Funktion? ConvertFrom-Json macht aus einem Text wie
+# "2026-08-01T04:35:12.1Z" von sich aus ein DateTime-Objekt. Reicht man das
+# an Parse weiter, wandelt PowerShell es vorher in Text um - und zwar in
+# einem anderen Format, als Parse es dann liest. Aus dem 1. August wird so
+# der 8. Januar, und die Anzeige zeigt Monate statt Minuten.
+# Deshalb: DateTime direkt nehmen, Text nur nach festen Regeln lesen.
+function ConvertTo-UtcZeit {
+    param($Wert)
+    if ($null -eq $Wert) { return $null }
+    if ($Wert -is [datetime]) { return $Wert.ToUniversalTime() }
+    $d = [datetime]::MinValue
+    $ok = [datetime]::TryParse(
+        [string]$Wert,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind,
+        [ref]$d)
+    if ($ok) { return $d.ToUniversalTime() }
+    return $null
+}
+
 function Set-LockFile {
+    param(
+        # Beim Sichern der Sperre gesetzt: startet die Zeitmessung neu.
+        # Beim Herzschlag weggelassen, damit der Startzeitpunkt erhalten bleibt.
+        [switch]$Neu
+    )
+    $start = $null
+    if (-not $Neu) {
+        # Vorhandenen Startzeitpunkt uebernehmen - immer wieder im festen
+        # Format schreiben, damit er beim naechsten Lesen eindeutig bleibt.
+        try {
+            $alt = Get-Content (Get-LockPath) -Raw -ErrorAction Stop | ConvertFrom-Json
+            $altStart = ConvertTo-UtcZeit $alt.startedUtc
+            if ($altStart) { $start = $altStart.ToString("o") }
+        }
+        catch { $start = $null }
+    }
+    if (-not $start) { $start = [datetime]::UtcNow.ToString("o") }
+
     $obj = [ordered]@{
         owner      = $script:cfg.PlayerName
         machine    = $env:COMPUTERNAME
+        startedUtc = $start
         updatedUtc = [datetime]::UtcNow.ToString("o")
     }
     ($obj | ConvertTo-Json) | Set-Content -Path (Get-LockPath) -Encoding UTF8
+}
+
+# Macht aus Minuten eine lesbare Angabe. "seit 154,3 Min" liest sich schlecht.
+function Format-Dauer {
+    param([double]$Minuten)
+    if ($Minuten -lt 1) { return "unter 1 Min" }
+    $m = [int][math]::Floor($Minuten)
+    if ($m -lt 60) { return ("{0} Min" -f $m) }
+    return ("{0} Std {1} Min" -f [int][math]::Floor($m / 60), ($m % 60))
 }
 
 function Get-LockState {
@@ -524,16 +581,26 @@ function Get-LockState {
     if (-not (Test-Path $lf)) { return [pscustomobject]@{ State = 'free' } }
     try {
         $j = Get-Content $lf -Raw -ErrorAction Stop | ConvertFrom-Json
-        $upd = [datetimeoffset]::Parse($j.updatedUtc).UtcDateTime
+        $upd = ConvertTo-UtcZeit $j.updatedUtc
+        if (-not $upd) { return [pscustomobject]@{ State = 'unknown' } }
         $age = ([datetime]::UtcNow - $upd).TotalMinutes
+        if ($age -lt 0) { $age = 0 }       # abweichende Uhren nicht negativ anzeigen
+
+        # Sperrdateien aus aelteren Fassungen haben noch keinen Startzeitpunkt -
+        # dann bleibt nur der Herzschlag als Naeherung.
+        $start = ConvertTo-UtcZeit $j.startedUtc
+        $dauer = if ($start) { ([datetime]::UtcNow - $start).TotalMinutes } else { $age }
+        if ($dauer -lt 0) { $dauer = 0 }
+
         $mine = ($j.owner -eq $script:cfg.PlayerName) -and ($j.machine -eq $env:COMPUTERNAME)
         return [pscustomobject]@{
-            State      = 'locked'
-            Owner      = $j.owner
-            Machine    = $j.machine
-            AgeMinutes = $age
-            Stale      = ($age -gt $script:cfg.LeaseMinutes)
-            Mine       = $mine
+            State          = 'locked'
+            Owner          = $j.owner
+            Machine        = $j.machine
+            AgeMinutes     = $age       # seit dem letzten Herzschlag -> Ablauf
+            SessionMinutes = $dauer     # seit Sitzungsbeginn -> Anzeige
+            Stale          = ($age -gt $script:cfg.LeaseMinutes)
+            Mine           = $mine
         }
     }
     catch {
@@ -579,15 +646,17 @@ function Update-StatusUI {
         }
         'locked' {
             if ($lock.Mine) {
-                $script:lblStatus.Text = "DU spielst gerade  (Sperre liegt bei dir)"
+                $script:lblStatus.Text = ("DU spielst gerade  (seit {0})" -f (Format-Dauer $lock.SessionMinutes))
                 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(200, 220, 255)
             }
             elseif ($lock.Stale) {
-                $script:lblStatus.Text = ("ABGELAUFENE Sperre von {0}  (seit {1} Min)  -  kann uebernommen werden" -f $lock.Owner, [math]::Round($lock.AgeMinutes, 1))
+                # Hier zaehlt bewusst der Herzschlag: interessant ist, wie lange
+                # sich niemand mehr gemeldet hat - nicht die Sitzungsdauer.
+                $script:lblStatus.Text = ("ABGELAUFENE Sperre von {0}  (still seit {1})  -  kann uebernommen werden" -f $lock.Owner, (Format-Dauer $lock.AgeMinutes))
                 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 235, 180)
             }
             else {
-                $script:lblStatus.Text = ("GESPERRT  -  {0} spielt  (seit {1} Min)" -f $lock.Owner, [math]::Round($lock.AgeMinutes, 1))
+                $script:lblStatus.Text = ("GESPERRT  -  {0} spielt  (seit {1})" -f $lock.Owner, (Format-Dauer $lock.SessionMinutes))
                 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 200, 200)
             }
         }
@@ -616,7 +685,7 @@ function Start-Play {
     Update-StatusUI $lock
 
     if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
-        Write-Log ("GESPERRT: {0} spielt gerade (seit {1} Min). Bitte warten." -f $lock.Owner, [math]::Round($lock.AgeMinutes, 1))
+        Write-Log ("GESPERRT: {0} spielt gerade (seit {1}). Bitte warten." -f $lock.Owner, (Format-Dauer $lock.SessionMinutes))
         return
     }
     if ($lock.State -eq 'locked' -and $lock.Stale) {
@@ -626,7 +695,10 @@ function Start-Play {
     # Sperre sichern (mit Wettlauf-Schutz: wer zuerst pusht, gewinnt)
     $acquired = $false
     for ($i = 1; $i -le 3 -and -not $acquired; $i++) {
-        Set-LockFile
+        # -Neu: hier beginnt unsere Sitzung, die Zeitmessung faengt bei null an.
+        # Ohne das wuerde ein uebernommener Startzeitpunkt des anderen Spielers
+        # weiterlaufen.
+        Set-LockFile -Neu
         $p = Invoke-GitCommitPush ("lock: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -eq 0) { $acquired = $true; break }
 

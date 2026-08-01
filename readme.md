@@ -243,7 +243,10 @@ Mehr ist im Alltag nicht nötig.
 
 Damit nie zwei Leute gleichzeitig denselben Stand bespielen (und sich gegenseitig
 überschreiben), legt das Skript beim Start eine Sperr-Datei (`PLAYING.lock`) im Repo an – mit
-deinem Namen und einem Zeitstempel.
+deinem Namen und **zwei** Zeitstempeln:
+
+- **Sitzungsbeginn** – bleibt die ganze Sitzung stehen. Nur dafür da, „spielt seit …" anzuzeigen.
+- **Letzter Herzschlag** – wird laufend erneuert und entscheidet, ob die Sperre abgelaufen ist.
 
 **Ein dauerhaftes Aussperren ist ausgeschlossen**, gleich dreifach abgesichert:
 
