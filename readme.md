@@ -96,6 +96,18 @@ Die `.cmd` lässt sich jederzeit selbst bauen:
 powershell -ExecutionPolicy Bypass -File .\tools\Build-Cmd.ps1
 ```
 
+### Schritt 1 – Der Assistent
+
+Beim **allerersten Start** führt euch ein Assistent in vier Schritten durch das Nötigste:
+Begrüßung samt Prüfung, ob Git installiert ist (mit Download-Link, falls nicht), euer Name,
+Dolphin und Spielstand-Ordner (beides schon vorausgefüllt) und zum Schluss der gemeinsame
+Ordner. Wer die Adresse des gemeinsamen Repos schon hat, fügt sie dort ein und klickt
+**„Jetzt holen"** – dann ist alles fertig und die Abschnitte unten sind nicht mehr nötig.
+
+Wer das Repo erst noch anlegen muss, lässt den letzten Schritt leer und macht danach wie
+unten beschrieben weiter. Der Assistent erscheint nur einmal; alles lässt sich später im
+Hauptfenster ändern.
+
 ### Erste Person (bringt den Spielstand mit)
 
 1. Auf **github.com** ein neues, **leeres, privates** Repo anlegen und dessen URL kopieren
@@ -133,9 +145,20 @@ fertig.
 | **Spiel** (optional)  | Was gestartet werden soll (siehe unten). Leer = Dolphins normale Oberfläche öffnet sich.                                              |
 | **Save-Ordner**       | Der Ordner, in dem Dolphin die Speicherdaten **dieses Spiels** ablegt.                                                                |
 | **Dein Name**         | Dein Spielername – für Sperre und Spielzeit-Statistik. Muss sich vom Mitspieler unterscheiden.                                        |
-| **Branch**            | Git-Branch, meist `main`.                                                                                                             |
-| **Sperre gilt (Min)** | Nach so vielen Minuten ohne Herzschlag gilt eine Sperre als abgelaufen (Standard 5).                                                  |
-| **Herzschlag (Sek)**  | Abstand, in dem während des Spielens gesichert und die Sperre aufgefrischt wird (Standard 60).                                        |
+
+**Dolphin.exe** und **Save-Ordner** werden beim ersten Start automatisch gesucht und
+vorausgefüllt – beim Save-Ordner wird gezielt der Animal-Crossing-Ordner erkannt.
+
+Änderungen werden **automatisch gespeichert**, einen Speichern-Knopf gibt es nicht mehr.
+
+Unter **„Erweitert…"** liegen die selten gebrauchten Werte:
+
+| Feld                  | Bedeutung                                                                                      |
+| --------------------- | ---------------------------------------------------------------------------------------------- |
+| **Bilder-Ordner**     | Screenshots/Fotos, die nach dem Spielen ins Repo verschoben werden. Leer = aus.                |
+| **Branch**            | Git-Branch, meist `main`.                                                                      |
+| **Sperre gilt (Min)** | Nach so vielen Minuten ohne Herzschlag gilt eine Sperre als abgelaufen (Standard 5).           |
+| **Herzschlag (Sek)**  | Abstand, in dem während des Spielens gesichert und die Sperre aufgefrischt wird (Standard 60). |
 
 **Zum Feld „Spiel":** Das Skript erkennt automatisch, was du angibst:
 - eine **Spiel-/Preset-Datei** (`.iso`, `.wbfs`, `.rvz`, `.gcm`, `.ciso`, `.json`) →
@@ -164,8 +187,11 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 | **Status prüfen**              | Aktualisiert die Anzeige: frei, du spielst, jemand anderes spielt, oder abgelaufene Sperre. Läuft beim Programmstart automatisch einmal. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
-| **Speichern**                  | Speichert die Einstellungen.                                                                     |
+| **Erweitert…**                 | Selten gebrauchte Einstellungen: Bilder-Ordner, Branch, Sperre, Herzschlag.                      |
 | **Repo einrichten…**           | Öffnet den Einrichtungs-Dialog (anlegen / verbinden / klonen).                                   |
+
+„Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
+Knopf, dann steht dort, **was** fehlt.
 
 ### Statusanzeige (Farben)
 

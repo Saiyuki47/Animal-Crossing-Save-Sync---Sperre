@@ -92,6 +92,9 @@ if (-not (Test-Path $script:AppDir)) {
     New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
 }
 $script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
+# Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
+# dann fuehrt der Assistent durch die Einrichtung (siehe Start-Timer).
+$script:istErststart = -not (Test-Path $script:ConfigPath)
 
 $script:defaults = @{
     DolphinPath      = "C:\Program Files\Dolphin-x64\Dolphin.exe"
@@ -114,6 +117,9 @@ $script:lastAccounted = Get-Date
 # Meldungen, die anfallen, bevor das Protokollfeld existiert (z. B. beim Laden
 # der Konfig). Sie werden nachgetragen, sobald die Oberflaeche steht.
 $script:pendingLog = @()
+# Ist Git da? Wird beim Start einmal geprueft (siehe Start-Timer) und steuert,
+# ob "Spielen starten" ueberhaupt anklickbar ist.
+$script:gitDa = $true
 # Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
 $script:configSaved = $false
 
@@ -700,6 +706,7 @@ function Complete-Session {
     $script:proc = $null
     $script:btnPlay.Enabled = $true
     $script:btnStop.Enabled = $false
+    [void](Update-ReadyState)
     Update-StatusUI (Get-LockState)
 }
 
@@ -800,6 +807,37 @@ function Unlock-Session {
     if ($p.Code -eq 0) { Write-Log "Sperre wurde zwangsweise freigegeben." }
     else { Write-GitProblem "Die Sperre konnte nicht freigegeben werden." $p }
     Update-StatusUI (Get-LockState)
+}
+
+# Sperrt "Spielen starten", solange etwas Wichtiges fehlt - und sagt im
+# Kurzhinweis am Knopf, WAS fehlt. Besser, als den Nutzer erst beim Klick
+# in eine Fehlermeldung laufen zu lassen.
+function Update-ReadyState {
+    # Waehrend einer Sitzung steuern Start-Play/Complete-Session die Knoepfe.
+    if ($script:holdingLock) { return }
+
+    $fehlt = @()
+    if (-not $script:gitDa) { $fehlt += "Git ist nicht installiert" }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.PlayerName)) { $fehlt += "dein Name ist leer" }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.DolphinPath) -or
+        -not (Test-Path -LiteralPath $script:cfg.DolphinPath)) { $fehlt += "Dolphin wurde nicht gefunden" }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
+        -not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) { $fehlt += "der gemeinsame Ordner ist noch kein Repo" }
+
+    $bereit = ($fehlt.Count -eq 0)
+    $script:btnPlay.Enabled = $bereit
+    if ($bereit) {
+        Set-Tip ("Der normale Weg zum Spielen:`n" +
+            "holt den neuesten Spielstand, setzt die Sperre auf deinen Namen`n" +
+            "und startet Dolphin. Bricht ab, wenn jemand anderes gerade spielt.`n" +
+            "Beim Beenden von Dolphin wird automatisch gesichert, hochgeladen`n" +
+            "und die Sperre wieder freigegeben.") $script:btnPlay
+    }
+    else {
+        Set-Tip ("Noch nicht startklar - es fehlt:`n- " + ($fehlt -join "`n- ") +
+            "`n`nDer Knopf 'Selbsttest' zeigt im Detail, was zu tun ist.") $script:btnPlay
+    }
+    return $fehlt
 }
 
 function Update-Status {
@@ -1280,13 +1318,7 @@ pics/** -text -diff
             Write-Log "Erster Commit erstellt."
         }
         else {
-            Write-Log "FEHLER: Commit fehlgeschlagen - das Repo ist noch nicht startklar."
-            Write-Log ("  git commit: {0}" -f $c.Text)
-            if ($c.Text -match 'user\.email|user\.name|identity') {
-                Write-Log "  Tipp: Git kennt dich noch nicht. Einmalig ausfuehren:"
-                Write-Log '        git config --global user.name "Dein Name"'
-                Write-Log '        git config --global user.email "du@example.com"'
-            }
+            Write-GitProblem "Das Repo ist noch nicht startklar - Speichern fehlgeschlagen." $c
         }
     }
     Invoke-Git @('branch', '-M', $script:cfg.Branch) | Out-Null
@@ -1311,7 +1343,7 @@ function Connect-Remote {
     }
     $p = Invoke-Git @('push', '-u', 'origin', $script:cfg.Branch)
     if ($p.Code -eq 0) { Write-Log "Hochgeladen. Das Repo ist jetzt startklar - der andere kann es nun klonen." }
-    else { Write-Log "Push fehlgeschlagen: $($p.Text)" }
+    else { Write-GitProblem "Hochladen fehlgeschlagen." $p }
 }
 
 function Copy-Repo {
@@ -1325,9 +1357,13 @@ function Copy-Repo {
     }
     Write-Log "Klone Repo..."
     $out = & git clone $url $target 2>&1
-    Write-Log ("git clone: " + (($out | Out-String).Trim()))
-    if (Test-Path (Join-Path $target '.git')) { Write-Log "Klonen erfolgreich. Du kannst jetzt spielen." }
-    else { Write-Log "Klonen hat nicht geklappt - URL und Zugangsdaten pruefen." }
+    $text = ConvertTo-GitText $out
+    if (Test-Path (Join-Path $target '.git')) {
+        Write-Log "Klonen erfolgreich. Du kannst jetzt spielen."
+    }
+    else {
+        Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." ([pscustomobject]@{ Text = $text })
+    }
 }
 
 function New-RemoteWithGh {
@@ -1343,6 +1379,339 @@ function New-RemoteWithGh {
     Write-Log "Erstelle privates GitHub-Repo '$name' und lade hoch..."
     $out = & gh repo create $name --private --source $script:cfg.RepoPath --remote origin --push 2>&1
     Write-Log ("gh: " + (($out | Out-String).Trim()))
+}
+
+# --------------------------------------------------------------------------
+# Erststart-Assistent
+# --------------------------------------------------------------------------
+# Fuehrt beim allerersten Start in vier Schritten durch das Noetigste, statt
+# neun leere Felder hinzustellen. Wie im Rest des Programms bewusst OHNE
+# GetNewClosure(): die Knopf-Handler merken sich ihre Felder in $script:-Variablen.
+
+function Update-WizStep {
+    for ($i = 0; $i -lt $script:wizPanels.Count; $i++) {
+        $script:wizPanels[$i].Visible = ($i -eq $script:wizStep)
+    }
+    $script:wizBack.Enabled = ($script:wizStep -gt 0)
+    $script:wizNext.Text = if ($script:wizStep -ge $script:wizPanels.Count - 1) { "Fertig" } else { "Weiter >" }
+    $script:wizKopf.Text = $script:wizTitel[$script:wizStep]
+}
+
+function Invoke-WizNext {
+    if ($script:wizStep -ge $script:wizPanels.Count - 1) {
+        $script:wizDlg.DialogResult = 'OK'
+        $script:wizDlg.Close()
+        return
+    }
+    $script:wizStep++
+    Update-WizStep
+}
+
+function Invoke-WizBack {
+    if ($script:wizStep -gt 0) { $script:wizStep-- }
+    Update-WizStep
+}
+
+function Show-FirstRunWizard {
+    $dlg = New-Object Windows.Forms.Form
+    $script:wizDlg = $dlg
+    $dlg.Text = "Willkommen - Einrichtung in 4 Schritten"
+    $dlg.Size = New-Object Drawing.Size(640, 470)
+    $dlg.StartPosition = "CenterScreen"
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $script:wizKopf = New-Object Windows.Forms.Label
+    $script:wizKopf.Location = New-Object Drawing.Point(18, 14)
+    $script:wizKopf.Size = New-Object Drawing.Size(590, 26)
+    $script:wizKopf.Font = New-Object Drawing.Font("Segoe UI", 12, [Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($script:wizKopf)
+
+    function NeuPanel {
+        $p = New-Object Windows.Forms.Panel
+        $p.Location = New-Object Drawing.Point(18, 48)
+        $p.Size = New-Object Drawing.Size(596, 320)
+        $p.Visible = $false
+        $dlg.Controls.Add($p)
+        return $p
+    }
+    function NeuText($panel, $text, $y, $hoehe = 60) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $text
+        $l.Location = New-Object Drawing.Point(2, $y)
+        $l.Size = New-Object Drawing.Size(590, $hoehe)
+        $panel.Controls.Add($l)
+        return $l
+    }
+    function NeuFeld($panel, $beschriftung, $wert, $y) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $beschriftung
+        $l.Location = New-Object Drawing.Point(2, $y)
+        $l.Size = New-Object Drawing.Size(150, 22)
+        $l.TextAlign = 'MiddleLeft'
+        $panel.Controls.Add($l)
+        $t = New-Object Windows.Forms.TextBox
+        $t.Text = "$wert"
+        $t.Location = New-Object Drawing.Point(156, $y)
+        $t.Size = New-Object Drawing.Size(370, 22)
+        $panel.Controls.Add($t)
+        return $t
+    }
+
+    # ---- Schritt 1: Willkommen + Git-Pruefung -----------------------------
+    $p1 = NeuPanel
+    NeuText $p1 ("Dieses Programm sorgt dafuer, dass ihr euch beim Spielen nicht in die" + [Environment]::NewLine +
+        "Quere kommt: Es holt vor dem Spielen den neuesten Spielstand, meldet euch" + [Environment]::NewLine +
+        "als 'spielt gerade' an und laedt danach alles wieder hoch." + [Environment]::NewLine + [Environment]::NewLine +
+        "Die Einrichtung dauert zwei Minuten. Alles laesst sich spaeter aendern.") 6 110 | Out-Null
+
+    $gitOk = ((Invoke-GitRaw @('--version')).Code -eq 0)
+    $lg = NeuText $p1 "" 128 44
+    if ($gitOk) {
+        $lg.Text = "Git ist installiert - alles bereit."
+        $lg.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+    }
+    else {
+        $lg.Text = ("Git fehlt. Ohne Git kann nichts ausgetauscht werden." + [Environment]::NewLine +
+            "Bitte herunterladen, installieren und das Programm danach neu starten.")
+        $lg.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        $bg = New-Object Windows.Forms.Button
+        $bg.Text = "Git-Download oeffnen"
+        $bg.Location = New-Object Drawing.Point(2, 178)
+        $bg.Size = New-Object Drawing.Size(190, 30)
+        $bg.Add_Click({ Start-Process "https://git-scm.com/download/win" })
+        $p1.Controls.Add($bg)
+    }
+    $lg.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+
+    # ---- Schritt 2: Name --------------------------------------------------
+    $p2 = NeuPanel
+    NeuText $p2 ("Unter diesem Namen erscheinst du beim anderen Spieler - er steht in der" + [Environment]::NewLine +
+        "Anzeige 'spielt gerade' und in der Spielzeit-Statistik." + [Environment]::NewLine + [Environment]::NewLine +
+        "WICHTIG: Ihr beide braucht UNTERSCHIEDLICHE Namen. Sonst haelt jeder die" + [Environment]::NewLine +
+        "Sperre des anderen faelschlich fuer die eigene.") 6 110 | Out-Null
+    $vorname = if ($script:cfg.PlayerName) { $script:cfg.PlayerName } else { $env:USERNAME }
+    $script:wizName = NeuFeld $p2 "Dein Name:" $vorname 128
+
+    # ---- Schritt 3: Dolphin + Save-Ordner ---------------------------------
+    $p3 = NeuPanel
+    $gefunden = ($script:cfg.DolphinPath -and (Test-Path -LiteralPath $script:cfg.DolphinPath))
+    NeuText $p3 $(if ($gefunden) {
+            "Dolphin und der Spielstand-Ordner wurden automatisch gefunden." + [Environment]::NewLine +
+            "Bitte kurz pruefen - stimmt das so?"
+        }
+        else {
+            "Dolphin konnte nicht automatisch gefunden werden." + [Environment]::NewLine +
+            "Bitte die Datei Dolphin.exe ueber '...' auswaehlen."
+        }) 6 46 | Out-Null
+
+    $script:wizDolphin = NeuFeld $p3 "Dolphin.exe:" $script:cfg.DolphinPath 62
+    $b3a = New-Object Windows.Forms.Button
+    $b3a.Text = "..."; $b3a.Location = New-Object Drawing.Point(532, 61); $b3a.Size = New-Object Drawing.Size(60, 24)
+    $b3a.Add_Click({
+            $d = New-Object Windows.Forms.OpenFileDialog
+            $d.Filter = "Dolphin (Dolphin.exe)|Dolphin.exe|Programme (*.exe)|*.exe"
+            if ($d.ShowDialog() -eq 'OK') { $script:wizDolphin.Text = $d.FileName }
+        })
+    $p3.Controls.Add($b3a)
+
+    $script:wizSave = NeuFeld $p3 "Spielstand-Ordner:" $script:cfg.SaveFolder 96
+    $b3b = New-Object Windows.Forms.Button
+    $b3b.Text = "..."; $b3b.Location = New-Object Drawing.Point(532, 95); $b3b.Size = New-Object Drawing.Size(60, 24)
+    $b3b.Add_Click({
+            $p = Select-FolderModern $script:wizSave.Text "Spielstand-Ordner von Dolphin waehlen"
+            if ($p) { $script:wizSave.Text = $p }
+        })
+    $p3.Controls.Add($b3b)
+    NeuText $p3 ("Der Spielstand-Ordner ist der Ordner, in dem Dolphin den Spielstand" + [Environment]::NewLine +
+        "ablegt. Nur dieser eine Ordner wird ausgetauscht." + [Environment]::NewLine +
+        "Leer lassen = Spielstaende werden NICHT synchronisiert.") 130 70 | Out-Null
+
+    # ---- Schritt 4: gemeinsamer Ordner ------------------------------------
+    $p4 = NeuPanel
+    NeuText $p4 ("Ihr tauscht den Spielstand ueber ein gemeinsames Repo im Internet aus" + [Environment]::NewLine +
+        "(z. B. ein privates Repo auf github.com)." + [Environment]::NewLine + [Environment]::NewLine +
+        "Hat der andere Spieler es schon angelegt? Dann hier die Adresse einfuegen" + [Environment]::NewLine +
+        "und auf 'Jetzt holen' klicken - der Rest passiert von allein.") 6 100 | Out-Null
+    $script:wizUrl = NeuFeld $p4 "Adresse (URL):" "" 112
+    $zielVor = if ($script:cfg.RepoPath) { $script:cfg.RepoPath }
+    else { Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'AC-SaveSync-Repo' }
+    $script:wizRepo = NeuFeld $p4 "Ordner dafuer:" $zielVor 146
+    $b4 = New-Object Windows.Forms.Button
+    $b4.Text = "..."; $b4.Location = New-Object Drawing.Point(532, 145); $b4.Size = New-Object Drawing.Size(60, 24)
+    $b4.Add_Click({
+            $p = Select-FolderModern $script:wizRepo.Text "Ordner fuer den gemeinsamen Spielstand waehlen"
+            if ($p) { $script:wizRepo.Text = $p }
+        })
+    $p4.Controls.Add($b4)
+
+    $script:wizHolStatus = NeuText $p4 "" 216 44
+    $b4b = New-Object Windows.Forms.Button
+    $b4b.Text = "Jetzt holen"
+    $b4b.Location = New-Object Drawing.Point(2, 180); $b4b.Size = New-Object Drawing.Size(150, 30)
+    $b4b.Add_Click({ Invoke-WizClone })
+    $p4.Controls.Add($b4b)
+
+    NeuText $p4 ("Noch kein gemeinsames Repo? Dann einfach leer lassen und spaeter im" + [Environment]::NewLine +
+        "Hauptfenster auf 'Repo einrichten...' klicken.") 262 40 | Out-Null
+
+    # ---- Navigation -------------------------------------------------------
+    $script:wizPanels = @($p1, $p2, $p3, $p4)
+    $script:wizTitel = @(
+        "1 von 4: Willkommen"
+        "2 von 4: Wie heisst du?"
+        "3 von 4: Wo ist Dolphin?"
+        "4 von 4: Der gemeinsame Ordner"
+    )
+    $script:wizStep = 0
+
+    $script:wizBack = New-Object Windows.Forms.Button
+    $script:wizBack.Text = "< Zurueck"
+    $script:wizBack.Location = New-Object Drawing.Point(340, 385)
+    $script:wizBack.Size = New-Object Drawing.Size(120, 32)
+    $script:wizBack.Add_Click({ Invoke-WizBack })
+    $dlg.Controls.Add($script:wizBack)
+
+    $script:wizNext = New-Object Windows.Forms.Button
+    $script:wizNext.Text = "Weiter >"
+    $script:wizNext.Location = New-Object Drawing.Point(470, 385)
+    $script:wizNext.Size = New-Object Drawing.Size(140, 32)
+    $script:wizNext.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+    $script:wizNext.Add_Click({ Invoke-WizNext })
+    $dlg.Controls.Add($script:wizNext)
+    $dlg.AcceptButton = $script:wizNext
+
+    Update-WizStep
+    [void]$dlg.ShowDialog()
+
+    # Ergebnis in die Felder des Hauptfensters uebernehmen
+    if ($script:wizName.Text.Trim()) { $script:txtName.Text = $script:wizName.Text.Trim() }
+    if ($script:wizDolphin.Text.Trim()) { $script:txtDolphin.Text = $script:wizDolphin.Text.Trim() }
+    if ($script:wizSave.Text.Trim()) { $script:txtSave.Text = $script:wizSave.Text.Trim() }
+    if ($script:wizRepo.Text.Trim()) { $script:txtRepo.Text = $script:wizRepo.Text.Trim() }
+    Save-ConfigFromUI
+    Write-Log "Einrichtung abgeschlossen. Die Angaben sind gespeichert."
+}
+
+# Holt das gemeinsame Repo im Assistenten (Schritt 4).
+function Invoke-WizClone {
+    $url = $script:wizUrl.Text.Trim()
+    $ziel = $script:wizRepo.Text.Trim()
+    if (-not $url) {
+        $script:wizHolStatus.Text = "Bitte oben die Adresse einfuegen."
+        $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+    if (Test-Path (Join-Path $ziel '.git')) {
+        $script:wizHolStatus.Text = "In diesem Ordner liegt bereits ein Repo - passt."
+        $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+        return
+    }
+    $script:wizHolStatus.Text = "Wird geholt, einen Moment..."
+    $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
+    [Windows.Forms.Application]::DoEvents()
+
+    $out = & git clone $url $ziel 2>&1
+    $text = ConvertTo-GitText $out
+    if (Test-Path (Join-Path $ziel '.git')) {
+        $script:wizHolStatus.Text = "Geklappt - der gemeinsame Ordner ist da."
+        $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+        Write-Log "Repo geklont nach: $ziel"
+    }
+    else {
+        $klar = "Das Holen hat nicht geklappt."
+        foreach ($k in $script:GitKlartext) {
+            if ($text -match $k.Muster) { $klar = $k.Text; break }
+        }
+        $script:wizHolStatus.Text = $klar
+        $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." ([pscustomobject]@{ Text = $text })
+    }
+}
+
+# --------------------------------------------------------------------------
+# Selten gebrauchte Einstellungen
+# --------------------------------------------------------------------------
+# Die eigentlichen Felder liegen unsichtbar im Hauptfenster (siehe dort).
+# Dieser Dialog zeigt Kopien davon und schreibt beim Uebernehmen zurueck -
+# so bleibt Save-ConfigFromUI unveraendert.
+function Show-AdvancedDialog {
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = "Erweiterte Einstellungen"
+    $dlg.Size = New-Object Drawing.Size(600, 300)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+
+    $hinweis = New-Object Windows.Forms.Label
+    $hinweis.Text = "Diese Werte passen fuer die allermeisten so, wie sie sind."
+    $hinweis.Location = New-Object Drawing.Point(15, 12)
+    $hinweis.Size = New-Object Drawing.Size(560, 20)
+    $dlg.Controls.Add($hinweis)
+
+    function Zeile($text, $wert, $y, $breite) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $text; $l.Location = New-Object Drawing.Point(15, $y)
+        $l.Size = New-Object Drawing.Size(140, 22); $l.TextAlign = 'MiddleLeft'
+        $dlg.Controls.Add($l)
+        $t = New-Object Windows.Forms.TextBox
+        $t.Text = "$wert"; $t.Location = New-Object Drawing.Point(160, $y)
+        $t.Size = New-Object Drawing.Size($breite, 22)
+        $dlg.Controls.Add($t)
+        return $t
+    }
+
+    $tPics = Zeile "Bilder-Ordner:" $script:txtPics.Text 46 340
+    $bPics = New-Object Windows.Forms.Button
+    $bPics.Text = "..."; $bPics.Location = New-Object Drawing.Point(508, 45)
+    $bPics.Size = New-Object Drawing.Size(60, 24)
+    $script:advPicsBox = $tPics
+    $bPics.Add_Click({
+            $p = Select-FolderModern $script:advPicsBox.Text "Bilder-Ordner waehlen"
+            if ($p) { $script:advPicsBox.Text = $p }
+        })
+    $dlg.Controls.Add($bPics)
+
+    $tBranch = Zeile "Branch:" $script:txtBranch.Text 82 140
+    $tLease = Zeile "Sperre gilt (Min):" $script:txtLease.Text 118 60
+    $tHeart = Zeile "Herzschlag (Sek):" $script:txtHeart.Text 154 60
+
+    Set-Tip ("Ordner mit deinen Screenshots/Fotos, z. B. ...\Load\WiiSDSync.`n" +
+        "Nach dem Spielen werden die Bilder ins Repo VERSCHOBEN (Unterordner 'pics')`n" +
+        "und sind danach hier lokal nicht mehr vorhanden.`n" +
+        "Leer lassen = Bilder bleiben unangetastet.") $tPics $bPics
+    Set-Tip ("Der Git-Zweig, auf dem synchronisiert wird - normalerweise 'main'.`n" +
+        "Beide Spieler muessen denselben Branch eingetragen haben.") $tBranch
+    Set-Tip ("Wie lange eine Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
+        "Danach gilt sie als abgelaufen und darf uebernommen werden - so bleibt`n" +
+        "sie nach einem Absturz nicht ewig haengen.`n" +
+        "Standard: 5, Minimum 1.") $tLease
+    Set-Tip ("Wie oft waehrend des Spielens gespeichert und hochgeladen wird (in Sekunden).`n" +
+        "Kleiner = bei einem Absturz geht weniger verloren, aber mehr Git-Verkehr.`n" +
+        "Sollte deutlich kleiner sein als 'Sperre gilt', sonst laeuft die Sperre`n" +
+        "zwischendurch ab.`n" +
+        "Standard: 60, Minimum 10.") $tHeart
+
+    $ok = New-Object Windows.Forms.Button
+    $ok.Text = "Uebernehmen"; $ok.Location = New-Object Drawing.Point(340, 210)
+    $ok.Size = New-Object Drawing.Size(110, 30)
+    $ok.DialogResult = 'OK'
+    $dlg.Controls.Add($ok)
+    $ab = New-Object Windows.Forms.Button
+    $ab.Text = "Abbrechen"; $ab.Location = New-Object Drawing.Point(458, 210)
+    $ab.Size = New-Object Drawing.Size(110, 30)
+    $ab.DialogResult = 'Cancel'
+    $dlg.Controls.Add($ab)
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $ab
+
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $script:txtPics.Text = $tPics.Text
+        $script:txtBranch.Text = $tBranch.Text
+        $script:txtLease.Text = $tLease.Text
+        $script:txtHeart.Text = $tHeart.Text
+        Save-ConfigFromUI
+        Write-Log "Erweiterte Einstellungen uebernommen."
+    }
 }
 
 function Show-SetupDialog {
@@ -1448,11 +1817,11 @@ Import-Config
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre"
-# 42 px hoeher als frueher: die Knoepfe stehen jetzt in zwei Reihen,
-# das Protokollfeld darunter soll dadurch nicht kleiner werden.
-$form.Size = New-Object Drawing.Size(660, 822)
+# Hoehe passt zum Inhalt: zwei Knopfreihen, dafuer zwei Eingabezeilen weniger
+# (Bilder-Ordner, Branch, Sperre und Herzschlag stecken jetzt in "Erweitert...").
+$form.Size = New-Object Drawing.Size(660, 760)
 $form.StartPosition = "CenterScreen"
-$form.MinimumSize = New-Object Drawing.Size(660, 822)
+$form.MinimumSize = New-Object Drawing.Size(660, 700)
 
 function New-Label {
     param($text, $x, $y, $w = 120)
@@ -1532,44 +1901,38 @@ Set-Tip ("Der Ordner, in dem Dolphin den Spielstand dieses Spiels ablegt.`n" +
 Set-Tip "Save-Ordner auswaehlen: in den Ordner wechseln, dann unten auf 'Oeffnen'." $btnBrowseSave
 
 $y += 32
-$lblPics = New-Label "Bilder-Ordner:" 15 $y
-$script:txtPics = New-Text $script:cfg.PicsFolder 140 $y 400
-$btnBrowsePics = New-Button "..." 548 $y 60 24
-Set-Tip ("Ordner mit deinen Screenshots/Fotos, z. B. ...\Load\WiiSDSync.`n" +
-    "Nach dem Spielen werden die Bilder ins Repo VERSCHOBEN (Unterordner 'pics')`n" +
-    "und sind danach hier lokal nicht mehr vorhanden.`n" +
-    "Leer lassen = Bilder bleiben unangetastet.") $lblPics $script:txtPics
-Set-Tip "Bilder-Ordner auswaehlen: in den Ordner wechseln, dann unten auf 'Oeffnen'." $btnBrowsePics
-
-$y += 32
 $lblName = New-Label "Dein Name:" 15 $y
 $script:txtName = New-Text $script:cfg.PlayerName 140 $y 180
-$lblBranch = New-Label "Branch:" 340 $y 60
-$script:txtBranch = New-Text $script:cfg.Branch 400 $y 100
+$btnAdvanced = New-Button "Erweitert..." 330 ($y - 2) 130 26
+$btnSetup = New-Button "Repo einrichten..." 470 ($y - 2) 138 26
 Set-Tip ("Dein Spielername. Er steht in der Sperre und in der Spielzeit-Statistik.`n" +
     "WICHTIG: Beide Spieler muessen UNTERSCHIEDLICHE Namen benutzen,`n" +
     "sonst haelt jeder die Sperre des anderen fuer die eigene.") $lblName $script:txtName
-Set-Tip ("Der Git-Zweig, auf dem synchronisiert wird - normalerweise 'main'.`n" +
-    "Beide Spieler muessen denselben Branch eingetragen haben.") $lblBranch $script:txtBranch
-
-$y += 32
-$lblLease = New-Label "Sperre gilt (Min):" 15 $y
-$script:txtLease = New-Text $script:cfg.LeaseMinutes 140 $y 60
-$lblHeart = New-Label "Herzschlag (Sek):" 220 $y 120
-$script:txtHeart = New-Text $script:cfg.HeartbeatSeconds 340 $y 60
-$btnSetup = New-Button "Repo einrichten..." 410 ($y - 2) 198 26
-Set-Tip ("Wie lange eine Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
-    "Danach gilt sie als abgelaufen und darf uebernommen werden - so bleibt`n" +
-    "sie nach einem Absturz nicht ewig haengen.`n" +
-    "Standard: 5, Minimum 1.") $lblLease $script:txtLease
-Set-Tip ("Wie oft waehrend des Spielens gespeichert und hochgeladen wird (in Sekunden).`n" +
-    "Kleiner = bei einem Absturz geht weniger verloren, aber mehr Git-Verkehr.`n" +
-    "Sollte deutlich kleiner sein als 'Sperre gilt', sonst laeuft die Sperre`n" +
-    "zwischendurch ab.`n" +
-    "Standard: 60, Minimum 10.") $lblHeart $script:txtHeart
+Set-Tip ("Selten gebrauchte Einstellungen: Bilder-Ordner, Branch,`n" +
+    "Gueltigkeit der Sperre und Herzschlag-Takt.`n" +
+    "Die Standardwerte passen fuer die allermeisten.") $btnAdvanced
 Set-Tip ("Hilfe fuer die einmalige Einrichtung:`n" +
     "lokales Repo anlegen, mit GitHub verbinden und hochladen,`n" +
     "oder ein vorhandenes Repo klonen (fuer den zweiten Spieler).") $btnSetup
+
+# --- Selten gebrauchte Felder ---
+# Sie bleiben Teil des Hauptfensters (damit Save-ConfigFromUI unveraendert
+# funktioniert), sind dort aber unsichtbar. Bearbeitet werden sie im Dialog
+# "Erweitert...", der die Werte hier hineinschreibt. Weil unsichtbare
+# Controls nichts zeichnen, duerfen sie an derselben Stelle liegen.
+$lblPics = New-Label "Bilder-Ordner:" 15 $y
+$script:txtPics = New-Text $script:cfg.PicsFolder 140 $y 400
+$btnBrowsePics = New-Button "..." 548 $y 60 24
+$lblBranch = New-Label "Branch:" 15 $y 60
+$script:txtBranch = New-Text $script:cfg.Branch 80 $y 100
+$lblLease = New-Label "Sperre gilt (Min):" 200 $y
+$script:txtLease = New-Text $script:cfg.LeaseMinutes 320 $y 60
+$lblHeart = New-Label "Herzschlag (Sek):" 390 $y 120
+$script:txtHeart = New-Text $script:cfg.HeartbeatSeconds 510 $y 60
+foreach ($v in @($lblPics, $script:txtPics, $btnBrowsePics, $lblBranch, $script:txtBranch,
+        $lblLease, $script:txtLease, $lblHeart, $script:txtHeart)) {
+    $v.Visible = $false
+}
 
 # Statusanzeige
 $y += 40
@@ -1598,10 +1961,9 @@ $script:btnStop.Enabled = $false          # erst waehrend einer Sitzung nutzbar
 
 # zweite Reihe: alles, was man seltener braucht
 $y += 42
-$btnRefresh = New-Button "Status pruefen" 15 $y 140 34
-$btnSelfTest = New-Button "Selbsttest" 163 $y 140 34
-$btnUnlock = New-Button "Sperre erzwingen freigeben" 311 $y 180 34
-$btnSave = New-Button "Speichern" 499 $y 109 34
+$btnRefresh = New-Button "Status pruefen" 15 $y 180 34
+$btnSelfTest = New-Button "Selbsttest" 203 $y 180 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 391 $y 217 34
 Set-Tip ("Prueft der Reihe nach alles, was zum Spielen noetig ist:`n" +
     "Git, deine Angaben, Dolphin, den gemeinsamen Ordner und die`n" +
     "Verbindung zum Server. Zu jedem Problem steht dabei, was zu tun ist.`n" +
@@ -1622,8 +1984,6 @@ Set-Tip ("Notausgang: loescht die Sperre, obwohl niemand Dolphin`n" +
     "Nur benutzen, wenn sicher ist, dass niemand spielt (z. B. nach`n" +
     "einem Absturz) - sonst kann Fortschritt des anderen verloren gehen.`n" +
     "Normalerweise unnoetig: die Sperre laeuft von allein ab.") $btnUnlock
-Set-Tip ("Speichert die Einstellungen dauerhaft, damit sie beim naechsten`n" +
-    "Start wieder da sind (in %APPDATA%\AC-SaveSync\acsync-config.json).") $btnSave
 
 # Log
 $y += 46
@@ -1658,6 +2018,21 @@ $script:timer = New-Object Windows.Forms.Timer
 $script:timer.Interval = 3000
 $script:timer.Add_Tick({ Invoke-Tick })
 
+# Automatisch speichern - der "Speichern"-Knopf ist deshalb entfallen.
+# Nach der letzten Aenderung wird kurz gewartet, damit nicht bei jedem
+# einzelnen Tastendruck in die Datei geschrieben wird.
+$script:saveTimer = New-Object Windows.Forms.Timer
+$script:saveTimer.Interval = 800
+$script:saveTimer.Add_Tick({
+        $script:saveTimer.Stop()
+        Save-ConfigFromUI
+        [void](Update-ReadyState)
+    })
+foreach ($feld in @($script:txtDolphin, $script:txtRepo, $script:txtGame, $script:txtSave,
+        $script:txtPics, $script:txtName, $script:txtBranch, $script:txtLease, $script:txtHeart)) {
+    $feld.Add_TextChanged({ $script:saveTimer.Stop(); $script:saveTimer.Start() })
+}
+
 # Einmaliger Timer fuer die automatische Pruefung beim Start.
 # Warum ein Timer und nicht direkt im "Shown"-Ereignis? Git braucht ein paar
 # Sekunden, und in dieser Zeit waere das Fenster noch nicht gezeichnet. So
@@ -1667,12 +2042,18 @@ $script:startTimer.Interval = 200
 $script:startTimer.Add_Tick({
         $script:startTimer.Stop()
 
+        # Allererster Start: erst durch die Einrichtung fuehren.
+        if ($script:istErststart) { Show-FirstRunWizard }
+
         # Ohne Git geht gar nichts - dann sofort den Selbsttest zeigen, statt
         # den Nutzer spaeter in eine unverstaendliche Fehlermeldung laufen zu lassen.
-        if ((Invoke-GitRaw @('--version')).Code -ne 0) {
+        $script:gitDa = ((Invoke-GitRaw @('--version')).Code -eq 0)
+        [void](Update-ReadyState)
+        if (-not $script:gitDa) {
             $script:lblStatus.Text = "Git fehlt - siehe Selbsttest"
             Write-Log "Git ist nicht installiert - ohne Git kann das Programm nichts austauschen."
-            Show-SelfTest
+            # Nach dem Assistenten nicht noch einmal nerven - der hat es schon gesagt.
+            if (-not $script:istErststart) { Show-SelfTest }
             return
         }
 
@@ -1736,14 +2117,15 @@ $script:btnStop.Add_Click({ Stop-Play })
 $btnRefresh.Add_Click({ Update-Status })
 $btnSelfTest.Add_Click({ Show-SelfTest })
 $btnUnlock.Add_Click({ Unlock-Session })
-$btnSave.Add_Click({
-        Save-ConfigFromUI
-        if ($script:configSaved) { Write-Log "Einstellungen gespeichert." }
-    })
 $btnSetup.Add_Click({ Show-SetupDialog })
+$btnAdvanced.Add_Click({ Show-AdvancedDialog })
 
 $form.Add_FormClosing({
         param($s, $e)
+        # Noch nicht geschriebene Aenderungen sichern (der Wartetimer koennte
+        # gerade noch laufen).
+        if ($script:saveTimer) { $script:saveTimer.Stop() }
+        Save-ConfigFromUI
         if ($script:holdingLock) {
             $r = [Windows.Forms.MessageBox]::Show(
                 ("Es laeuft noch eine Sitzung und du haeltst die Sperre.`n`n" +
