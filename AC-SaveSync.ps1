@@ -567,8 +567,12 @@ function Set-LockFile {
     ($obj | ConvertTo-Json) | Set-Content -Path (Get-LockPath) -Encoding UTF8
 }
 
-# Macht aus Minuten eine lesbare Angabe. "seit 154,3 Min" liest sich schlecht.
-function Format-Dauer {
+# Macht aus MINUTEN eine lesbare Angabe fuer die Statusanzeige.
+# "seit 154,3 Min" liest sich schlecht, "seit 2 Std 34 Min" gut.
+# Nicht zu verwechseln mit Format-Duration weiter unten: das rechnet mit
+# SEKUNDEN und liefert die knappe Form ("2h 34m") fuer die Tabelle in der
+# gemeinsamen README.
+function Format-Minuten {
     param([double]$Minuten)
     if ($Minuten -lt 1) { return "unter 1 Min" }
     $m = [int][math]::Floor($Minuten)
@@ -646,17 +650,17 @@ function Update-StatusUI {
         }
         'locked' {
             if ($lock.Mine) {
-                $script:lblStatus.Text = ("DU spielst gerade  (seit {0})" -f (Format-Dauer $lock.SessionMinutes))
+                $script:lblStatus.Text = ("DU spielst gerade  (seit {0})" -f (Format-Minuten $lock.SessionMinutes))
                 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(200, 220, 255)
             }
             elseif ($lock.Stale) {
                 # Hier zaehlt bewusst der Herzschlag: interessant ist, wie lange
                 # sich niemand mehr gemeldet hat - nicht die Sitzungsdauer.
-                $script:lblStatus.Text = ("ABGELAUFENE Sperre von {0}  (still seit {1})  -  kann uebernommen werden" -f $lock.Owner, (Format-Dauer $lock.AgeMinutes))
+                $script:lblStatus.Text = ("ABGELAUFENE Sperre von {0}  (still seit {1})  -  kann uebernommen werden" -f $lock.Owner, (Format-Minuten $lock.AgeMinutes))
                 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 235, 180)
             }
             else {
-                $script:lblStatus.Text = ("GESPERRT  -  {0} spielt  (seit {1})" -f $lock.Owner, (Format-Dauer $lock.SessionMinutes))
+                $script:lblStatus.Text = ("GESPERRT  -  {0} spielt  (seit {1})" -f $lock.Owner, (Format-Minuten $lock.SessionMinutes))
                 $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 200, 200)
             }
         }
@@ -685,7 +689,7 @@ function Start-Play {
     Update-StatusUI $lock
 
     if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
-        Write-Log ("GESPERRT: {0} spielt gerade (seit {1}). Bitte warten." -f $lock.Owner, (Format-Dauer $lock.SessionMinutes))
+        Write-Log ("GESPERRT: {0} spielt gerade (seit {1}). Bitte warten." -f $lock.Owner, (Format-Minuten $lock.SessionMinutes))
         return
     }
     if ($lock.State -eq 'locked' -and $lock.Stale) {
@@ -1230,6 +1234,23 @@ function Show-SelfTest {
 # --------------------------------------------------------------------------
 # Screenshots/Fotos ins Repo verschieben (mit kollisionssicheren Namen)
 # --------------------------------------------------------------------------
+# Liefert die Aufnahmezeit eines Bildes fuer die Sortierung der Galerie.
+# Move-Pics baut sie in den Dateinamen ein (Spieler_JJJJMMTT-HHMMSS_Name).
+# Bilder, die jemand von Hand in den pics-Ordner gelegt hat, haben dieses
+# Muster nicht - fuer die zaehlt die Aenderungszeit der Datei.
+function Get-BildZeit {
+    param($Datei)
+    if ($Datei.Name -match '_(\d{8})-(\d{6})_') {
+        $t = [datetime]::MinValue
+        $ok = [datetime]::TryParseExact(
+            ($Matches[1] + $Matches[2]), 'yyyyMMddHHmmss',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$t)
+        if ($ok) { return $t }
+    }
+    return $Datei.LastWriteTime
+}
+
 function Move-Pics {
     $src = $script:cfg.PicsFolder
     if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
@@ -1374,13 +1395,16 @@ function Write-Readme {
     $lines += ""
     $lines += ("**Gesamt zusammen:** {0}" -f (Format-Duration $total))
 
-    # Fotos-Galerie (falls Bilder im Repo liegen), neueste zuerst
+    # Fotos-Galerie (falls Bilder im Repo liegen), neueste zuerst.
+    # Sortiert wird nach der Aufnahmezeit, NICHT nach dem Dateinamen: der
+    # faengt mit dem Spielernamen an, dadurch stand frueher alles von "Zoe"
+    # vor allem von "Anna" - auch wenn Zoes Bild zwei Wochen aelter war.
     $picsDir = Join-Path $script:cfg.RepoPath 'pics'
     if (Test-Path $picsDir) {
         $imgExts = @('.jpg', '.jpeg', '.png')
         $imgs = Get-ChildItem -Path $picsDir -File -ErrorAction SilentlyContinue |
         Where-Object { $imgExts -contains $_.Extension.ToLowerInvariant() } |
-        Sort-Object Name -Descending
+        Sort-Object @{ Expression = { Get-BildZeit $_ } }, @{ Expression = { $_.Name } } -Descending
         if ($imgs -and $imgs.Count -gt 0) {
             $lines += ""
             $lines += ("## Fotos ({0})" -f $imgs.Count)
