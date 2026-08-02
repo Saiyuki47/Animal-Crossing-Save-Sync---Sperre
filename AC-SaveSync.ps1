@@ -157,7 +157,7 @@ $env:GIT_TERMINAL_PROMPT = '0'
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.15'
+$script:Version = '1.16'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
@@ -267,6 +267,8 @@ $script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
 # Eigener Pfad - fuer die Desktop-Verknuepfung. Beim Start ueber die .cmd
 # setzt deren Kopf $PSCommandPath auf die .cmd, sonst ist es diese .ps1.
 $script:SelfPath = $PSCommandPath
+# Pfad der Protokolldatei dieses Laufs (siehe Initialize-LogDatei)
+$script:LogPfad = $null
 # Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
 # dann fuehrt der Assistent durch die Einrichtung (siehe Start-Timer).
 $script:istErststart = -not (Test-Path $script:ConfigPath)
@@ -297,6 +299,9 @@ $script:pendingLog = @()
 $script:gitDa = $true
 # Laeuft gerade ein Update? Dann beim Schliessen nicht nachfragen.
 $script:updateLaeuft = $false
+# Fehlgeschlagene Herzschlaege in Folge und wann zuletzt etwas ankam
+$script:hbFehler = 0
+$script:hbLetzterErfolg = Get-Date
 # Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
 $script:configSaved = $false
 
@@ -349,9 +354,35 @@ function Save-ConfigFromUI {
 # --------------------------------------------------------------------------
 # Kleine Helfer
 # --------------------------------------------------------------------------
+# Legt die Protokolldatei fuer diesen Programmlauf an und raeumt alte weg.
+# Bewusst neben der Einstellungsdatei und NICHT im gemeinsamen Repo: dort
+# wuerde sie zum Mitspieler synchronisiert, das Repo aufblaehen und die
+# oertlichen Pfade preisgeben.
+function Initialize-LogDatei {
+    try {
+        $ordner = Join-Path $script:AppDir 'logs'
+        if (-not (Test-Path $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
+        $script:LogPfad = Join-Path $ordner ("ac-savesync_{0}.log" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+        ("=== AC-SaveSync {0} - gestartet {1} ===" -f $script:Version, (Get-Date).ToString("dd.MM.yyyy HH:mm:ss")) |
+        Set-Content -LiteralPath $script:LogPfad -Encoding UTF8
+
+        # Nur die zehn juengsten behalten - sonst sammelt sich das jahrelang an.
+        Get-ChildItem -LiteralPath $ordner -Filter 'ac-savesync_*.log' -File -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -Skip 10 |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    catch { $script:LogPfad = $null }
+}
+
 function Write-Log {
     param([string]$msg)
     $line = "[{0}] {1}`r`n" -f (Get-Date).ToString("HH:mm:ss"), $msg
+
+    # Immer auch in die Datei - nach einem Absturz ist das Fenster ja weg.
+    if ($script:LogPfad) {
+        try { [IO.File]::AppendAllText($script:LogPfad, $line, [Text.UTF8Encoding]::new($false)) } catch { }
+    }
+
     if ($script:txtLog) {
         # Zuerst nachtragen, was vor dem Fensteraufbau gemeldet wurde
         if ($script:pendingLog.Count -gt 0) {
@@ -618,13 +649,54 @@ function Test-Repo {
 # seit dem letzten Herzschlag. Frueher stand hier nur der Hinweis, man moege
 # die Funktion dann nicht aufrufen - "Status pruefen" tat es trotzdem, und
 # zwar mitten im Spielen. Jetzt verweigert die Funktion selbst den Dienst.
+# Liegt hier Arbeit, die ein "reset --hard" vernichten wuerde?
+# Zwei Faelle: geaenderte Dateien, die noch nicht committet sind, und Commits,
+# die es noch nicht auf den Server geschafft haben (typisch nach einem Absturz
+# oder wenn beim Beenden das Hochladen scheiterte).
+function Get-LokalerFortschritt {
+    $offen = Invoke-Git @('status', '--porcelain')
+    $vorne = Invoke-Git @('rev-list', '--count', "origin/$($script:cfg.Branch)..HEAD")
+    $anzahl = 0
+    [void][int]::TryParse(("$($vorne.Text)").Trim(), [ref]$anzahl)
+    return [pscustomobject]@{
+        Dateien = @(($offen.Text -split "`r?`n") | Where-Object { $_.Trim() }).Count
+        Commits = $anzahl
+        Etwas   = (($offen.Text).Trim() -ne '' -or $anzahl -gt 0)
+    }
+}
+
 function Sync-Remote {
     if ($script:holdingLock) {
         Write-Log "Uebersprungen: waehrend deiner Sitzung wird der Stand nicht vom Server ueberschrieben."
         return
     }
-    $f = Invoke-Git @('fetch', 'origin')
-    if ($f.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht geholt werden." $f }
+
+    # Erst holen, dann vergleichen - vorher weiss Git nicht, was der Server hat.
+    $vor = Invoke-Git @('fetch', 'origin')
+    if ($vor.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht geholt werden." $vor }
+
+    # Bevor etwas verworfen wird: nachfragen, wenn hier noch Ungesichertes liegt.
+    $lokal = Get-LokalerFortschritt
+    if ($lokal.Etwas) {
+        $was = @()
+        if ($lokal.Commits -gt 0) { $was += ("{0} noch nicht hochgeladene Aenderung(en)" -f $lokal.Commits) }
+        if ($lokal.Dateien -gt 0) { $was += ("{0} geaenderte Datei(en)" -f $lokal.Dateien) }
+        $r = [Windows.Forms.MessageBox]::Show(
+            ("Auf diesem PC liegt Fortschritt, der noch nicht beim Mitspieler ist:`n`n" +
+            "  " + ($was -join "`n  ") + "`n`n" +
+            "Das passiert meist, wenn das Hochladen beim letzten Mal scheiterte - " +
+            "etwa nach einem Absturz oder ohne Internet.`n`n" +
+            "JA  = Stand vom Server holen. Der Fortschritt oben geht dabei VERLOREN.`n" +
+            "NEIN = alles so lassen und erst einmal nichts abgleichen."),
+            "Nicht hochgeladener Fortschritt", 'YesNo', 'Warning')
+        if ($r -ne 'Yes') {
+            Write-Log "Abgleich uebersprungen - dein oertlicher Fortschritt bleibt erhalten."
+            Write-Log "Tipp: 'Spielen starten' und wieder beenden laedt ihn hoch, sobald es wieder geht."
+            return
+        }
+        Write-Log "Oertlicher Fortschritt wurde auf deinen Wunsch verworfen."
+    }
+
     $r = Invoke-Git @('reset', '--hard', "origin/$($script:cfg.Branch)")
     if ($r.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht uebernommen werden." $r }
 }
@@ -910,6 +982,8 @@ function Start-Play {
 
     $script:lastHeartbeat = Get-Date
     $script:lastAccounted = Get-Date
+    $script:hbFehler = 0
+    $script:hbLetzterErfolg = Get-Date
     $script:btnPlay.Enabled = $false
     $script:btnStop.Enabled = $true
     Update-StatusUI (Get-LockState)
@@ -931,10 +1005,37 @@ function Invoke-Tick {
         Add-Playtime
         $p = Invoke-GitCommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -ne 0) {
+            $script:hbFehler++
             Write-GitProblem "Zwischenspeichern waehrend des Spielens hat nicht geklappt." $p
             Write-Log "  Das Spiel laeuft normal weiter - es wird beim naechsten Herzschlag erneut versucht."
+
+            # Wichtig: Kommt nichts mehr beim Server an, altert dort DEINE Sperre.
+            # Nach "Sperre gilt (Min)" darf der Mitspieler sie uebernehmen - dann
+            # spielt ihr beide, und einer verliert seinen Fortschritt. Das darf
+            # nicht bloss als Zeile im Protokoll untergehen.
+            if ($script:hbFehler -ge 2) {
+                $still = ((Get-Date) - $script:hbLetzterErfolg).TotalMinutes
+                $rest = $script:cfg.LeaseMinutes - $still
+                if ($rest -gt 0) {
+                    $script:lblStatus.Text = ("ACHTUNG  -  nichts mehr hochgeladen seit {0}. Deine Sperre laeuft in {1} ab!" -f
+                        (Format-Minuten $still), (Format-Minuten $rest))
+                }
+                else {
+                    $script:lblStatus.Text = ("ACHTUNG  -  deine Sperre ist ABGELAUFEN (seit {0} nichts hochgeladen)" -f (Format-Minuten $still))
+                }
+                $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 190, 190)
+                Write-Log ("WARNUNG: Seit {0} kommt nichts mehr beim Server an." -f (Format-Minuten $still))
+                Write-Log "  Solange das so bleibt, kann dein Mitspieler die Sperre uebernehmen."
+                Write-Log "  Pruefe deine Internetverbindung - der 'Selbsttest' zeigt Einzelheiten."
+            }
         }
         else {
+            if ($script:hbFehler -gt 0) {
+                Write-Log "Verbindung wieder da - Spielstand und Sperre sind aktuell."
+                Update-StatusUI (Get-LockState)
+            }
+            $script:hbFehler = 0
+            $script:hbLetzterErfolg = Get-Date
             Write-Log "Herzschlag gesendet (Spielstand + Sperre aktualisiert)."
         }
         $script:lastHeartbeat = Get-Date
@@ -1133,6 +1234,262 @@ function Update-Status {
 }
 
 # --------------------------------------------------------------------------
+# Anzeige von allein auffrischen, waehrend der andere spielt
+# --------------------------------------------------------------------------
+# Liest den Stand der Sperre DIREKT vom Server, ohne den Arbeitsordner
+# anzufassen. Ein "reset --hard" waere dafuer viel zu grob - hier soll ja nur
+# die Anzeige stimmen, nicht der Spielstand wechseln.
+function Get-LockStateRemote {
+    $f = Invoke-Git @('fetch', 'origin')
+    if ($f.Code -ne 0) { return $null }
+    $j = Invoke-Git @('show', "origin/$($script:cfg.Branch):PLAYING.lock")
+    if ($j.Code -ne 0) { return [pscustomobject]@{ State = 'free' } }   # Datei fehlt = niemand spielt
+    try {
+        $o = $j.Text | ConvertFrom-Json
+        $upd = ConvertTo-UtcZeit $o.updatedUtc
+        if (-not $upd) { return $null }
+        $age = ([datetime]::UtcNow - $upd).TotalMinutes
+        if ($age -lt 0) { $age = 0 }
+        $start = ConvertTo-UtcZeit $o.startedUtc
+        $dauer = if ($start) { ([datetime]::UtcNow - $start).TotalMinutes } else { $age }
+        if ($dauer -lt 0) { $dauer = 0 }
+        return [pscustomobject]@{
+            State          = 'locked'
+            Owner          = $o.owner
+            Machine        = $o.machine
+            AgeMinutes     = $age
+            SessionMinutes = $dauer
+            Stale          = ($age -gt $script:cfg.LeaseMinutes)
+            Mine           = (($o.owner -eq $script:cfg.PlayerName) -and ($o.machine -eq $env:COMPUTERNAME))
+        }
+    }
+    catch { return $null }
+}
+
+function Invoke-AutoAuffrischen {
+    # Nur wenn gerade nichts laeuft und alles eingerichtet ist.
+    if ($script:holdingLock -or -not $script:gitDa) { return }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { return }
+    if (-not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) { return }
+
+    $neu = Get-LockStateRemote
+    if (-not $neu) { return }        # kein Netz o. ae. - stillschweigend nichts tun
+
+    $vorher = $script:letzterFremdstand
+    Update-StatusUI $neu
+
+    # Nur melden, wenn sich wirklich etwas geaendert hat - sonst wuerde das
+    # Protokoll alle paar Minuten mit derselben Zeile volllaufen.
+    $jetzt = if ($neu.State -eq 'free') { 'frei' } else { "$($neu.Owner)" }
+    if ($vorher -and $vorher -ne 'frei' -and $jetzt -eq 'frei') {
+        Write-Log ("{0} hat aufgehoert - du kannst jetzt spielen." -f $vorher)
+    }
+    elseif ($vorher -ne $jetzt -and $jetzt -ne 'frei') {
+        Write-Log ("{0} spielt jetzt." -f $neu.Owner)
+    }
+    $script:letzterFremdstand = $jetzt
+}
+
+# --------------------------------------------------------------------------
+# Spielzeit ansehen
+# --------------------------------------------------------------------------
+function Show-Spielzeit {
+    if (-not (Test-Repo)) { return }
+    $h = Get-Playtime
+    if (-not $h -or $h.Keys.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show(
+            "Noch keine Spielzeit aufgezeichnet.`n`nSie wird waehrend des Spielens mitgezaehlt.",
+            "Spielzeit", 'OK', 'Information')
+        return
+    }
+
+    $dlg = New-Object Windows.Forms.Form
+    $script:zeitDlg = $dlg
+    $dlg.Text = "Spielzeit"
+    $dlg.Size = New-Object Drawing.Size(560, 380)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    if ($script:appIcon) { $dlg.Icon = $script:appIcon }
+
+    $lst = New-Object Windows.Forms.ListView
+    $lst.Location = New-Object Drawing.Point(15, 15)
+    $lst.Size = New-Object Drawing.Size(514, 250)
+    $lst.View = 'Details'
+    $lst.FullRowSelect = $true
+    $lst.GridLines = $true
+    [void]$lst.Columns.Add("Spieler", 150)
+    [void]$lst.Columns.Add("Gesamt", 110)
+    [void]$lst.Columns.Add("Sitzungen", 80)
+    [void]$lst.Columns.Add("Zuletzt gespielt", 160)
+    $dlg.Controls.Add($lst)
+
+    $gesamt = 0.0
+    foreach ($name in ($h.Keys | Sort-Object { - [double]$h[$_].TotalSeconds })) {
+        $e = $h[$name]
+        $gesamt += [double]$e.TotalSeconds
+        $zuletzt = "-"
+        if ($e.LastPlayedUtc) {
+            $d = ConvertTo-UtcZeit $e.LastPlayedUtc
+            if ($d) { $zuletzt = $d.ToLocalTime().ToString("dd.MM.yyyy HH:mm") }
+        }
+        $i = New-Object Windows.Forms.ListViewItem($name)
+        [void]$i.SubItems.Add((Format-Duration $e.TotalSeconds))
+        [void]$i.SubItems.Add("$($e.Sessions)")
+        [void]$i.SubItems.Add($zuletzt)
+        [void]$lst.Items.Add($i)
+    }
+
+    $lg = New-Object Windows.Forms.Label
+    $lg.Text = ("Zusammen: {0}" -f (Format-Duration $gesamt))
+    $lg.Location = New-Object Drawing.Point(15, 275)
+    $lg.Size = New-Object Drawing.Size(300, 22)
+    $lg.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lg)
+
+    $bZu = New-Object Windows.Forms.Button
+    $bZu.Text = "Schliessen"
+    $bZu.Location = New-Object Drawing.Point(409, 300)
+    $bZu.Size = New-Object Drawing.Size(120, 30)
+    $bZu.Add_Click({ $script:zeitDlg.Close() })
+    $dlg.Controls.Add($bZu)
+
+    Set-UiScale $dlg
+    [void]$dlg.ShowDialog()
+}
+
+# --------------------------------------------------------------------------
+# Frueheren Spielstand zurueckholen
+# --------------------------------------------------------------------------
+# Git speichert bei jedem Herzschlag den kompletten Stand - die Historie ist
+# also laengst da, nur kommt ohne Git-Kenntnisse niemand daran.
+#
+# Zurueckgeholt wird NIE durch Umschreiben der Geschichte, sondern als neuer
+# Stand obendrauf. Der jetzige Stand bleibt damit erhalten und liesse sich
+# genauso wieder zurueckholen.
+function Get-StandListe {
+    $r = Invoke-Git @('log', '-60', '--pretty=format:%H%x09%ad%x09%s', '--date=format:%d.%m.%Y %H:%M', '--', 'save')
+    if ($r.Code -ne 0) { return @() }
+    $liste = @()
+    foreach ($z in ($r.Text -split "`r?`n")) {
+        if (-not $z.Trim()) { continue }
+        $t = $z -split "`t"
+        if ($t.Count -lt 3) { continue }
+        $liste += [pscustomobject]@{ Sha = $t[0]; Datum = $t[1]; Text = $t[2] }
+    }
+    return $liste
+}
+
+function Invoke-StandZurueck {
+    $i = $script:standListe.SelectedIndex
+    if ($i -lt 0) { return }
+    $s = $script:standDaten[$i]
+
+    $r = [Windows.Forms.MessageBox]::Show(
+        ("Den Spielstand vom {0} zurueckholen?`n`n" +
+        "Der jetzige Stand geht dabei NICHT verloren - er bleibt in der Liste " +
+        "und laesst sich genauso zurueckholen.`n`n" +
+        "Achtung: Dein Mitspieler bekommt den alten Stand beim naechsten Mal ebenfalls." -f $s.Datum),
+        "Frueheren Stand zurueckholen", 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    $script:standStatus.Text = "Wird zurueckgeholt..."
+    [Windows.Forms.Application]::DoEvents()
+
+    $co = Invoke-Git @('checkout', $s.Sha, '--', 'save')
+    if ($co.Code -ne 0) {
+        Write-GitProblem "Der alte Stand konnte nicht geholt werden." $co
+        $script:standStatus.Text = "Hat nicht geklappt - Einzelheiten im Protokoll."
+        $script:standStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+
+    $p = Invoke-GitCommitPush ("Spielstand vom {0} zurueckgeholt ({1})" -f $s.Datum, $script:cfg.PlayerName)
+    if ($p.Code -ne 0) {
+        Write-GitProblem "Der zurueckgeholte Stand konnte nicht hochgeladen werden." $p
+        $script:standStatus.Text = "Oertlich zurueckgeholt, aber nicht hochgeladen - siehe Protokoll."
+        $script:standStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+
+    # Auch gleich in den Dolphin-Ordner schreiben, sonst merkt man beim
+    # naechsten Spielen nichts davon.
+    [void](Restore-Saves)
+    Write-Log ("Spielstand vom {0} zurueckgeholt und hochgeladen." -f $s.Datum)
+    $script:standStatus.Text = "Fertig - der Stand vom $($s.Datum) ist wieder da."
+    $script:standStatus.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
+}
+
+function Show-FruehereStaende {
+    if (-not (Test-Repo)) { return }
+    if ($script:holdingLock) {
+        [void][Windows.Forms.MessageBox]::Show(
+            "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden'.",
+            "Frueherer Spielstand", 'OK', 'Warning')
+        return
+    }
+
+    Write-Log "Hole die Liste frueherer Spielstaende..."
+    Sync-Remote
+    $script:standDaten = @(Get-StandListe)
+    if ($script:standDaten.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show(
+            "Es sind noch keine Spielstaende gespeichert.`n`nSie entstehen automatisch waehrend des Spielens.",
+            "Frueherer Spielstand", 'OK', 'Information')
+        return
+    }
+
+    $dlg = New-Object Windows.Forms.Form
+    $script:standDlg = $dlg
+    $dlg.Text = "Frueherer Spielstand"
+    $dlg.Size = New-Object Drawing.Size(660, 470)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    if ($script:appIcon) { $dlg.Icon = $script:appIcon }
+
+    $info = New-Object Windows.Forms.Label
+    $info.Text = ("Jeder Eintrag ist ein vollstaendiger Spielstand, wie er zu diesem Zeitpunkt war." + [Environment]::NewLine +
+        "Waehle einen aus, um ihn zurueckzuholen. Der jetzige Stand bleibt dabei erhalten.")
+    $info.Location = New-Object Drawing.Point(15, 12)
+    $info.Size = New-Object Drawing.Size(610, 40)
+    $dlg.Controls.Add($info)
+
+    $script:standListe = New-Object Windows.Forms.ListBox
+    $script:standListe.Location = New-Object Drawing.Point(15, 58)
+    $script:standListe.Size = New-Object Drawing.Size(610, 280)
+    $script:standListe.Font = New-Object Drawing.Font("Consolas", 9)
+    foreach ($s in $script:standDaten) {
+        [void]$script:standListe.Items.Add(("{0}   {1}" -f $s.Datum, $s.Text))
+    }
+    $script:standListe.SelectedIndex = 0
+    $dlg.Controls.Add($script:standListe)
+
+    $script:standStatus = New-Object Windows.Forms.Label
+    $script:standStatus.Location = New-Object Drawing.Point(15, 348)
+    $script:standStatus.Size = New-Object Drawing.Size(610, 20)
+    $dlg.Controls.Add($script:standStatus)
+
+    $bHol = New-Object Windows.Forms.Button
+    $bHol.Text = "Diesen Stand zurueckholen"
+    $bHol.Location = New-Object Drawing.Point(15, 378)
+    $bHol.Size = New-Object Drawing.Size(230, 34)
+    $bHol.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+    $bHol.Add_Click({ Invoke-StandZurueck })
+    $dlg.Controls.Add($bHol)
+
+    $bZu = New-Object Windows.Forms.Button
+    $bZu.Text = "Schliessen"
+    $bZu.Location = New-Object Drawing.Point(505, 378)
+    $bZu.Size = New-Object Drawing.Size(120, 34)
+    $bZu.Add_Click({ $script:standDlg.Close() })
+    $dlg.Controls.Add($bZu)
+
+    Set-UiScale $dlg
+    [void]$dlg.ShowDialog()
+}
+
+# --------------------------------------------------------------------------
 # Fotos ansehen
 # --------------------------------------------------------------------------
 # Zeigt die Bilder aus dem Unterordner 'pics' des gemeinsamen Repos - also
@@ -1189,6 +1546,63 @@ function Invoke-FotoZurueck {
     if ($script:fotoIndex -gt 0) { $script:fotoIndex--; Show-FotoAktuell }
 }
 
+# Diashow: laeuft im Kreis, damit sie nicht nach dem letzten Bild einfach steht.
+function Invoke-FotoDiashow {
+    if ($script:fotoShow.Enabled) {
+        $script:fotoShow.Stop()
+        $script:fotoShowKnopf.Text = "Diashow"
+        return
+    }
+    $script:fotoShow.Start()
+    $script:fotoShowKnopf.Text = "Diashow anhalten"
+}
+function Invoke-FotoShowTick {
+    if ($script:fotoIndex -lt $script:fotoListe.Count - 1) { $script:fotoIndex++ } else { $script:fotoIndex = 0 }
+    Show-FotoAktuell
+}
+
+function Invoke-FotoSpeichern {
+    if ($script:fotoListe.Count -eq 0) { return }
+    $d = $script:fotoListe[$script:fotoIndex]
+    $s = New-Object Windows.Forms.SaveFileDialog
+    $s.FileName = $d.Name
+    $s.Filter = "Bild (*$($d.Extension))|*$($d.Extension)|Alle Dateien|*.*"
+    $s.InitialDirectory = [Environment]::GetFolderPath('MyPictures')
+    if ($s.ShowDialog() -eq 'OK') {
+        try {
+            Copy-Item -LiteralPath $d.FullName -Destination $s.FileName -Force
+            Write-Log ("Foto gespeichert: {0}" -f $s.FileName)
+        }
+        catch { Write-Log "Foto konnte nicht gespeichert werden: $($_.Exception.Message)" }
+    }
+}
+
+# Loeschen entfernt das Bild bei BEIDEN - es liegt ja im gemeinsamen Ordner.
+function Invoke-FotoLoeschen {
+    if ($script:fotoListe.Count -eq 0) { return }
+    if ($script:fotoShow.Enabled) { Invoke-FotoDiashow }      # Diashow anhalten
+    $d = $script:fotoListe[$script:fotoIndex]
+    $r = [Windows.Forms.MessageBox]::Show(
+        ("Dieses Foto loeschen?`n`n{0}`n`nEs liegt im gemeinsamen Ordner - es verschwindet damit " +
+        "auch bei deinem Mitspieler." -f $d.Name),
+        "Foto loeschen", 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    # Erst das Bild freigeben, sonst laesst sich die Datei nicht loeschen.
+    if ($script:fotoBild) { $script:fotoBox.Image = $null; $script:fotoBild.Dispose(); $script:fotoBild = $null }
+    try { Remove-Item -LiteralPath $d.FullName -Force }
+    catch { Write-Log "Foto konnte nicht geloescht werden: $($_.Exception.Message)"; Show-FotoAktuell; return }
+
+    $p = Invoke-GitCommitPush ("Foto geloescht: {0} ({1})" -f $d.Name, $script:cfg.PlayerName)
+    if ($p.Code -ne 0) { Write-GitProblem "Das Loeschen konnte nicht hochgeladen werden." $p }
+    else { Write-Log ("Foto geloescht: {0}" -f $d.Name) }
+
+    $script:fotoListe = @($script:fotoListe | Where-Object { $_.FullName -ne $d.FullName })
+    if ($script:fotoListe.Count -eq 0) { $script:fotoDlg.Close(); return }
+    if ($script:fotoIndex -ge $script:fotoListe.Count) { $script:fotoIndex = $script:fotoListe.Count - 1 }
+    Show-FotoAktuell
+}
+
 function Show-Fotos {
     if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) {
         [void][Windows.Forms.MessageBox]::Show("Es ist noch kein gemeinsamer Ordner eingerichtet.",
@@ -1214,7 +1628,7 @@ function Show-Fotos {
     $dlg = New-Object Windows.Forms.Form
     $script:fotoDlg = $dlg
     $dlg.Text = "Fotos"
-    $dlg.Size = New-Object Drawing.Size(900, 700)
+    $dlg.Size = New-Object Drawing.Size(900, 740)
     # Mindestbreite so, dass die linke Knopfgruppe (Blaettern) und die rechte
     # (Ordner/Schliessen) sich beim Kleinziehen nicht ins Gehege kommen:
     # links bis 260, rechts 290 ab dem Rand, dazwischen etwas Luft.
@@ -1261,14 +1675,14 @@ function Show-Fotos {
     $script:fotoWeiter.Add_Click({ Invoke-FotoWeiter })
     $dlg.Controls.Add($script:fotoWeiter)
 
-    $bOrdner = New-Object Windows.Forms.Button
-    $bOrdner.Text = "Ordner oeffnen"
-    $bOrdner.Location = New-Object Drawing.Point(600, 628)
-    $bOrdner.Size = New-Object Drawing.Size(150, 32)
-    $bOrdner.Anchor = 'Bottom,Right'
-    $bOrdner.Add_Click({ Start-Process explorer.exe $script:fotoOrdner })
-    $dlg.Controls.Add($bOrdner)
-    Set-Tip "Oeffnet den Ordner mit allen Fotos im Explorer." $bOrdner
+    $script:fotoShowKnopf = New-Object Windows.Forms.Button
+    $script:fotoShowKnopf.Text = "Diashow"
+    $script:fotoShowKnopf.Location = New-Object Drawing.Point(268, 628)
+    $script:fotoShowKnopf.Size = New-Object Drawing.Size(140, 32)
+    $script:fotoShowKnopf.Anchor = 'Bottom,Left'
+    $script:fotoShowKnopf.Add_Click({ Invoke-FotoDiashow })
+    $dlg.Controls.Add($script:fotoShowKnopf)
+    Set-Tip "Blaettert alle drei Sekunden weiter und faengt am Ende wieder vorn an." $script:fotoShowKnopf
 
     $bZu = New-Object Windows.Forms.Button
     $bZu.Text = "Schliessen"
@@ -1277,6 +1691,39 @@ function Show-Fotos {
     $bZu.Anchor = 'Bottom,Right'
     $bZu.Add_Click({ $script:fotoDlg.Close() })
     $dlg.Controls.Add($bZu)
+
+    # zweite Reihe: was man mit dem gezeigten Bild machen kann
+    $bSpeichern = New-Object Windows.Forms.Button
+    $bSpeichern.Text = "Speichern unter..."
+    $bSpeichern.Location = New-Object Drawing.Point(12, 668)
+    $bSpeichern.Size = New-Object Drawing.Size(160, 32)
+    $bSpeichern.Anchor = 'Bottom,Left'
+    $bSpeichern.Add_Click({ Invoke-FotoSpeichern })
+    $dlg.Controls.Add($bSpeichern)
+    Set-Tip "Legt eine Kopie des gezeigten Fotos ab, wo du moechtest." $bSpeichern
+
+    $bLoeschen = New-Object Windows.Forms.Button
+    $bLoeschen.Text = "Loeschen"
+    $bLoeschen.Location = New-Object Drawing.Point(180, 668)
+    $bLoeschen.Size = New-Object Drawing.Size(120, 32)
+    $bLoeschen.Anchor = 'Bottom,Left'
+    $bLoeschen.Add_Click({ Invoke-FotoLoeschen })
+    $dlg.Controls.Add($bLoeschen)
+    Set-Tip ("Entfernt das Foto aus dem gemeinsamen Ordner.`n" +
+        "Es verschwindet damit auch bei deinem Mitspieler.") $bLoeschen
+
+    $bOrdner = New-Object Windows.Forms.Button
+    $bOrdner.Text = "Ordner oeffnen"
+    $bOrdner.Location = New-Object Drawing.Point(308, 668)
+    $bOrdner.Size = New-Object Drawing.Size(150, 32)
+    $bOrdner.Anchor = 'Bottom,Left'
+    $bOrdner.Add_Click({ Start-Process explorer.exe $script:fotoOrdner })
+    $dlg.Controls.Add($bOrdner)
+    Set-Tip "Oeffnet den Ordner mit allen Fotos im Explorer." $bOrdner
+
+    $script:fotoShow = New-Object Windows.Forms.Timer
+    $script:fotoShow.Interval = 3000
+    $script:fotoShow.Add_Tick({ Invoke-FotoShowTick })
 
     # Blaettern per Pfeiltasten - bequemer als Klicken
     $dlg.Add_KeyDown({
@@ -1287,6 +1734,7 @@ function Show-Fotos {
         })
     # Beim Schliessen das Bild freigeben
     $dlg.Add_FormClosed({
+            if ($script:fotoShow) { $script:fotoShow.Stop() }
             if ($script:fotoBild) { $script:fotoBox.Image = $null; $script:fotoBild.Dispose(); $script:fotoBild = $null }
         })
 
@@ -2757,6 +3205,7 @@ function Show-SetupDialog {
 # ==========================================================================
 # Grafische Oberflaeche
 # ==========================================================================
+Initialize-LogDatei
 Import-Config
 # Was fehlt oder ins Leere zeigt, selbst suchen - spart dem Nutzer die
 # Sucherei nach Dolphin und dem Save-Ordner.
@@ -2766,9 +3215,9 @@ $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre  (v$($script:Version))"
 # Hoehe passt zum Inhalt: zwei Knopfreihen, dafuer zwei Eingabezeilen weniger
 # (Bilder-Ordner, Branch, Sperre und Herzschlag stecken jetzt in "Erweitert...").
-$form.Size = New-Object Drawing.Size(660, 760)
+$form.Size = New-Object Drawing.Size(660, 802)
 $form.StartPosition = "CenterScreen"
-$form.MinimumSize = New-Object Drawing.Size(660, 700)
+$form.MinimumSize = New-Object Drawing.Size(660, 742)
 $script:mainForm = $form
 $ico = Get-AppIcon
 if ($ico) { $form.Icon = $ico }
@@ -2911,10 +3360,20 @@ $script:btnStop.Enabled = $false          # erst waehrend einer Sitzung nutzbar
 
 # zweite Reihe: alles, was man seltener braucht
 $y += 42
-$btnRefresh = New-Button "Status pruefen" 15 $y 130 34
-$btnSelfTest = New-Button "Selbsttest" 153 $y 110 34
-$btnFotos = New-Button "Fotos ansehen" 271 $y 130 34
-$btnUnlock = New-Button "Sperre erzwingen freigeben" 409 $y 199 34
+$btnRefresh = New-Button "Status pruefen" 15 $y 186 34
+$btnSelfTest = New-Button "Selbsttest" 209 $y 186 34
+$btnFotos = New-Button "Fotos ansehen" 403 $y 205 34
+
+# dritte Reihe: was man seltener braucht
+$y += 42
+$btnZeit = New-Button "Spielzeit" 15 $y 186 34
+$btnStaende = New-Button "Frueherer Spielstand" 209 $y 186 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 403 $y 205 34
+Set-Tip ("Wer hat wie lange gespielt, wie viele Sitzungen und wann zuletzt.") $btnZeit
+Set-Tip ("Holt einen frueheren Spielstand zurueck - Git hat bei jedem`n" +
+    "Herzschlag einen vollstaendigen Stand gespeichert.`n" +
+    "Der jetzige Stand geht dabei nicht verloren.`n" +
+    "Die Rettung, wenn im Spiel etwas schiefgegangen ist.") $btnStaende
 Set-Tip ("Zeigt die Fotos aus dem gemeinsamen Ordner - neueste zuerst.`n" +
     "Blaettern geht auch mit den Pfeiltasten.`n" +
     "Die Bilder landen dort automatisch nach dem Spielen, wenn unter`n" +
@@ -2988,6 +3447,14 @@ foreach ($feld in @($script:txtDolphin, $script:txtRepo, $script:txtGame, $scrip
     $feld.Add_TextChanged({ $script:saveTimer.Stop(); $script:saveTimer.Start() })
 }
 
+# Frischt die Anzeige von allein auf, solange man selbst nicht spielt - sonst
+# muesste man beim Warten staendig "Status pruefen" druecken. Liest nur die
+# Sperre vom Server, ohne den Arbeitsordner anzufassen.
+$script:autoTimer = New-Object Windows.Forms.Timer
+$script:autoTimer.Interval = 180000        # 3 Minuten
+$script:autoTimer.Add_Tick({ Invoke-AutoAuffrischen })
+$script:letzterFremdstand = $null
+
 # Einmaliger Timer fuer die automatische Pruefung beim Start.
 # Warum ein Timer und nicht direkt im "Shown"-Ereignis? Git braucht ein paar
 # Sekunden, und in dieser Zeit waere das Fenster noch nicht gezeichnet. So
@@ -3025,6 +3492,10 @@ $script:startTimer.Add_Tick({
 
         $script:lblStatus.Text = "Wird geprueft..."
         Update-Status -SkipSave
+
+        # Ab jetzt die Anzeige von allein aktuell halten
+        $script:letzterFremdstand = $null
+        $script:autoTimer.Start()
 
         # Zum Schluss nach einer neueren Fassung sehen. -Still: ohne Meldung,
         # wenn alles aktuell ist oder gerade kein Internet da ist. Bewusst nach
@@ -3077,6 +3548,8 @@ $script:btnStop.Add_Click({ Stop-Play })
 $btnRefresh.Add_Click({ Update-Status })
 $btnSelfTest.Add_Click({ Show-SelfTest })
 $btnFotos.Add_Click({ Show-Fotos })
+$btnZeit.Add_Click({ Show-Spielzeit })
+$btnStaende.Add_Click({ Show-FruehereStaende })
 $btnUnlock.Add_Click({ Unlock-Session })
 $btnSetup.Add_Click({ Show-SetupDialog })
 $btnAdvanced.Add_Click({ Show-AdvancedDialog })

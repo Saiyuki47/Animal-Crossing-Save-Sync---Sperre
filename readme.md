@@ -202,7 +202,9 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 | **Spielen starten**            | Holt den Stand, setzt die Sperre, schreibt den Save in den Dolphin-Ordner und startet das Spiel. |
 | **Spielen beenden**            | Beendet Dolphin aus dem Programm heraus und schließt die Sitzung ab: sichern, hochladen, Sperre freigeben. **Vorher im Spiel speichern!** Nur während einer laufenden Sitzung anklickbar. |
 | **Status prüfen**              | Aktualisiert die Anzeige: frei, du spielst, jemand anderes spielt, oder abgelaufene Sperre. Läuft beim Programmstart automatisch einmal. |
-| **Fotos ansehen**              | Zeigt die Bilder aus dem gemeinsamen Ordner direkt im Programm – neueste zuerst, mit Name und Aufnahmezeit. Blättern per Knopf oder Pfeiltasten. |
+| **Fotos ansehen**              | Zeigt die Bilder aus dem gemeinsamen Ordner direkt im Programm – neueste zuerst, mit Name und Aufnahmezeit. Blättern per Knopf oder Pfeiltasten, dazu Diashow, Speichern und Löschen. |
+| **Spielzeit**                  | Wer hat wie lange gespielt, wie viele Sitzungen, wann zuletzt.                                   |
+| **Früherer Spielstand**        | Holt einen älteren Spielstand zurück. Der jetzige bleibt dabei erhalten. Die Rettung, wenn im Spiel etwas schiefgegangen ist. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
 | **Erweitert…**                 | Selten gebrauchte Einstellungen: Bilder-Ordner, Branch, Sperre, Herzschlag. Dort liegt auch **„Verknüpfung auf dem Desktop anlegen"**. |
@@ -210,6 +212,18 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 
 „Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
 Knopf, dann steht dort, **was** fehlt.
+
+### Wenn etwas schiefgeht
+
+- **Die Anzeige hält sich selbst aktuell.** Solange ihr nicht spielt, sieht das Programm alle
+  drei Minuten nach, ob der andere angefangen oder aufgehört hat.
+- **Reißt beim Spielen die Verbindung ab**, meldet sich das Programm deutlich: Es kann dann
+  nichts mehr hochladen, und nach „Sperre gilt (Min)" darf der andere übernehmen.
+- **Nicht hochgeladener Fortschritt wird nicht mehr stillschweigend verworfen.** Liegt beim
+  Abgleich noch etwas auf eurem PC – etwa nach einem Absturz –, fragt das Programm nach.
+- **Ein Protokoll jedes Programmlaufs** liegt unter `%APPDATA%\AC-SaveSync\logs\`. Die letzten
+  zehn bleiben erhalten, ältere werden automatisch gelöscht. Bewusst außerhalb des gemeinsamen
+  Ordners, damit es nicht beim Mitspieler landet.
 
 ### Updates
 
