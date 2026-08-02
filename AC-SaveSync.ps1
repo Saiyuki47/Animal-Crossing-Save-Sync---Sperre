@@ -157,7 +157,7 @@ $env:GIT_TERMINAL_PROMPT = '0'
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.13'
+$script:Version = '1.14'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
@@ -2161,7 +2161,9 @@ function Invoke-WizClone {
 function Show-AdvancedDialog {
     $dlg = New-Object Windows.Forms.Form
     $dlg.Text = "Erweiterte Einstellungen"
-    $dlg.Size = New-Object Drawing.Size(600, 300)
+    # Hoch genug, dass die beiden Knopfreihen untereinander Platz haben:
+    # Werkzeuge (Verknuepfung/Updates), darunter Uebernehmen/Abbrechen.
+    $dlg.Size = New-Object Drawing.Size(600, 350)
     $dlg.StartPosition = "CenterParent"
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
@@ -2226,7 +2228,7 @@ function Show-AdvancedDialog {
     $bUpd = New-Object Windows.Forms.Button
     $bUpd.Text = "Nach Updates suchen"
     $bUpd.Location = New-Object Drawing.Point(305, 190)
-    $bUpd.Size = New-Object Drawing.Size(180, 28)
+    $bUpd.Size = New-Object Drawing.Size(265, 28)
     $bUpd.Add_Click({ Invoke-UpdatePruefung })
     $dlg.Controls.Add($bUpd)
     Set-Tip ("Holt die neueste Fassung direkt von GitHub und ersetzt`n" +
@@ -2235,7 +2237,7 @@ function Show-AdvancedDialog {
 
     $lVer = New-Object Windows.Forms.Label
     $lVer.Text = "Version $($script:Version)"
-    $lVer.Location = New-Object Drawing.Point(15, 224)
+    $lVer.Location = New-Object Drawing.Point(15, 232)
     $lVer.Size = New-Object Drawing.Size(200, 20)
     $lVer.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
     $dlg.Controls.Add($lVer)
@@ -2244,12 +2246,12 @@ function Show-AdvancedDialog {
         "das legt Windows fuer alle Dateien dieser Art gemeinsam fest.") $bVerk
 
     $ok = New-Object Windows.Forms.Button
-    $ok.Text = "Uebernehmen"; $ok.Location = New-Object Drawing.Point(340, 210)
+    $ok.Text = "Uebernehmen"; $ok.Location = New-Object Drawing.Point(340, 258)
     $ok.Size = New-Object Drawing.Size(110, 30)
     $ok.DialogResult = 'OK'
     $dlg.Controls.Add($ok)
     $ab = New-Object Windows.Forms.Button
-    $ab.Text = "Abbrechen"; $ab.Location = New-Object Drawing.Point(458, 210)
+    $ab.Text = "Abbrechen"; $ab.Location = New-Object Drawing.Point(458, 258)
     $ab.Size = New-Object Drawing.Size(110, 30)
     $ab.DialogResult = 'Cancel'
     $dlg.Controls.Add($ab)
