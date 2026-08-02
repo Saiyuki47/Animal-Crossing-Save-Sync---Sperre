@@ -19,6 +19,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Das Programm zeigt seine Version an und vergleicht sie beim Update mit
+      # dem neuesten Release. Laufen Tag und Nummer im Skript auseinander,
+      # haelt es sich fuer aelter oder neuer, als es ist - deshalb hier stoppen.
+      - name: Version im Skript muss zum Tag passen
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $treffer = Select-String -Path AC-SaveSync.ps1 -Pattern "^\`$script:Version = '([^']+)'"
+          if (-not $treffer) { throw 'Zeile $script:Version in AC-SaveSync.ps1 nicht gefunden' }
+          $imSkript = $treffer.Matches[0].Groups[1].Value
+          if ($imSkript -ne $tag) {
+            throw "Tag ist v$tag, im Skript steht aber '$imSkript'. Bitte `$script:Version anpassen."
+          }
+          Write-Host "Version passt: $imSkript"
+
+      # Betreff des getaggten Commits als Aenderungsnotiz merken. Das Programm
+      # zeigt sie im Update-Dialog an, damit man weiss, wofuer man aktualisiert.
+      - name: Aenderung ermitteln
+        id: aenderung
+        shell: bash
+        run: echo "text=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+
       - name: AC-SaveSync.cmd bauen
         shell: pwsh
         run: ./tools/Build-Cmd.ps1
@@ -53,6 +76,10 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --notes-file - \
             AC-SaveSync.cmd AC-SaveSync.ps1 assets/ac-savesync.ico <<'EOF'
+          ## Was ist neu
+
+          ${{ steps.aenderung.outputs.text }}
+
           ## Installation
 
           1. **AC-SaveSync.cmd** herunterladen (unten unter *Assets*).

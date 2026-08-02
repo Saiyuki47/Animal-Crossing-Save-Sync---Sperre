@@ -210,6 +210,22 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 „Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
 Knopf, dann steht dort, **was** fehlt.
 
+### Updates
+
+Das Programm sieht **beim Start selbst nach**, ob es eine neuere Fassung gibt. Wenn ja,
+fragt es kurz nach – ein Klick genügt, dann lädt es sich die neue Version, ersetzt sich
+selbst und startet neu. Herunterladen von Hand ist nicht mehr nötig.
+
+Wer zwischendurch nachsehen will: **„Erweitert…" → „Nach Updates suchen"**. Dort steht
+auch, welche Version gerade läuft (ebenso im Fenstertitel).
+
+Vor dem Ersetzen wird die heruntergeladene Datei geprüft – Größe, Aufbau und ob der
+enthaltene Code fehlerfrei ist. Fällt eine dieser Prüfungen durch, bleibt die vorhandene
+Fassung unangetastet. Die alte Datei wird zusätzlich als Sicherungskopie abgelegt
+(`%APPDATA%\AC-SaveSync\update\`).
+
+Ohne Internet passiert beim Start nichts Sichtbares – die Prüfung wird still übersprungen.
+
 ### Darstellung
 
 Das Fenster passt sich der Bildschirmskalierung an: Bei 150 % wird alles größer und

@@ -152,6 +152,16 @@ function Set-UiSchrift {
 $env:GIT_TERMINAL_PROMPT = '0'
 
 # --------------------------------------------------------------------------
+# Version und Update-Quelle
+# --------------------------------------------------------------------------
+# Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
+# Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
+# sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
+$script:Version = '1.12'
+$script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
+$script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
+
+# --------------------------------------------------------------------------
 # Kurzhilfen (Tooltips), die beim Ueberfahren mit der Maus erscheinen
 # --------------------------------------------------------------------------
 # EIN ToolTip-Bauteil reicht fuer alle Fenster; es merkt sich pro Control
@@ -285,6 +295,8 @@ $script:pendingLog = @()
 # Ist Git da? Wird beim Start einmal geprueft (siehe Start-Timer) und steuert,
 # ob "Spielen starten" ueberhaupt anklickbar ist.
 $script:gitDa = $true
+# Laeuft gerade ein Update? Dann beim Schliessen nicht nachfragen.
+$script:updateLaeuft = $false
 # Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
 $script:configSaved = $false
 
@@ -1099,6 +1111,211 @@ function Update-Status {
     elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
     elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
     else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
+}
+
+# --------------------------------------------------------------------------
+# Selbst aktualisieren
+# --------------------------------------------------------------------------
+# Holt die neueste Fassung direkt von GitHub, prueft sie und ersetzt die
+# eigene Datei. Das geht, weil weder die .cmd noch die .ps1 waehrend des
+# Laufens von Windows festgehalten wird: Der Starter liest die Datei einmal
+# ein und gibt sie sofort wieder frei.
+
+# Fragt GitHub nach dem neuesten Release. Rueckgabe: Objekt mit Version,
+# Beschreibung und Dateiliste - oder $null, wenn es nicht klappt (kein
+# Internet, GitHub gerade nicht erreichbar, Zaehlgrenze erreicht).
+function Get-NeuesteVersion {
+    try {
+        # Aeltere Windows-Fassungen sprechen von sich aus noch kein TLS 1.2,
+        # GitHub verlangt es aber - sonst bricht der Aufruf unverstaendlich ab.
+        [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+        $r = Invoke-RestMethod -Uri $script:ReleaseApi -TimeoutSec 15 `
+            -Headers @{ 'User-Agent' = 'AC-SaveSync'; 'Accept' = 'application/vnd.github+json' }
+        if (-not $r.tag_name) { return $null }
+        return [pscustomobject]@{
+            Version = ("$($r.tag_name)" -replace '^v', '')
+            Tag     = "$($r.tag_name)"
+            Text    = "$($r.body)"
+            Dateien = $r.assets
+        }
+    }
+    catch {
+        Write-Log "Update-Pruefung nicht moeglich: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Vergleicht zwei Versionsangaben. Bewusst ueber [version] statt als Text:
+# als Text waere "1.9" groesser als "1.11".
+function Test-VersionNeuer {
+    param([string]$Kandidat, [string]$Aktuell)
+    try {
+        return ([version]($Kandidat -replace '^v', '')) -gt ([version]($Aktuell -replace '^v', ''))
+    }
+    catch { return $false }
+}
+
+# Prueft eine heruntergeladene Datei, BEVOR sie die laufende ersetzt.
+# Dieselben Pruefungen wie im Release-Workflow - eine halb geladene oder
+# beschaedigte Datei wuerde das Programm sonst unstartbar machen.
+function Test-UpdateDatei {
+    param([string]$Pfad, [string]$Endung)
+    if (-not (Test-Path -LiteralPath $Pfad)) { return "Datei fehlt" }
+    $bytes = [IO.File]::ReadAllBytes($Pfad)
+    if ($bytes.Length -lt 50000) { return "Datei ist verdaechtig klein ($($bytes.Length) Bytes)" }
+    if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return "Datei beginnt mit einem BOM" }
+
+    $text = [IO.File]::ReadAllText($Pfad, [Text.UTF8Encoding]::new($false))
+    $rumpf = $text
+    if ($Endung -eq '.cmd') {
+        $marke = [char]10 + '@@AC-SAVESYNC-POWERSHELL-' + 'BODY@@'
+        $i = $text.IndexOf($marke)
+        if ($i -lt 0) { return "Markerzeile fehlt - keine gueltige Starter-Datei" }
+        $rumpf = $text.Substring($i + $marke.Length)
+    }
+    $t = $null; $f = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($rumpf, [ref]$t, [ref]$f)
+    if ($f -and $f.Count -gt 0) { return "Der Inhalt hat $($f.Count) Syntaxfehler" }
+    return ""   # leer = in Ordnung
+}
+
+# Laedt die neue Fassung, prueft sie, ersetzt die eigene Datei und startet neu.
+function Install-Update {
+    param($Info)
+
+    $selbst = $script:SelfPath
+    if ([string]::IsNullOrWhiteSpace($selbst) -or -not (Test-Path -LiteralPath $selbst)) {
+        Write-Log "Update nicht moeglich: der eigene Pfad ist unbekannt."
+        return $false
+    }
+    $endung = [IO.Path]::GetExtension($selbst).ToLowerInvariant()
+    $gesucht = if ($endung -eq '.cmd') { 'AC-SaveSync.cmd' } else { 'AC-SaveSync.ps1' }
+    $datei = $Info.Dateien | Where-Object { $_.name -eq $gesucht } | Select-Object -First 1
+    if (-not $datei) {
+        Write-Log "Im Release ist keine Datei '$gesucht' enthalten."
+        return $false
+    }
+
+    $ordner = Join-Path $script:AppDir 'update'
+    if (-not (Test-Path $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
+    $neu = Join-Path $ordner $gesucht
+
+    Write-Log ("Lade Version {0} herunter..." -f $Info.Version)
+    [Windows.Forms.Application]::DoEvents()
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $datei.browser_download_url -OutFile $neu -TimeoutSec 120 `
+            -UseBasicParsing -Headers @{ 'User-Agent' = 'AC-SaveSync' }
+    }
+    catch {
+        Write-Log "Herunterladen fehlgeschlagen: $($_.Exception.Message)"
+        return $false
+    }
+
+    $fehler = Test-UpdateDatei $neu $endung
+    if ($fehler) {
+        Write-Log "Die heruntergeladene Datei wurde NICHT uebernommen: $fehler"
+        Write-Log "Die vorhandene Fassung bleibt unveraendert."
+        return $false
+    }
+
+    # Sicherheitskopie daneben legen - falls doch etwas schiefgeht, ist der
+    # alte Stand einen Handgriff entfernt.
+    try { Copy-Item -LiteralPath $selbst -Destination (Join-Path $ordner ("vorher" + $endung)) -Force } catch { }
+
+    try {
+        Copy-Item -LiteralPath $neu -Destination $selbst -Force
+    }
+    catch {
+        Write-Log "Ersetzen fehlgeschlagen: $($_.Exception.Message)"
+        Write-Log "Laeuft das Programm aus einem geschuetzten Ordner? Dann bitte woanders hin legen."
+        return $false
+    }
+    Write-Log ("Aktualisiert auf Version {0}." -f $Info.Version)
+    return $true
+}
+
+# Der ganze Ablauf mit Rueckfragen. -Still: keine Meldung, wenn schon aktuell
+# (fuer die Pruefung beim Start).
+function Invoke-UpdatePruefung {
+    param([switch]$Still)
+
+    $info = Get-NeuesteVersion
+    if (-not $info) {
+        if (-not $Still) {
+            [void][Windows.Forms.MessageBox]::Show(
+                "Die Update-Pruefung hat nicht geklappt.`n`nMeist fehlt gerade die Internetverbindung. Einzelheiten stehen im Protokoll.",
+                "Nach Updates suchen", 'OK', 'Information')
+        }
+        return
+    }
+
+    if (-not (Test-VersionNeuer $info.Version $script:Version)) {
+        Write-Log ("Version {0} ist aktuell." -f $script:Version)
+        if (-not $Still) {
+            [void][Windows.Forms.MessageBox]::Show(
+                ("Du hast bereits die neueste Fassung (Version {0})." -f $script:Version),
+                "Nach Updates suchen", 'OK', 'Information')
+        }
+        return
+    }
+
+    Write-Log ("Neue Version verfuegbar: {0} (du hast {1})." -f $info.Version, $script:Version)
+    # Aus dem Release-Text nur den Abschnitt "Was ist neu" zeigen - alles
+    # andere ist die Installationsanleitung und hier fehl am Platz.
+    $was = ""
+    if ($info.Text) {
+        $zeilen = @()
+        $drin = $false
+        foreach ($z in ($info.Text -split "`r?`n")) {
+            if ($z -match '^##\s') { $drin = ($z -match 'Was ist neu'); continue }
+            if ($drin -and $z.Trim()) { $zeilen += $z.Trim() }
+        }
+        if ($zeilen.Count -gt 0) {
+            $was = "`n`nNeu darin:`n" + (($zeilen | Select-Object -First 5 | ForEach-Object { "- $_" }) -join "`n")
+        }
+    }
+
+    $r = [Windows.Forms.MessageBox]::Show(
+        ("Version {0} ist verfuegbar - du hast {1}.{2}`n`nJetzt aktualisieren? Das Programm startet dabei neu." -f
+        $info.Version, $script:Version, $was),
+        "Update verfuegbar", 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    if ($script:holdingLock) {
+        [void][Windows.Forms.MessageBox]::Show(
+            "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach aktualisieren.",
+            "Noch nicht jetzt", 'OK', 'Warning')
+        return
+    }
+
+    if (Install-Update $info) {
+        [void][Windows.Forms.MessageBox]::Show(
+            ("Fertig - Version {0} ist installiert.`n`nDas Programm startet jetzt neu." -f $info.Version),
+            "Update abgeschlossen", 'OK', 'Information')
+        try {
+            $selbst = $script:SelfPath
+            if ([IO.Path]::GetExtension($selbst).ToLowerInvariant() -eq '.ps1') {
+                Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+                    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta', '-File', "`"$selbst`""
+            }
+            else {
+                Start-Process -FilePath $selbst
+            }
+        }
+        catch { Write-Log "Neustart fehlgeschlagen - bitte von Hand starten." }
+        $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
+        $script:mainForm.Close()
+    }
+    else {
+        [void][Windows.Forms.MessageBox]::Show(
+            ("Das Update hat nicht geklappt. Die vorhandene Fassung laeuft unveraendert weiter.`n`n" +
+            "Einzelheiten stehen im Protokoll. Du kannst die Datei auch von Hand holen:`n{0}" -f $script:ReleaseSeite),
+            "Update fehlgeschlagen", 'OK', 'Warning')
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -1986,6 +2203,23 @@ function Show-AdvancedDialog {
     $bVerk.Size = New-Object Drawing.Size(280, 28)
     $bVerk.Add_Click({ [void](New-DesktopShortcut) })
     $dlg.Controls.Add($bVerk)
+
+    $bUpd = New-Object Windows.Forms.Button
+    $bUpd.Text = "Nach Updates suchen"
+    $bUpd.Location = New-Object Drawing.Point(305, 190)
+    $bUpd.Size = New-Object Drawing.Size(180, 28)
+    $bUpd.Add_Click({ Invoke-UpdatePruefung })
+    $dlg.Controls.Add($bUpd)
+    Set-Tip ("Holt die neueste Fassung direkt von GitHub und ersetzt`n" +
+        "dieses Programm - Herunterladen von Hand entfaellt.`n" +
+        "Beim Start wird ohnehin automatisch nachgesehen.") $bUpd
+
+    $lVer = New-Object Windows.Forms.Label
+    $lVer.Text = "Version $($script:Version)"
+    $lVer.Location = New-Object Drawing.Point(15, 224)
+    $lVer.Size = New-Object Drawing.Size(200, 20)
+    $lVer.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
+    $dlg.Controls.Add($lVer)
     Set-Tip ("Legt eine Verknuepfung mit Symbol auf dem Desktop an.`n" +
         "Die heruntergeladene .cmd-Datei selbst kann kein Symbol tragen -`n" +
         "das legt Windows fuer alle Dateien dieser Art gemeinsam fest.") $bVerk
@@ -2344,12 +2578,13 @@ Import-Config
 [void](Set-AutoPaths)
 
 $form = New-Object Windows.Forms.Form
-$form.Text = "Animal Crossing - Save-Sync & Sperre"
+$form.Text = "Animal Crossing - Save-Sync & Sperre  (v$($script:Version))"
 # Hoehe passt zum Inhalt: zwei Knopfreihen, dafuer zwei Eingabezeilen weniger
 # (Bilder-Ordner, Branch, Sperre und Herzschlag stecken jetzt in "Erweitert...").
 $form.Size = New-Object Drawing.Size(660, 760)
 $form.StartPosition = "CenterScreen"
 $form.MinimumSize = New-Object Drawing.Size(660, 700)
+$script:mainForm = $form
 $ico = Get-AppIcon
 if ($ico) { $form.Icon = $ico }
 
@@ -2600,6 +2835,11 @@ $script:startTimer.Add_Tick({
 
         $script:lblStatus.Text = "Wird geprueft..."
         Update-Status -SkipSave
+
+        # Zum Schluss nach einer neueren Fassung sehen. -Still: ohne Meldung,
+        # wenn alles aktuell ist oder gerade kein Internet da ist. Bewusst nach
+        # der Statuspruefung, damit der Blick aufs Wesentliche nicht wartet.
+        if (-not $script:istErststart) { Invoke-UpdatePruefung -Still }
     })
 
 # Ereignisse verdrahten
@@ -2656,6 +2896,8 @@ $form.Add_FormClosing({
         # gerade noch laufen).
         if ($script:saveTimer) { $script:saveTimer.Stop() }
         Save-ConfigFromUI
+        # Beim Neustart nach einem Update nicht noch einmal nachfragen.
+        if ($script:updateLaeuft) { return }
         if ($script:holdingLock) {
             $r = [Windows.Forms.MessageBox]::Show(
                 ("Es laeuft noch eine Sitzung und du haeltst die Sperre.`n`n" +
