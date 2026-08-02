@@ -210,6 +210,18 @@ angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert
 „Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
 Knopf, dann steht dort, **was** fehlt.
 
+### Darstellung
+
+Das Fenster passt sich der Bildschirmskalierung an: Bei 150 % wird alles größer und
+bleibt scharf, statt wie ein Foto hochgezogen zu werden.
+
+Wer es unabhängig davon größer oder kleiner will, kann den Faktor selbst vorgeben –
+dazu vor dem Start die Umgebungsvariable `ACSS_UI_SCALE` setzen (erlaubt sind 0,5 bis 4):
+
+```powershell
+$env:ACSS_UI_SCALE = "1.5"
+```
+
 ### Statusanzeige (Farben)
 
 - **Grün** – frei, du kannst spielen.

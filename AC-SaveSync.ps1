@@ -43,6 +43,107 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# --------------------------------------------------------------------------
+# Darstellung: moderner Stil und scharfe Schrift auf grossen Bildschirmen
+# --------------------------------------------------------------------------
+# Beides MUSS hier oben stehen - vor dem allerersten Fenster. Spaeter
+# aufgerufen bleibt es wirkungslos.
+
+# Ohne diese zwei Zeilen zeichnet Windows Knoepfe und Felder im Stil von
+# Windows 2000 statt im aktuellen.
+[Windows.Forms.Application]::EnableVisualStyles()
+[Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+
+# Ohne die folgende Anmeldung haelt Windows das Programm fuer nicht
+# skalierungsfaehig: Es laesst uns in 96 dpi zeichnen und zieht das fertige
+# Fenster anschliessend wie ein Foto auf die tatsaechliche Groesse - alles
+# wird unscharf. Angemeldet zeichnen wir in echten Bildpunkten; um die
+# richtige Groesse kuemmert sich Set-UiScale weiter unten.
+Add-Type -Name Dpi -Namespace ACSS -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+[DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr wert);
+'@
+try {
+    # -4 = "Per Monitor V2": folgt auch dem Wechsel auf einen zweiten
+    # Bildschirm mit anderer Skalierung. Gibt es erst ab Windows 10 1703.
+    if (-not [ACSS.Dpi]::SetProcessDpiAwarenessContext([IntPtr]-4)) {
+        [void][ACSS.Dpi]::SetProcessDPIAware()
+    }
+}
+catch {
+    try { [void][ACSS.Dpi]::SetProcessDPIAware() } catch { }
+}
+
+# Wie stark muss das Layout wachsen? 96 dpi = 100 %, 144 dpi = 150 %.
+# Alle Groessen im Skript sind fuer 100 % geschrieben.
+$script:uiScale = 1.0
+try {
+    $g = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+    $script:uiScale = $g.DpiX / 96.0
+    $g.Dispose()
+}
+catch { $script:uiScale = 1.0 }
+# Zum Ausprobieren und fuer alle, die es generell groesser wollen:
+# ACSS_UI_SCALE=1.5 setzen und das Programm starten.
+if ($env:ACSS_UI_SCALE) {
+    $w = 0.0
+    if ([double]::TryParse($env:ACSS_UI_SCALE, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$w) -and $w -ge 0.5 -and $w -le 4.0) {
+        $script:uiScale = $w
+    }
+}
+
+# Zieht ein fertig aufgebautes Fenster auf die passende Groesse.
+# Form.Scale() erledigt Positionen und Groessen inklusive der verankerten
+# Elemente - nur die Schriften laesst es unangetastet, die kommen hier dazu.
+# Erst NACH dem Aufbau aufrufen, sonst werden spaeter zugefuegte Elemente
+# nicht erfasst.
+function Set-UiScale {
+    param([Windows.Forms.Form]$Fenster)
+    $f = $script:uiScale
+    if ($f -le 1.001) { return }          # bei 100 % gibt es nichts zu tun
+
+    $Fenster.SuspendLayout()
+    try {
+        $min = $Fenster.MinimumSize
+        $Fenster.MinimumSize = [Drawing.Size]::Empty   # sonst blockiert es das Wachsen
+        $Fenster.Scale((New-Object Drawing.SizeF($f, $f)))
+        if (-not $min.IsEmpty) {
+            $Fenster.MinimumSize = New-Object Drawing.Size(
+                [int][math]::Round($min.Width * $f), [int][math]::Round($min.Height * $f))
+        }
+        Set-UiSchrift $Fenster $f
+    }
+    finally {
+        $Fenster.ResumeLayout($true)
+    }
+}
+
+# Schriften mitwachsen lassen.
+#
+# ACHTUNG, hier steckt eine Falle: Elemente ohne eigene Schrift erben die des
+# Vaters. Setzt man erst die Schrift des Panels und liest danach die des
+# Kindes, bekommt man die bereits vergroesserte zurueck und multipliziert ein
+# zweites Mal - aus 9 pt werden 13,5 und dann 20,25. Der Text passt dann nicht
+# mehr in seine Zeile.
+# Deshalb: erst ALLE alten Schriften einsammeln, dann alle setzen.
+function Set-UiSchrift {
+    param($Element, [double]$Faktor)
+
+    $merker = New-Object System.Collections.ArrayList
+    function Sammle($e) {
+        foreach ($c in $e.Controls) {
+            if ($c.Font) { [void]$merker.Add(@{ C = $c; F = $c.Font }) }
+            if ($c.Controls -and $c.Controls.Count -gt 0) { Sammle $c }
+        }
+    }
+    Sammle $Element
+
+    foreach ($m in $merker) {
+        $m.C.Font = New-Object Drawing.Font($m.F.FontFamily, ($m.F.Size * $Faktor), $m.F.Style)
+    }
+}
+
 # Git darf NIE in der Konsole nach Benutzername/Passwort fragen: das Programm
 # startet ohne sichtbare Konsole, die Frage waere unsichtbar und Git wuerde
 # ewig warten. Mit 0 bricht Git stattdessen mit einer Meldung ab - und die
@@ -1148,36 +1249,38 @@ function Show-SelfTest {
     $kopf.Anchor = 'Top,Left,Right'
     $dlg.Controls.Add($kopf)
 
-    $panel = New-Object Windows.Forms.Panel
+    # Untereinander stapeln laesst Windows selbst (FlowLayoutPanel), statt die
+    # Hoehen von Hand auszurechnen. Wichtig auf grossen Bildschirmen: dort wird
+    # die Schrift groesser, Texte brauchen mehr Zeilen - vorher berechnete
+    # Abstaende wuerden dann nicht mehr passen und die Zeilen ueberlappen.
+    $panel = New-Object Windows.Forms.FlowLayoutPanel
     $panel.Location = New-Object Drawing.Point(15, 44)
     $panel.Size = New-Object Drawing.Size(612, 430)
+    $panel.FlowDirection = 'TopDown'
+    $panel.WrapContents = $false
     $panel.AutoScroll = $true
     $panel.BorderStyle = 'FixedSingle'
     $panel.Anchor = 'Top,Bottom,Left,Right'
     $dlg.Controls.Add($panel)
 
-    $py = 8
+    $textBreite = 550
     foreach ($p in $erg) {
         $zeile = New-Object Windows.Forms.Label
         $zeile.Text = if ($p.Ok) { "OK      " + $p.Name } else { "FEHLT   " + $p.Name }
         $zeile.ForeColor = if ($p.Ok) { [Drawing.Color]::FromArgb(0, 110, 0) } else { [Drawing.Color]::FromArgb(170, 0, 0) }
         $zeile.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
-        $zeile.Location = New-Object Drawing.Point(10, $py)
-        $zeile.Size = New-Object Drawing.Size(570, 20)
+        $zeile.AutoSize = $true
+        $zeile.Margin = New-Object Windows.Forms.Padding(8, 8, 8, 0)
         $panel.Controls.Add($zeile)
-        $py += 20
 
         if ($p.Hinweis) {
             $h = New-Object Windows.Forms.Label
             $h.Text = $p.Hinweis
-            $h.Location = New-Object Drawing.Point(28, $py)
-            $h.Size = New-Object Drawing.Size(550, 0)
-            $h.AutoSize = $false
-            $h.MaximumSize = New-Object Drawing.Size(550, 0)
             $h.AutoSize = $true
+            $h.MaximumSize = New-Object Drawing.Size($textBreite, 0)   # bricht um
+            $h.Margin = New-Object Windows.Forms.Padding(26, 2, 8, 0)
             $h.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
             $panel.Controls.Add($h)
-            $py += $h.Height + 4
         }
 
         # Originalmeldung von Git immer mit anzeigen, wenn es eine gibt
@@ -1189,13 +1292,11 @@ function Show-SelfTest {
             $r.ScrollBars = 'Vertical'
             $r.Font = New-Object Drawing.Font("Consolas", 8.5)
             $r.BackColor = [Drawing.Color]::FromArgb(245, 245, 245)
-            $r.Location = New-Object Drawing.Point(28, $py)
             $zeilen = @($p.Roh -split "`r?`n").Count
-            $r.Size = New-Object Drawing.Size(550, [Math]::Min(90, 16 + 13 * $zeilen))
+            $r.Size = New-Object Drawing.Size($textBreite, [Math]::Min(90, 16 + 13 * $zeilen))
+            $r.Margin = New-Object Windows.Forms.Padding(26, 2, 8, 6)
             $panel.Controls.Add($r)
-            $py += $r.Height + 4
         }
-        $py += 8
     }
 
     $btnKopieren = New-Object Windows.Forms.Button
@@ -1228,6 +1329,7 @@ function Show-SelfTest {
     }
     Write-Log ("Selbsttest fertig: {0} Punkt(e) offen." -f $anzahlFehler)
 
+    Set-UiScale $dlg
     [void]$dlg.ShowDialog()
 }
 
@@ -1761,6 +1863,7 @@ function Show-FirstRunWizard {
     $dlg.AcceptButton = $script:wizNext
 
     Update-WizStep
+    Set-UiScale $dlg
     [void]$dlg.ShowDialog()
 
     # Ergebnis in die Felder des Hauptfensters uebernehmen
@@ -1899,6 +2002,7 @@ function Show-AdvancedDialog {
     $dlg.Controls.Add($ab)
     $dlg.AcceptButton = $ok; $dlg.CancelButton = $ab
 
+    Set-UiScale $dlg
     if ($dlg.ShowDialog() -eq 'OK') {
         $script:txtPics.Text = $tPics.Text
         $script:txtBranch.Text = $tBranch.Text
@@ -2227,6 +2331,7 @@ function Show-SetupDialog {
     Set-Tip "Schliesst dieses Fenster. Die Einstellungen bleiben erhalten." $bc
 
     Show-SetupSeite 0
+    Set-UiScale $dlg
     [void]$dlg.ShowDialog()
 }
 
@@ -2565,4 +2670,5 @@ $form.Add_FormClosing({
 $form.Add_Shown({ $script:startTimer.Start() })
 
 Write-Log "Bereit."
+Set-UiScale $form
 [void]$form.ShowDialog()
