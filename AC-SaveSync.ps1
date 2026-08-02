@@ -157,7 +157,7 @@ $env:GIT_TERMINAL_PROMPT = '0'
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.14'
+$script:Version = '1.15'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
@@ -1130,6 +1130,170 @@ function Update-Status {
     elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
     elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
     else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
+}
+
+# --------------------------------------------------------------------------
+# Fotos ansehen
+# --------------------------------------------------------------------------
+# Zeigt die Bilder aus dem Unterordner 'pics' des gemeinsamen Repos - also
+# genau die, die nach dem Spielen dorthin verschoben wurden.
+
+# Zerlegt den Dateinamen (Spieler_JJJJMMTT-HHMMSS_Rest) in seine Teile.
+# Bilder ohne dieses Muster hat jemand von Hand hineingelegt.
+function Get-FotoInfo {
+    param($Datei)
+    if ($Datei.Name -match '^(.*?)_(\d{8})-(\d{6})_') {
+        $zeit = Get-BildZeit $Datei
+        return [pscustomobject]@{
+            Spieler = $Matches[1] -replace '_', ' '
+            Zeit    = $zeit
+            Text    = ("{0}  -  {1:dd.MM.yyyy}, {1:HH:mm} Uhr" -f ($Matches[1] -replace '_', ' '), $zeit)
+        }
+    }
+    return [pscustomobject]@{
+        Spieler = ""
+        Zeit    = $Datei.LastWriteTime
+        Text    = ("{0}  -  {1:dd.MM.yyyy}, {1:HH:mm} Uhr" -f $Datei.Name, $Datei.LastWriteTime)
+    }
+}
+
+# Zeigt das Bild an der aktuellen Stelle.
+function Show-FotoAktuell {
+    if ($script:fotoListe.Count -eq 0) { return }
+    $d = $script:fotoListe[$script:fotoIndex]
+
+    # Altes Bild freigeben, sonst waechst der Speicherbedarf mit jedem Blaettern.
+    if ($script:fotoBild) { $script:fotoBox.Image = $null; $script:fotoBild.Dispose(); $script:fotoBild = $null }
+    try {
+        # Ueber den Umweg Speicher laden: Image.FromFile wuerde die Datei
+        # offen halten, und dann kaeme Git beim naechsten Abgleich nicht daran.
+        $bytes = [IO.File]::ReadAllBytes($d.FullName)
+        $ms = New-Object IO.MemoryStream(, $bytes)
+        $script:fotoBild = [Drawing.Image]::FromStream($ms)
+        $script:fotoBox.Image = $script:fotoBild
+        $script:fotoInfo.Text = (Get-FotoInfo $d).Text
+    }
+    catch {
+        $script:fotoBox.Image = $null
+        $script:fotoInfo.Text = "Bild konnte nicht geladen werden: $($d.Name)"
+    }
+    $script:fotoZaehler.Text = ("Bild {0} von {1}" -f ($script:fotoIndex + 1), $script:fotoListe.Count)
+    $script:fotoZurueck.Enabled = ($script:fotoIndex -gt 0)
+    $script:fotoWeiter.Enabled = ($script:fotoIndex -lt $script:fotoListe.Count - 1)
+}
+
+function Invoke-FotoWeiter {
+    if ($script:fotoIndex -lt $script:fotoListe.Count - 1) { $script:fotoIndex++; Show-FotoAktuell }
+}
+function Invoke-FotoZurueck {
+    if ($script:fotoIndex -gt 0) { $script:fotoIndex--; Show-FotoAktuell }
+}
+
+function Show-Fotos {
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) {
+        [void][Windows.Forms.MessageBox]::Show("Es ist noch kein gemeinsamer Ordner eingerichtet.",
+            "Fotos", 'OK', 'Information')
+        return
+    }
+    $script:fotoOrdner = Join-Path $script:cfg.RepoPath 'pics'
+    $exts = @('.jpg', '.jpeg', '.png')
+    $script:fotoListe = @()
+    if (Test-Path -LiteralPath $script:fotoOrdner) {
+        $script:fotoListe = @(Get-ChildItem -LiteralPath $script:fotoOrdner -File -ErrorAction SilentlyContinue |
+            Where-Object { $exts -contains $_.Extension.ToLowerInvariant() } |
+            Sort-Object @{ Expression = { Get-BildZeit $_ } }, @{ Expression = { $_.Name } } -Descending)
+    }
+    if ($script:fotoListe.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show(
+            ("Noch keine Fotos da.`n`nSie landen automatisch hier, wenn du nach dem Spielen " +
+            "welche im Bilder-Ordner hast - den stellst du unter 'Erweitert...' ein."),
+            "Fotos", 'OK', 'Information')
+        return
+    }
+
+    $dlg = New-Object Windows.Forms.Form
+    $script:fotoDlg = $dlg
+    $dlg.Text = "Fotos"
+    $dlg.Size = New-Object Drawing.Size(900, 700)
+    # Mindestbreite so, dass die linke Knopfgruppe (Blaettern) und die rechte
+    # (Ordner/Schliessen) sich beim Kleinziehen nicht ins Gehege kommen:
+    # links bis 260, rechts 290 ab dem Rand, dazwischen etwas Luft.
+    $dlg.MinimumSize = New-Object Drawing.Size(600, 450)
+    $dlg.StartPosition = "CenterParent"
+    if ($script:appIcon) { $dlg.Icon = $script:appIcon }
+    $dlg.KeyPreview = $true      # Pfeiltasten sollen ueberall im Fenster wirken
+
+    $script:fotoBox = New-Object Windows.Forms.PictureBox
+    $script:fotoBox.Location = New-Object Drawing.Point(12, 12)
+    $script:fotoBox.Size = New-Object Drawing.Size(860, 560)
+    $script:fotoBox.SizeMode = 'Zoom'        # ganz sichtbar, Seitenverhaeltnis bleibt
+    $script:fotoBox.BackColor = [Drawing.Color]::FromArgb(30, 30, 30)
+    $script:fotoBox.Anchor = 'Top,Bottom,Left,Right'
+    $dlg.Controls.Add($script:fotoBox)
+
+    $script:fotoInfo = New-Object Windows.Forms.Label
+    $script:fotoInfo.Location = New-Object Drawing.Point(12, 580)
+    $script:fotoInfo.Size = New-Object Drawing.Size(560, 20)
+    $script:fotoInfo.Anchor = 'Bottom,Left,Right'
+    $script:fotoInfo.Font = New-Object Drawing.Font("Segoe UI", 9.75, [Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($script:fotoInfo)
+
+    $script:fotoZaehler = New-Object Windows.Forms.Label
+    $script:fotoZaehler.Location = New-Object Drawing.Point(12, 604)
+    $script:fotoZaehler.Size = New-Object Drawing.Size(200, 20)
+    $script:fotoZaehler.Anchor = 'Bottom,Left'
+    $script:fotoZaehler.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
+    $dlg.Controls.Add($script:fotoZaehler)
+
+    $script:fotoZurueck = New-Object Windows.Forms.Button
+    $script:fotoZurueck.Text = "< Zurueck"
+    $script:fotoZurueck.Location = New-Object Drawing.Point(12, 628)
+    $script:fotoZurueck.Size = New-Object Drawing.Size(120, 32)
+    $script:fotoZurueck.Anchor = 'Bottom,Left'
+    $script:fotoZurueck.Add_Click({ Invoke-FotoZurueck })
+    $dlg.Controls.Add($script:fotoZurueck)
+
+    $script:fotoWeiter = New-Object Windows.Forms.Button
+    $script:fotoWeiter.Text = "Weiter >"
+    $script:fotoWeiter.Location = New-Object Drawing.Point(140, 628)
+    $script:fotoWeiter.Size = New-Object Drawing.Size(120, 32)
+    $script:fotoWeiter.Anchor = 'Bottom,Left'
+    $script:fotoWeiter.Add_Click({ Invoke-FotoWeiter })
+    $dlg.Controls.Add($script:fotoWeiter)
+
+    $bOrdner = New-Object Windows.Forms.Button
+    $bOrdner.Text = "Ordner oeffnen"
+    $bOrdner.Location = New-Object Drawing.Point(600, 628)
+    $bOrdner.Size = New-Object Drawing.Size(150, 32)
+    $bOrdner.Anchor = 'Bottom,Right'
+    $bOrdner.Add_Click({ Start-Process explorer.exe $script:fotoOrdner })
+    $dlg.Controls.Add($bOrdner)
+    Set-Tip "Oeffnet den Ordner mit allen Fotos im Explorer." $bOrdner
+
+    $bZu = New-Object Windows.Forms.Button
+    $bZu.Text = "Schliessen"
+    $bZu.Location = New-Object Drawing.Point(758, 628)
+    $bZu.Size = New-Object Drawing.Size(120, 32)
+    $bZu.Anchor = 'Bottom,Right'
+    $bZu.Add_Click({ $script:fotoDlg.Close() })
+    $dlg.Controls.Add($bZu)
+
+    # Blaettern per Pfeiltasten - bequemer als Klicken
+    $dlg.Add_KeyDown({
+            param($s, $e)
+            if ($e.KeyCode -eq 'Right' -or $e.KeyCode -eq 'PageDown') { Invoke-FotoWeiter; $e.Handled = $true }
+            elseif ($e.KeyCode -eq 'Left' -or $e.KeyCode -eq 'PageUp') { Invoke-FotoZurueck; $e.Handled = $true }
+            elseif ($e.KeyCode -eq 'Escape') { $script:fotoDlg.Close() }
+        })
+    # Beim Schliessen das Bild freigeben
+    $dlg.Add_FormClosed({
+            if ($script:fotoBild) { $script:fotoBox.Image = $null; $script:fotoBild.Dispose(); $script:fotoBild = $null }
+        })
+
+    $script:fotoIndex = 0
+    Set-UiScale $dlg
+    Show-FotoAktuell
+    [void]$dlg.ShowDialog()
 }
 
 # --------------------------------------------------------------------------
@@ -2747,9 +2911,14 @@ $script:btnStop.Enabled = $false          # erst waehrend einer Sitzung nutzbar
 
 # zweite Reihe: alles, was man seltener braucht
 $y += 42
-$btnRefresh = New-Button "Status pruefen" 15 $y 180 34
-$btnSelfTest = New-Button "Selbsttest" 203 $y 180 34
-$btnUnlock = New-Button "Sperre erzwingen freigeben" 391 $y 217 34
+$btnRefresh = New-Button "Status pruefen" 15 $y 130 34
+$btnSelfTest = New-Button "Selbsttest" 153 $y 110 34
+$btnFotos = New-Button "Fotos ansehen" 271 $y 130 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 409 $y 199 34
+Set-Tip ("Zeigt die Fotos aus dem gemeinsamen Ordner - neueste zuerst.`n" +
+    "Blaettern geht auch mit den Pfeiltasten.`n" +
+    "Die Bilder landen dort automatisch nach dem Spielen, wenn unter`n" +
+    "'Erweitert...' ein Bilder-Ordner eingetragen ist.") $btnFotos
 Set-Tip ("Prueft der Reihe nach alles, was zum Spielen noetig ist:`n" +
     "Git, deine Angaben, Dolphin, den gemeinsamen Ordner und die`n" +
     "Verbindung zum Server. Zu jedem Problem steht dabei, was zu tun ist.`n" +
@@ -2907,6 +3076,7 @@ $script:btnPlay.Add_Click({ Start-Play })
 $script:btnStop.Add_Click({ Stop-Play })
 $btnRefresh.Add_Click({ Update-Status })
 $btnSelfTest.Add_Click({ Show-SelfTest })
+$btnFotos.Add_Click({ Show-Fotos })
 $btnUnlock.Add_Click({ Unlock-Session })
 $btnSetup.Add_Click({ Show-SetupDialog })
 $btnAdvanced.Add_Click({ Show-AdvancedDialog })
