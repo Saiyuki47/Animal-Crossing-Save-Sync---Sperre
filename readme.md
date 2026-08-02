@@ -28,6 +28,7 @@ die Spielzeiten jedes Spielers in die Repo-README.
 - [Wo liegt die Konfiguration?](#wo-liegt-die-konfiguration)
 - [Fehlerbehebung](#fehlerbehebung)
 - [Grenzen & Hinweise](#grenzen--hinweise)
+- [Lizenz](#lizenz)
 
 ---
 
@@ -394,3 +395,13 @@ speichere im Spiel und schau, in welchem Ordner sich die Dateien geändert haben
   Sperre.
 - Für Online-Besuche in Echtzeit (sich gegenseitig in der Stadt sehen) ist dieses Tool **nicht**
   gedacht – dafür bräuchtet ihr die Online-Funktion des Spiels (z. B. über Wiimmfi).
+
+---
+
+## Lizenz
+
+[MIT](LICENSE) – benutzen, ändern und weitergeben ist erlaubt, solange der Copyright-Hinweis
+erhalten bleibt. Ohne Gewähr und ohne Haftung.
+
+Das Symbol (`icon.ico`) ist an *Animal Crossing* angelehnt. Die Marke und die Bildsprache
+gehören Nintendo; die MIT-Lizenz gilt für den Code dieses Projekts, nicht dafür.

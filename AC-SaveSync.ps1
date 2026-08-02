@@ -3,6 +3,11 @@
   Animal Crossing Save-Sync + Sperre (Git) - mit grafischer Oberflaeche
 ================================================================================
 
+  Copyright (c) 2026 Saiyuki47 - MIT-Lizenz.
+  Benutzen, aendern und weitergeben erlaubt, solange dieser Hinweis erhalten
+  bleibt. Ohne Gewaehr und ohne Haftung. Vollstaendiger Text:
+  https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/blob/main/LICENSE
+
   Was macht das Skript?
   ---------------------
   Es startet Dolphin NICHT direkt, sondern kuemmert sich drumherum:
