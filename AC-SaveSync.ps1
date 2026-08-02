@@ -157,7 +157,7 @@ $env:GIT_TERMINAL_PROMPT = '0'
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.12'
+$script:Version = '1.13'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
@@ -612,9 +612,17 @@ function Test-Repo {
 }
 
 # Auf den Remote-Stand zwingen (kein Merge -> keine Konflikte).
-# Nur aufrufen, wenn wir die Sperre NICHT halten (sonst wuerden wir eigenen
-# Fortschritt verwerfen).
+#
+# ACHTUNG: Das "reset --hard" wirft alles weg, was lokal noch nicht
+# hochgeladen ist. Waehrend einer eigenen Sitzung waere das der Spielstand
+# seit dem letzten Herzschlag. Frueher stand hier nur der Hinweis, man moege
+# die Funktion dann nicht aufrufen - "Status pruefen" tat es trotzdem, und
+# zwar mitten im Spielen. Jetzt verweigert die Funktion selbst den Dienst.
 function Sync-Remote {
+    if ($script:holdingLock) {
+        Write-Log "Uebersprungen: waehrend deiner Sitzung wird der Stand nicht vom Server ueberschrieben."
+        return
+    }
     $f = Invoke-Git @('fetch', 'origin')
     if ($f.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht geholt werden." $f }
     $r = Invoke-Git @('reset', '--hard', "origin/$($script:cfg.Branch)")
@@ -1103,6 +1111,17 @@ function Update-Status {
     param([switch]$SkipSave)
     if (-not $SkipSave) { Save-ConfigFromUI }
     if (-not (Test-Repo)) { return }
+
+    # Waehrend der eigenen Sitzung nichts vom Server holen: Es gibt dort
+    # nichts Neues zu sehen (die Sperre liegt ja bei dir), und der Abgleich
+    # wuerde den laufenden Spielstand ueberschreiben. Also nur die Anzeige
+    # auffrischen.
+    if ($script:holdingLock) {
+        Write-Log "Du spielst gerade - es wird nur die Anzeige aufgefrischt."
+        Update-StatusUI (Get-LockState)
+        return
+    }
+
     Write-Log "Pruefe aktuellen Status..."
     Sync-Remote
     $lock = Get-LockState
