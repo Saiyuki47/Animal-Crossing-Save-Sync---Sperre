@@ -44,6 +44,10 @@
     Oder in PowerShell:   powershell -ExecutionPolicy Bypass -File .\AC-SaveSync.ps1
 ================================================================================
 #>
+Set-StrictMode -Version Latest
+# @@AC-SAVESYNC-POWERSHELL-BODY@@
+
+#region Start: Anzeige, DPI und Skalierung
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -98,6 +102,182 @@ if ($env:ACSS_UI_SCALE) {
     }
 }
 
+#endregion
+
+#region Konstanten und Zustand
+
+# Git darf NIE in der Konsole nach Benutzername/Passwort fragen: das Programm
+# startet ohne sichtbare Konsole, die Frage waere unsichtbar und Git wuerde
+# ewig warten. Mit 0 bricht Git stattdessen mit einer Meldung ab - und die
+# uebersetzt Write-GitProblem weiter unten in Klartext.
+# Der Windows-Anmelde-Dialog (Credential Manager) erscheint weiterhin normal.
+# <FIXED> Diese Zuweisung stand doppelt im Skript (einmal hier, einmal weiter
+# unten vor dem Abschnitt "Konfiguration"). Die zweite war wirkungslos und
+# wurde entfernt - dies ist die einzige verbliebene Stelle.
+$env:GIT_TERMINAL_PROMPT = '0'
+
+# --------------------------------------------------------------------------
+# Version und Update-Quelle
+# --------------------------------------------------------------------------
+# Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
+# Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
+# sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
+$script:Version = '1.16'
+$script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
+$script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
+
+# --------------------------------------------------------------------------
+# Konfiguration
+# --------------------------------------------------------------------------
+# Die Konfig liegt im Windows-Benutzerprofil unter %APPDATA%\AC-SaveSync\.
+# Dieser Ordner ist im Explorer standardmaessig ausgeblendet und liegt voellig
+# getrennt vom Skript - es landet also nichts Sichtbares neben der .ps1.
+$script:AppDir = if ($env:APPDATA) { Join-Path $env:APPDATA "AC-SaveSync" }
+elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "AC-SaveSync" }
+else { Join-Path (Get-Location).Path "AC-SaveSync" }
+if (-not (Test-Path $script:AppDir)) {
+    New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+}
+$script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
+# Eigener Pfad - fuer die Desktop-Verknuepfung. Beim Start ueber die .cmd
+# setzt deren Kopf $PSCommandPath auf die .cmd, sonst ist es diese .ps1.
+$script:SelfPath = $PSCommandPath
+# Pfad der Protokolldatei dieses Laufs (siehe Initialize-LogDatei)
+$script:LogPfad = $null
+# Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
+# dann fuehrt der Assistent durch die Einrichtung (siehe Start-Timer).
+$script:istErststart = -not (Test-Path $script:ConfigPath)
+
+$script:defaults = @{
+    DolphinPath      = "C:\Program Files\Dolphin-x64\Dolphin.exe"
+    RepoPath         = "$env:USERPROFILE\Documents\ACSave"
+    GamePath         = ""
+    SaveFolder       = ""
+    PicsFolder       = ""
+    PlayerName       = $env:USERNAME
+    Branch           = "main"
+    LeaseMinutes     = 5
+    HeartbeatSeconds = 60
+}
+$script:cfg = $script:defaults.Clone()
+
+# Laufzeit-Zustand
+$script:proc = $null
+$script:holdingLock = $false
+$script:lastHeartbeat = Get-Date
+$script:lastAccounted = Get-Date
+# Meldungen, die anfallen, bevor das Protokollfeld existiert (z. B. beim Laden
+# der Konfig). Sie werden nachgetragen, sobald die Oberflaeche steht.
+$script:pendingLog = @()
+# Ist Git da? Wird beim Start einmal geprueft (siehe Start-Timer) und steuert,
+# ob "Spielen starten" ueberhaupt anklickbar ist.
+$script:gitDa = $true
+# Laeuft gerade ein Update? Dann beim Schliessen nicht nachfragen.
+$script:updateLaeuft = $false
+# Fehlgeschlagene Herzschlaege in Folge und wann zuletzt etwas ankam
+$script:hbFehler = 0
+$script:hbLetzterErfolg = Get-Date
+# Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
+$script:configSaved = $false
+
+# <FIXED> Vorbelegung fuer Set-StrictMode -Version Latest.
+# StrictMode bricht ab, sobald eine Variable GELESEN wird, die es noch nicht
+# gibt. Die folgenden Werte entstehen erst spaeter - die Oberflaeche legt sie
+# beim Aufbau an, die Dialoge erst beim Oeffnen. Vorher fragt der Code sie aber
+# bereits ab, etwa Write-Log mit "if ($script:txtLog)" (das Protokollfeld gibt
+# es beim ersten Eintrag noch nicht) oder Get-AppIcon mit "if ($script:appIcon)"
+# als Merker fuer das bereits gebaute Symbol.
+# Die Typen sind mit Bedacht gewaehlt: Was spaeter mit .Count abgefragt wird,
+# faengt als leeres Feld an - "$null.Count" waere unter StrictMode ebenfalls ein
+# Fehler. Zaehler beginnen bei 0, alles Uebrige bei $null.
+
+# Oberflaeche des Hauptfensters (entsteht im Abschnitt "Main logic")
+$script:mainForm = $null
+$script:txtLog = $null
+$script:lblStatus = $null
+$script:btnPlay = $null
+$script:btnStop = $null
+$script:txtDolphin = $null
+$script:txtRepo = $null
+$script:txtGame = $null
+$script:txtSave = $null
+$script:txtPics = $null
+$script:txtName = $null
+$script:txtBranch = $null
+$script:txtLease = $null
+$script:txtHeart = $null
+$script:timer = $null
+$script:saveTimer = $null
+$script:autoTimer = $null
+$script:startTimer = $null
+$script:letzterFremdstand = $null
+
+# Programmsymbol (Get-AppIcon)
+$script:appIcon = $null
+$script:IconPath = $null
+
+# Fotos-Fenster
+$script:fotoDlg = $null
+$script:fotoBox = $null
+$script:fotoBild = $null
+$script:fotoInfo = $null
+$script:fotoZaehler = $null
+$script:fotoZurueck = $null
+$script:fotoWeiter = $null
+$script:fotoShow = $null
+$script:fotoShowKnopf = $null
+$script:fotoOrdner = $null
+$script:fotoListe = @()
+$script:fotoIndex = 0
+
+# Fenster "Frueherer Spielstand"
+$script:standDlg = $null
+$script:standListe = $null
+$script:standStatus = $null
+$script:standDaten = @()
+
+# Spielzeit- und Selbsttest-Fenster
+$script:zeitDlg = $null
+$script:selfTestDlg = $null
+$script:selfTestBericht = ""
+
+# Erweiterte Einstellungen
+$script:advPicsBox = $null
+
+# Erststart-Assistent
+$script:wizDlg = $null
+$script:wizKopf = $null
+$script:wizBack = $null
+$script:wizNext = $null
+$script:wizName = $null
+$script:wizDolphin = $null
+$script:wizSave = $null
+$script:wizUrl = $null
+$script:wizRepo = $null
+$script:wizHolStatus = $null
+$script:wizPanels = @()
+$script:wizTitel = @()
+$script:wizStep = 0
+
+# Fenster "Repo einrichten"
+$script:setupDlg = $null
+$script:setupKopf = $null
+$script:setupZurueck = $null
+$script:setupUrlA = $null
+$script:setupUrlB = $null
+$script:setupDirA = $null
+$script:setupDirB = $null
+$script:setupStatusA = $null
+$script:setupStatusB = $null
+$script:setupKopierA = $null
+$script:setupNameBox = $null
+$script:setupPanels = @()
+$script:setupSeite = 0
+
+#endregion
+
+#region UI helpers
+
 # Zieht ein fertig aufgebautes Fenster auf die passende Groesse.
 # Form.Scale() erledigt Positionen und Groessen inklusive der verankerten
 # Elemente - nur die Schriften laesst es unangetastet, die kommen hier dazu.
@@ -148,23 +328,6 @@ function Set-UiSchrift {
         $m.C.Font = New-Object Drawing.Font($m.F.FontFamily, ($m.F.Size * $Faktor), $m.F.Style)
     }
 }
-
-# Git darf NIE in der Konsole nach Benutzername/Passwort fragen: das Programm
-# startet ohne sichtbare Konsole, die Frage waere unsichtbar und Git wuerde
-# ewig warten. Mit 0 bricht Git stattdessen mit einer Meldung ab - und die
-# uebersetzt Write-GitProblem weiter unten in Klartext.
-# Der Windows-Anmelde-Dialog (Credential Manager) erscheint weiterhin normal.
-$env:GIT_TERMINAL_PROMPT = '0'
-
-# --------------------------------------------------------------------------
-# Version und Update-Quelle
-# --------------------------------------------------------------------------
-# Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
-# Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
-# sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.16'
-$script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
-$script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
 # --------------------------------------------------------------------------
 # Kurzhilfen (Tooltips), die beim Ueberfahren mit der Maus erscheinen
@@ -253,108 +416,48 @@ function New-DesktopShortcut {
 # Eingebettetes Deko-Banner (Base64-PNG, 192x64)
 $script:BannerBase64 = "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"
 
-# Git soll nie interaktiv nach Passwoertern fragen (sonst haengt das Skript):
-$env:GIT_TERMINAL_PROMPT = "0"
-
-# --------------------------------------------------------------------------
-# Konfiguration
-# --------------------------------------------------------------------------
-# Die Konfig liegt im Windows-Benutzerprofil unter %APPDATA%\AC-SaveSync\.
-# Dieser Ordner ist im Explorer standardmaessig ausgeblendet und liegt voellig
-# getrennt vom Skript - es landet also nichts Sichtbares neben der .ps1.
-$script:AppDir = if ($env:APPDATA) { Join-Path $env:APPDATA "AC-SaveSync" }
-elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "AC-SaveSync" }
-else { Join-Path (Get-Location).Path "AC-SaveSync" }
-if (-not (Test-Path $script:AppDir)) {
-    New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+function New-Label {
+    param($text, $x, $y, $w = 120)
+    $l = New-Object Windows.Forms.Label
+    $l.Text = $text; $l.Location = New-Object Drawing.Point($x, $y)
+    $l.Size = New-Object Drawing.Size($w, 22); $l.TextAlign = 'MiddleLeft'
+    $form.Controls.Add($l); return $l
 }
-$script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
-# Eigener Pfad - fuer die Desktop-Verknuepfung. Beim Start ueber die .cmd
-# setzt deren Kopf $PSCommandPath auf die .cmd, sonst ist es diese .ps1.
-$script:SelfPath = $PSCommandPath
-# Pfad der Protokolldatei dieses Laufs (siehe Initialize-LogDatei)
-$script:LogPfad = $null
-# Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
-# dann fuehrt der Assistent durch die Einrichtung (siehe Start-Timer).
-$script:istErststart = -not (Test-Path $script:ConfigPath)
-
-$script:defaults = @{
-    DolphinPath      = "C:\Program Files\Dolphin-x64\Dolphin.exe"
-    RepoPath         = "$env:USERPROFILE\Documents\ACSave"
-    GamePath         = ""
-    SaveFolder       = ""
-    PicsFolder       = ""
-    PlayerName       = $env:USERNAME
-    Branch           = "main"
-    LeaseMinutes     = 5
-    HeartbeatSeconds = 60
+function New-Text {
+    param($val, $x, $y, $w)
+    $t = New-Object Windows.Forms.TextBox
+    $t.Text = "$val"; $t.Location = New-Object Drawing.Point($x, $y)
+    $t.Size = New-Object Drawing.Size($w, 22)
+    $form.Controls.Add($t); return $t
 }
-$script:cfg = $script:defaults.Clone()
-
-# Laufzeit-Zustand
-$script:proc = $null
-$script:holdingLock = $false
-$script:lastHeartbeat = Get-Date
-$script:lastAccounted = Get-Date
-# Meldungen, die anfallen, bevor das Protokollfeld existiert (z. B. beim Laden
-# der Konfig). Sie werden nachgetragen, sobald die Oberflaeche steht.
-$script:pendingLog = @()
-# Ist Git da? Wird beim Start einmal geprueft (siehe Start-Timer) und steuert,
-# ob "Spielen starten" ueberhaupt anklickbar ist.
-$script:gitDa = $true
-# Laeuft gerade ein Update? Dann beim Schliessen nicht nachfragen.
-$script:updateLaeuft = $false
-# Fehlgeschlagene Herzschlaege in Folge und wann zuletzt etwas ankam
-$script:hbFehler = 0
-$script:hbLetzterErfolg = Get-Date
-# Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
-$script:configSaved = $false
-
-function Import-Config {
-    if (Test-Path $script:ConfigPath) {
-        try {
-            $j = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @($script:cfg.Keys)) {
-                if ($null -ne $j.$k -and "$($j.$k)" -ne "") { $script:cfg[$k] = $j.$k }
-            }
-        }
-        catch {
-            Write-Log "WARNUNG: Einstellungsdatei unlesbar - es gelten die Standardwerte."
-            Write-Log ("  Datei: {0}" -f $script:ConfigPath)
-            Write-Log ("  Grund: {0}" -f $_.Exception.Message)
-        }
-    }
+function New-Button {
+    param($text, $x, $y, $w, $h = 28)
+    $b = New-Object Windows.Forms.Button
+    $b.Text = $text; $b.Location = New-Object Drawing.Point($x, $y)
+    $b.Size = New-Object Drawing.Size($w, $h)
+    $form.Controls.Add($b); return $b
 }
 
-function Save-ConfigFromUI {
-    $script:cfg.DolphinPath = $script:txtDolphin.Text
-    $script:cfg.RepoPath = $script:txtRepo.Text
-    $script:cfg.GamePath = $script:txtGame.Text
-    $script:cfg.SaveFolder = $script:txtSave.Text
-    $script:cfg.PicsFolder = $script:txtPics.Text
-    $script:cfg.PlayerName = $script:txtName.Text
-    $script:cfg.Branch = $script:txtBranch.Text
-
-    $lm = 5; [void][int]::TryParse($script:txtLease.Text, [ref]$lm)
-    $hb = 60; [void][int]::TryParse($script:txtHeart.Text, [ref]$hb)
-    if ($lm -lt 1) { $lm = 1 }
-    if ($hb -lt 10) { $hb = 10 }
-    $script:cfg.LeaseMinutes = $lm
-    $script:cfg.HeartbeatSeconds = $hb
-
-    # Ob das Schreiben geklappt hat, merken - sonst wuerde der Speichern-Knopf
-    # "gespeichert" melden, obwohl die Datei nicht geschrieben werden konnte.
-    $script:configSaved = $false
-    try {
-        ($script:cfg | ConvertTo-Json) | Set-Content -Path $script:ConfigPath -Encoding UTF8
-        $script:configSaved = $true
-    }
-    catch {
-        Write-Log "FEHLER: Einstellungen konnten nicht gespeichert werden."
-        Write-Log ("  Datei: {0}" -f $script:ConfigPath)
-        Write-Log ("  Grund: {0}" -f $_.Exception.Message)
-    }
+# Moderner, Explorer-artiger Ordner-Dialog (statt der alten Baum-Ansicht).
+# Trick: OpenFileDialog als Ordnerauswahl nutzen -> in den gewuenschten Ordner
+# wechseln und unten auf "Oeffnen" klicken; wir nehmen dann dessen Verzeichnis.
+function Select-FolderModern {
+    param([string]$InitialPath = "", [string]$Title = "Ordner auswaehlen")
+    $d = New-Object Windows.Forms.OpenFileDialog
+    $d.Title = $Title
+    $d.ValidateNames = $false
+    $d.CheckFileExists = $false
+    $d.CheckPathExists = $true
+    $d.Multiselect = $false
+    $d.FileName = "Diesen Ordner waehlen"
+    if ($InitialPath -and (Test-Path $InitialPath)) { $d.InitialDirectory = $InitialPath }
+    if ($d.ShowDialog() -eq 'OK') { return [IO.Path]::GetDirectoryName($d.FileName) }
+    return $null
 }
+
+#endregion
+
+#region Protokoll und Konfiguration
 
 # --------------------------------------------------------------------------
 # Kleine Helfer
@@ -405,6 +508,78 @@ function Write-Log {
     }
 }
 
+# <FIXED> Liest einen Eintrag aus einem ConvertFrom-Json-Ergebnis, ohne dass ein
+# fehlender Eintrag unter StrictMode zum Fehler wird.
+# Das ist keine Bequemlichkeit, sondern noetig: Mehrere Stellen RECHNEN damit,
+# dass ein Eintrag fehlen kann - eine Sperr-Datei aus einer aelteren Fassung hat
+# z. B. noch kein "startedUtc", und Get-LockState weicht dann bewusst auf den
+# Herzschlag aus. Ohne diesen Helfer wuerde StrictMode dort abbrechen und die
+# Sperre faelschlich als unlesbar melden.
+# Rueckgabe: der Wert, oder $null wenn es den Eintrag nicht gibt.
+function Get-JsonWert {
+    param($Objekt, [string]$Name)
+    if ($null -eq $Objekt) { return $null }
+    $p = $Objekt.PSObject.Properties[$Name]
+    if (-not $p) { return $null }
+    return $p.Value
+}
+
+function Import-Config {
+    if (Test-Path $script:ConfigPath) {
+        try {
+            $j = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
+            foreach ($k in @($script:cfg.Keys)) {
+                # <FIXED> Erst nachsehen, OB es den Eintrag ueberhaupt gibt.
+                # Unter StrictMode ist das Lesen einer fehlenden Eigenschaft ein
+                # Fehler - und eine Einstellungsdatei aus einer aelteren Fassung
+                # kennt neuere Schluessel noch nicht. Ohne diese Pruefung wuerde
+                # sie komplett verworfen, statt nur den fehlenden Wert.
+                if (-not $j.PSObject.Properties[$k]) { continue }
+                if ($null -ne $j.$k -and "$($j.$k)" -ne "") { $script:cfg[$k] = $j.$k }
+            }
+        }
+        catch {
+            Write-Log "WARNUNG: Einstellungsdatei unlesbar - es gelten die Standardwerte."
+            Write-Log ("  Datei: {0}" -f $script:ConfigPath)
+            Write-Log ("  Grund: {0}" -f $_.Exception.Message)
+        }
+    }
+}
+
+function Save-ConfigFromUI {
+    $script:cfg.DolphinPath = $script:txtDolphin.Text
+    $script:cfg.RepoPath = $script:txtRepo.Text
+    $script:cfg.GamePath = $script:txtGame.Text
+    $script:cfg.SaveFolder = $script:txtSave.Text
+    $script:cfg.PicsFolder = $script:txtPics.Text
+    $script:cfg.PlayerName = $script:txtName.Text
+    $script:cfg.Branch = $script:txtBranch.Text
+
+    $lm = 5; [void][int]::TryParse($script:txtLease.Text, [ref]$lm)
+    $hb = 60; [void][int]::TryParse($script:txtHeart.Text, [ref]$hb)
+    if ($lm -lt 1) { $lm = 1 }
+    if ($hb -lt 10) { $hb = 10 }
+    $script:cfg.LeaseMinutes = $lm
+    $script:cfg.HeartbeatSeconds = $hb
+
+    # Ob das Schreiben geklappt hat, merken - sonst wuerde der Speichern-Knopf
+    # "gespeichert" melden, obwohl die Datei nicht geschrieben werden konnte.
+    $script:configSaved = $false
+    try {
+        ($script:cfg | ConvertTo-Json) | Set-Content -Path $script:ConfigPath -Encoding UTF8
+        $script:configSaved = $true
+    }
+    catch {
+        Write-Log "FEHLER: Einstellungen konnten nicht gespeichert werden."
+        Write-Log ("  Datei: {0}" -f $script:ConfigPath)
+        Write-Log ("  Grund: {0}" -f $_.Exception.Message)
+    }
+}
+
+#endregion
+
+#region Git helpers
+
 # Macht aus der Ausgabe von git sauberen Text.
 # Ohne das verpackt PowerShell alles, was git nach stderr schreibt, in
 # ErrorRecords - und die werden mit "At C:\...:815 char:32", "CategoryInfo"
@@ -426,145 +601,19 @@ function Invoke-Git {
     [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
 }
 
-# --------------------------------------------------------------------------
-# Automatisch finden, was man sonst von Hand zusammensuchen muesste
-# --------------------------------------------------------------------------
-# Sucht Dolphin an den ueblichen Stellen. Rueckgabe: Pfad zur Dolphin.exe
-# oder "" - dann muss der Nutzer sie selbst auswaehlen.
-function Find-DolphinExe {
-    $orte = @(
-        "$env:ProgramFiles\Dolphin-x64\Dolphin.exe"
-        "$env:ProgramFiles\Dolphin\Dolphin.exe"
-        "${env:ProgramFiles(x86)}\Dolphin-x64\Dolphin.exe"
-        "${env:ProgramFiles(x86)}\Dolphin\Dolphin.exe"
-        "$env:LOCALAPPDATA\Programs\Dolphin-x64\Dolphin.exe"
-        "$env:LOCALAPPDATA\Programs\Dolphin\Dolphin.exe"
-    )
-    foreach ($o in $orte) {
-        if ($o -and (Test-Path -LiteralPath $o)) { return $o }
+# Ruft git auch ausserhalb des Repos auf (fuer --version und --global config)
+# und faengt ab, dass git ueberhaupt fehlt.
+function Invoke-GitRaw {
+    param([string[]]$GitArgs, [string]$WorkDir)
+    try {
+        if ($WorkDir) { $out = & git -C $WorkDir @GitArgs 2>&1 }
+        else { $out = & git @GitArgs 2>&1 }
+        return [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
     }
-
-    # Portable Entpack-Installationen: irgendwo ein Ordner "Dolphin*" mit der
-    # exe darin. Nur eine Ebene tief suchen - das bleibt schnell.
-    $eltern = @(
-        ([Environment]::GetFolderPath('MyDocuments'))
-        ([Environment]::GetFolderPath('Desktop'))
-        "$env:USERPROFILE\Downloads"
-        "$env:ProgramFiles"
-        "${env:ProgramFiles(x86)}"
-        "$env:LOCALAPPDATA\Programs"
-        "C:\", "C:\Games", "D:\", "D:\Games", "E:\"
-    )
-    foreach ($p in $eltern) {
-        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
-        try {
-            foreach ($d in (Get-ChildItem -LiteralPath $p -Directory -Filter 'Dolphin*' -ErrorAction SilentlyContinue)) {
-                $exe = Join-Path $d.FullName 'Dolphin.exe'
-                if (Test-Path -LiteralPath $exe) { return $exe }
-            }
-        }
-        catch { }
+    catch {
+        # git nicht gefunden -> 9009 ist Windows' "Befehl nicht gefunden"
+        return [pscustomobject]@{ Code = 9009; Text = $_.Exception.Message }
     }
-
-    # Ueber die Deinstallations-Eintraege der Registry (deckt eigene Pfade ab)
-    $wurzeln = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
-    foreach ($w in $wurzeln) {
-        try {
-            foreach ($k in (Get-ItemProperty $w -ErrorAction SilentlyContinue)) {
-                if ("$($k.DisplayName)" -like '*Dolphin*') {
-                    $d = "$($k.InstallLocation)".Trim('"')
-                    if ($d) {
-                        $exe = Join-Path $d 'Dolphin.exe'
-                        if (Test-Path -LiteralPath $exe) { return $exe }
-                    }
-                }
-            }
-        }
-        catch { }
-    }
-
-    $c = Get-Command 'Dolphin.exe' -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
-    return ""
-}
-
-# Sucht den Ordner, in dem Dolphin den Spielstand ablegt.
-# Wenn moeglich wird direkt der Ordner von Animal Crossing zurueckgegeben -
-# die Ordnernamen unter Wii\title\00010000 sind die Spielkuerzel in Hex:
-#   52555545 = RUUE (USA), 52555550 = RUUP (Europa), 5255554A = RUUJ (Japan)
-# Das ist deutlich besser als der Sammelordner, in dem ALLE Wii-Spiele liegen.
-function Find-DolphinSaveFolder {
-    param([string]$DolphinExe)
-    $wurzeln = @()
-    # Portable Installation: der User-Ordner liegt neben der Dolphin.exe
-    if ($DolphinExe -and (Test-Path -LiteralPath $DolphinExe)) {
-        $wurzeln += (Join-Path (Split-Path -Parent $DolphinExe) 'User')
-    }
-    $wurzeln += (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Dolphin Emulator')
-    if ($env:APPDATA) { $wurzeln += (Join-Path $env:APPDATA 'Dolphin Emulator') }
-
-    $acKuerzel = @('52555545', '52555550', '5255554a')
-
-    # Von mehreren Kandidaten den zuletzt bespielten nehmen: wer zwei Regionen
-    # installiert hat, spielt hoechstens eine davon wirklich.
-    function Neuester($ordner) {
-        $best = $null; $zeit = [datetime]::MinValue
-        foreach ($o in $ordner) {
-            $f = Get-ChildItem -LiteralPath $o -Recurse -File -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($f -and $f.LastWriteTime -gt $zeit) { $zeit = $f.LastWriteTime; $best = $o }
-        }
-        if ($best) { return $best }
-        return ($ordner | Select-Object -First 1)
-    }
-
-    foreach ($w in $wurzeln) {
-        $titel = Join-Path $w 'Wii\title\00010000'
-        if (Test-Path -LiteralPath $titel) {
-            # a) Animal Crossing direkt treffen
-            $kandidaten = @()
-            foreach ($k in $acKuerzel) {
-                $p = Join-Path $titel $k
-                if (Test-Path -LiteralPath $p) { $kandidaten += $p }
-            }
-            if ($kandidaten.Count -gt 0) { return (Neuester $kandidaten) }
-            # b) genau ein Spiel vorhanden -> das ist es dann wohl
-            $unter = @(Get-ChildItem -LiteralPath $titel -Directory -ErrorAction SilentlyContinue)
-            if ($unter.Count -eq 1) { return $unter[0].FullName }
-            # c) sonst der Sammelordner als grober Vorschlag
-            if ($unter.Count -gt 1) { return $titel }
-        }
-        foreach ($u in @('Wii', 'GC')) {
-            $p = Join-Path $w $u
-            if (Test-Path -LiteralPath $p) { return $p }
-        }
-    }
-    return ""
-}
-
-# Fuellt leere oder ins Leere zeigende Pfade mit dem, was gefunden wurde.
-# Aendert NIE etwas, das der Nutzer selbst eingetragen hat und das existiert.
-function Set-AutoPaths {
-    $gefunden = @()
-
-    if ([string]::IsNullOrWhiteSpace($script:cfg.DolphinPath) -or
-        -not (Test-Path -LiteralPath $script:cfg.DolphinPath)) {
-        $d = Find-DolphinExe
-        if ($d) { $script:cfg.DolphinPath = $d; $gefunden += "Dolphin: $d" }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder) -or
-        -not (Test-Path -LiteralPath $script:cfg.SaveFolder)) {
-        $s = Find-DolphinSaveFolder $script:cfg.DolphinPath
-        if ($s) { $script:cfg.SaveFolder = $s; $gefunden += "Save-Ordner (Vorschlag): $s" }
-    }
-
-    foreach ($g in $gefunden) { Write-Log ("Automatisch gefunden - {0}" -f $g) }
-    return $gefunden.Count
 }
 
 # --------------------------------------------------------------------------
@@ -577,40 +626,52 @@ function Set-AutoPaths {
 $script:GitKlartext = @(
     @{ Muster = 'could not read Username|could not read Password|Authentication failed|Invalid username or password|terminal prompts disabled|Permission denied \(publickey\)'
         Text  = 'Git kommt nicht auf den Server - die Zugangsdaten fehlen oder stimmen nicht.'
-        Tipp  = 'Eingabeaufforderung im Repo-Ordner oeffnen und einmal "git push" ausfuehren, dann die Anmeldung abschliessen. Bei GitHub per Browser-Login oder mit einem Token als Passwort.' }
+        Tipp  = 'Eingabeaufforderung im Repo-Ordner oeffnen und einmal "git push" ausfuehren, dann die Anmeldung abschliessen. Bei GitHub per Browser-Login oder mit einem Token als Passwort.' 
+    }
     @{ Muster = 'Could not resolve host|Failed to connect|Connection timed out|unable to access.*(Could not|Failed)|network is unreachable'
         Text  = 'Der Server ist nicht erreichbar - meist fehlt gerade die Internetverbindung.'
-        Tipp  = 'Internetverbindung pruefen und es danach erneut versuchen. Der Spielstand bleibt solange lokal erhalten.' }
+        Tipp  = 'Internetverbindung pruefen und es danach erneut versuchen. Der Spielstand bleibt solange lokal erhalten.' 
+    }
     @{ Muster = 'Repository not found|repository .* not found|remote: Not Found'
         Text  = 'Das Repo gibt es unter dieser Adresse nicht - oder dein Konto hat keinen Zugriff darauf.'
-        Tipp  = 'Adresse auf Tippfehler pruefen. Bei einem privaten Repo muss dein Konto als Mitarbeiter eingetragen sein.' }
+        Tipp  = 'Adresse auf Tippfehler pruefen. Bei einem privaten Repo muss dein Konto als Mitarbeiter eingetragen sein.' 
+    }
     @{ Muster = 'non-fast-forward|fetch first|Updates were rejected|behind its remote'
         Text  = 'Auf dem Server liegt ein neuerer Stand - jemand anderes war schneller.'
-        Tipp  = 'Auf "Status pruefen" klicken, damit der neue Stand geholt wird, und es dann noch einmal versuchen.' }
+        Tipp  = 'Auf "Status pruefen" klicken, damit der neue Stand geholt wird, und es dann noch einmal versuchen.' 
+    }
     @{ Muster = 'Please tell me who you are|user\.email|user\.name|empty ident|unable to auto-detect email'
         Text  = 'Git weiss noch nicht, wer du bist - ohne Namen und E-Mail kann es nichts speichern.'
-        Tipp  = 'Einmalig in einer Eingabeaufforderung ausfuehren:  git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"' }
+        Tipp  = 'Einmalig in einer Eingabeaufforderung ausfuehren:  git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"' 
+    }
     @{ Muster = 'not a git repository|does not appear to be a git repository'
         Text  = 'Der eingetragene Ordner ist kein Git-Repo.'
-        Tipp  = 'Pfad beim Repo-Ordner pruefen, oder unten auf "Repo einrichten..." klicken.' }
+        Tipp  = 'Pfad beim Repo-Ordner pruefen, oder unten auf "Repo einrichten..." klicken.' 
+    }
     @{ Muster = "'origin' does not appear|No such remote|remote origin already exists"
         Text  = 'Die Verbindung zum gemeinsamen Repo im Internet ("origin") ist nicht richtig eingerichtet.'
-        Tipp  = 'Ueber "Repo einrichten..." Schritt 2 die Adresse des gemeinsamen Repos eintragen.' }
+        Tipp  = 'Ueber "Repo einrichten..." Schritt 2 die Adresse des gemeinsamen Repos eintragen.' 
+    }
     @{ Muster = 'src refspec .* does not match any|couldn.t find remote ref'
         Text  = 'Den eingetragenen Branch gibt es noch nicht.'
-        Tipp  = 'Pruefen, ob beide Spieler denselben Branch eingetragen haben (normalerweise "main").' }
+        Tipp  = 'Pruefen, ob beide Spieler denselben Branch eingetragen haben (normalerweise "main").' 
+    }
     @{ Muster = 'index\.lock|Unable to create .*index\.lock'
         Text  = 'Git blockiert sich selbst - vermutlich laeuft noch ein anderer Git-Vorgang oder einer ist abgestuerzt.'
-        Tipp  = 'Kurz warten und erneut versuchen. Hilft das nicht, die Datei .git\index.lock im Repo-Ordner loeschen.' }
+        Tipp  = 'Kurz warten und erneut versuchen. Hilft das nicht, die Datei .git\index.lock im Repo-Ordner loeschen.' 
+    }
     @{ Muster = 'would be overwritten by merge|local changes.*would be overwritten|CONFLICT|Automatic merge failed'
         Text  = 'Lokale Aenderungen stehen dem Stand vom Server im Weg.'
-        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Achtung: dabei werden lokale Aenderungen verworfen.' }
+        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Achtung: dabei werden lokale Aenderungen verworfen.' 
+    }
     @{ Muster = 'Filename too long|unable to write file.*too long|path too long'
         Text  = 'Ein Dateiname wird zu lang - Windows steigt bei sehr langen Pfaden aus.'
-        Tipp  = 'Einmalig ausfuehren:  git config --global core.longpaths true  - oder den Repo-Ordner naeher an die Laufwerkswurzel legen, z. B. C:\ACSave.' }
+        Tipp  = 'Einmalig ausfuehren:  git config --global core.longpaths true  - oder den Repo-Ordner naeher an die Laufwerkswurzel legen, z. B. C:\ACSave.' 
+    }
     @{ Muster = 'detected dubious ownership|safe\.directory'
         Text  = 'Git traut dem Ordner nicht, weil er einem anderen Benutzerkonto gehoert.'
-        Tipp  = 'Einmalig ausfuehren:  git config --global --add safe.directory "<Pfad zum Repo-Ordner>"' }
+        Tipp  = 'Einmalig ausfuehren:  git config --global --add safe.directory "<Pfad zum Repo-Ordner>"' 
+    }
 )
 
 # Gibt einen Git-Fehler verstaendlich aus: erst Klartext + Tipp, danach immer
@@ -706,6 +767,411 @@ function Sync-Remote {
     if ($r.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht uebernommen werden." $r }
 }
 
+# Liegt etwas zum Committen bereit? Ueber den Exitcode statt ueber den
+# Ausgabetext ("nothing to commit"), damit es auch mit anderssprachigem Git
+# funktioniert:  0 = Index deckt sich mit HEAD,  1 = es gibt Vorgemerktes.
+function Test-Staged {
+    return ((Invoke-Git @('diff', '--cached', '--quiet')).Code -ne 0)
+}
+
+# Committet die aktuellen Aenderungen und pusht sie. Rueckgabe wie Invoke-Git,
+# damit der Aufrufer an .Code erkennt, ob wirklich alles beim Remote angekommen
+# ist. WICHTIG: Scheitert schon der Commit, wird NICHT gepusht und der Fehler
+# durchgereicht - sonst wuerde ein "Everything up-to-date" des Push einen
+# Erfolg vortaeuschen und z. B. eine Sperre als gesichert gelten, die nie
+# beim anderen Spieler ankommt.
+function Invoke-GitCommitPush {
+    param([string]$msg)
+    Invoke-Git @('add', '-A') | Out-Null
+    if (Test-Staged) {
+        $c = Invoke-Git @('commit', '-m', $msg)
+        if ($c.Code -ne 0) {
+            Write-GitProblem "Speichern fehlgeschlagen - es wird nichts hochgeladen." $c
+            return [pscustomobject]@{ Code = $c.Code; Text = $c.Text; Stage = 'commit' }
+        }
+    }
+    # Auch ohne neuen Commit pushen: es koennen aeltere Commits liegen
+    # geblieben sein, deren Push beim letzten Mal fehlgeschlagen ist.
+    $p = Invoke-Git @('push', 'origin', $script:cfg.Branch)
+    return [pscustomobject]@{ Code = $p.Code; Text = $p.Text; Stage = 'push' }
+}
+
+#endregion
+
+#region Automatisch finden: Dolphin und Save-Ordner
+
+# --------------------------------------------------------------------------
+# Automatisch finden, was man sonst von Hand zusammensuchen muesste
+# --------------------------------------------------------------------------
+# Sucht Dolphin an den ueblichen Stellen. Rueckgabe: Pfad zur Dolphin.exe
+# oder "" - dann muss der Nutzer sie selbst auswaehlen.
+function Find-DolphinExe {
+    $orte = @(
+        "$env:ProgramFiles\Dolphin-x64\Dolphin.exe"
+        "$env:ProgramFiles\Dolphin\Dolphin.exe"
+        "${env:ProgramFiles(x86)}\Dolphin-x64\Dolphin.exe"
+        "${env:ProgramFiles(x86)}\Dolphin\Dolphin.exe"
+        "$env:LOCALAPPDATA\Programs\Dolphin-x64\Dolphin.exe"
+        "$env:LOCALAPPDATA\Programs\Dolphin\Dolphin.exe"
+    )
+    foreach ($o in $orte) {
+        if ($o -and (Test-Path -LiteralPath $o)) { return $o }
+    }
+
+    # Portable Entpack-Installationen: irgendwo ein Ordner "Dolphin*" mit der
+    # exe darin. Nur eine Ebene tief suchen - das bleibt schnell.
+    $eltern = @(
+        ([Environment]::GetFolderPath('MyDocuments'))
+        ([Environment]::GetFolderPath('Desktop'))
+        "$env:USERPROFILE\Downloads"
+        "$env:ProgramFiles"
+        "${env:ProgramFiles(x86)}"
+        "$env:LOCALAPPDATA\Programs"
+        "C:\", "C:\Games", "D:\", "D:\Games", "E:\"
+    )
+    foreach ($p in $eltern) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        try {
+            foreach ($d in (Get-ChildItem -LiteralPath $p -Directory -Filter 'Dolphin*' -ErrorAction SilentlyContinue)) {
+                $exe = Join-Path $d.FullName 'Dolphin.exe'
+                if (Test-Path -LiteralPath $exe) { return $exe }
+            }
+        }
+        catch { }
+    }
+
+    # Ueber die Deinstallations-Eintraege der Registry (deckt eigene Pfade ab)
+    $wurzeln = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($w in $wurzeln) {
+        try {
+            foreach ($k in (Get-ItemProperty $w -ErrorAction SilentlyContinue)) {
+                # <FIXED> Nicht jeder Deinstallations-Eintrag hat DisplayName
+                # oder InstallLocation. Unter StrictMode wuerde der erste solche
+                # Eintrag die ganze Registry-Suche abbrechen (der catch liegt um
+                # die Schleife) - Dolphin waere dann unauffindbar.
+                if ("$(Get-JsonWert $k 'DisplayName')" -like '*Dolphin*') {
+                    $d = "$(Get-JsonWert $k 'InstallLocation')".Trim('"')
+                    if ($d) {
+                        $exe = Join-Path $d 'Dolphin.exe'
+                        if (Test-Path -LiteralPath $exe) { return $exe }
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    $c = Get-Command 'Dolphin.exe' -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    return ""
+}
+
+# Sucht den Ordner, in dem Dolphin den Spielstand ablegt.
+# Wenn moeglich wird direkt der Ordner von Animal Crossing zurueckgegeben -
+# die Ordnernamen unter Wii\title\00010000 sind die Spielkuerzel in Hex:
+#   52555545 = RUUE (USA), 52555550 = RUUP (Europa), 5255554A = RUUJ (Japan)
+# Das ist deutlich besser als der Sammelordner, in dem ALLE Wii-Spiele liegen.
+function Find-DolphinSaveFolder {
+    param([string]$DolphinExe)
+    $wurzeln = @()
+    # Portable Installation: der User-Ordner liegt neben der Dolphin.exe
+    if ($DolphinExe -and (Test-Path -LiteralPath $DolphinExe)) {
+        $wurzeln += (Join-Path (Split-Path -Parent $DolphinExe) 'User')
+    }
+    $wurzeln += (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Dolphin Emulator')
+    if ($env:APPDATA) { $wurzeln += (Join-Path $env:APPDATA 'Dolphin Emulator') }
+
+    $acKuerzel = @('52555545', '52555550', '5255554a')
+
+    # Von mehreren Kandidaten den zuletzt bespielten nehmen: wer zwei Regionen
+    # installiert hat, spielt hoechstens eine davon wirklich.
+    function Neuester($ordner) {
+        $best = $null; $zeit = [datetime]::MinValue
+        foreach ($o in $ordner) {
+            $f = Get-ChildItem -LiteralPath $o -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($f -and $f.LastWriteTime -gt $zeit) { $zeit = $f.LastWriteTime; $best = $o }
+        }
+        if ($best) { return $best }
+        return ($ordner | Select-Object -First 1)
+    }
+
+    foreach ($w in $wurzeln) {
+        $titel = Join-Path $w 'Wii\title\00010000'
+        if (Test-Path -LiteralPath $titel) {
+            # a) Animal Crossing direkt treffen
+            $kandidaten = @()
+            foreach ($k in $acKuerzel) {
+                $p = Join-Path $titel $k
+                if (Test-Path -LiteralPath $p) { $kandidaten += $p }
+            }
+            if ($kandidaten.Count -gt 0) { return (Neuester $kandidaten) }
+            # b) genau ein Spiel vorhanden -> das ist es dann wohl
+            $unter = @(Get-ChildItem -LiteralPath $titel -Directory -ErrorAction SilentlyContinue)
+            if ($unter.Count -eq 1) { return $unter[0].FullName }
+            # c) sonst der Sammelordner als grober Vorschlag
+            if ($unter.Count -gt 1) { return $titel }
+        }
+        foreach ($u in @('Wii', 'GC')) {
+            $p = Join-Path $w $u
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+    }
+    return ""
+}
+
+# Fuellt leere oder ins Leere zeigende Pfade mit dem, was gefunden wurde.
+# Aendert NIE etwas, das der Nutzer selbst eingetragen hat und das existiert.
+function Set-AutoPaths {
+    $gefunden = @()
+
+    if ([string]::IsNullOrWhiteSpace($script:cfg.DolphinPath) -or
+        -not (Test-Path -LiteralPath $script:cfg.DolphinPath)) {
+        $d = Find-DolphinExe
+        if ($d) { $script:cfg.DolphinPath = $d; $gefunden += "Dolphin: $d" }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder) -or
+        -not (Test-Path -LiteralPath $script:cfg.SaveFolder)) {
+        $s = Find-DolphinSaveFolder $script:cfg.DolphinPath
+        if ($s) { $script:cfg.SaveFolder = $s; $gefunden += "Save-Ordner (Vorschlag): $s" }
+    }
+
+    foreach ($g in $gefunden) { Write-Log ("Automatisch gefunden - {0}" -f $g) }
+    return $gefunden.Count
+}
+
+#endregion
+
+#region Dateien: Spielstand, Bilder und Spielzeit
+
+# --------------------------------------------------------------------------
+# Spielstaende zwischen Dolphin-Ordner und Repo kopieren
+# --------------------------------------------------------------------------
+function Get-RepoSaveDir { Join-Path $script:cfg.RepoPath 'save' }
+
+# true = ok/uebersprungen, false = echter Fehler
+function Restore-Saves {
+    $src = Get-RepoSaveDir
+    $dst = $script:cfg.SaveFolder
+    if ([string]::IsNullOrWhiteSpace($dst)) { return $true }   # Feld leer -> Funktion aus
+    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Write-Log "Noch kein Spielstand im Repo - vorhandener Dolphin-Save bleibt unangetastet."
+        return $true
+    }
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    Write-Log "Schreibe Spielstand aus dem Repo in den Dolphin-Ordner..."
+    # /E = inkl. Unterordner, ueberschreibt; bewusst OHNE Loeschen, damit im
+    # Dolphin-Ordner nichts Fremdes geloescht wird.
+    $null = robocopy $src $dst /E /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
+    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Zurueckschreiben (robocopy-Code $LASTEXITCODE)."; return $false }
+    return $true
+}
+
+function Backup-Saves {
+    $src = $script:cfg.SaveFolder
+    $dst = Get-RepoSaveDir
+    if ([string]::IsNullOrWhiteSpace($src)) { return $true }   # Feld leer -> Funktion aus
+    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Write-Log "Dolphin-Save-Ordner ist leer/fehlt - nichts zu sichern."
+        return $true
+    }
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    # /MIR = spiegelt exakt ins repo-eigene 'save/' (dort ist Spiegeln sicher).
+    $null = robocopy $src $dst /MIR /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
+    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Sichern (robocopy-Code $LASTEXITCODE)."; return $false }
+    return $true
+}
+
+# --------------------------------------------------------------------------
+# Screenshots/Fotos ins Repo verschieben (mit kollisionssicheren Namen)
+# --------------------------------------------------------------------------
+# Liefert die Aufnahmezeit eines Bildes fuer die Sortierung der Galerie.
+# Move-Pics baut sie in den Dateinamen ein (Spieler_JJJJMMTT-HHMMSS_Name).
+# Bilder, die jemand von Hand in den pics-Ordner gelegt hat, haben dieses
+# Muster nicht - fuer die zaehlt die Aenderungszeit der Datei.
+function Get-BildZeit {
+    param($Datei)
+    if ($Datei.Name -match '_(\d{8})-(\d{6})_') {
+        $t = [datetime]::MinValue
+        $ok = [datetime]::TryParseExact(
+            ($Matches[1] + $Matches[2]), 'yyyyMMddHHmmss',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$t)
+        if ($ok) { return $t }
+    }
+    return $Datei.LastWriteTime
+}
+
+function Move-Pics {
+    $src = $script:cfg.PicsFolder
+    if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
+    if (-not (Test-Path $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
+    $dst = Join-Path $script:cfg.RepoPath 'pics'
+    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+
+    $exts = @('.jpg', '.jpeg', '.png')
+    $files = Get-ChildItem -Path $src -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $exts -contains $_.Extension.ToLowerInvariant() }
+    if (-not $files) { Write-Log "Keine neuen Bilder gefunden."; return }
+
+    $safe = ($script:cfg.PlayerName -replace '[^\w\-]', '_')
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "Unbekannt" }
+
+    $moved = 0
+    foreach ($f in $files) {
+        # Eindeutiger Name: Spieler + Aufnahme-Zeit + Originalname (alles bereinigt)
+        $stamp = $f.LastWriteTime.ToString("yyyyMMdd-HHmmss")
+        $stem = ("{0}_{1}_{2}" -f $safe, $stamp, $f.BaseName) -replace '[^\w\-]', '_'
+        $ext = $f.Extension.ToLowerInvariant()
+        $target = Join-Path $dst ($stem + $ext)
+        $i = 1
+        while (Test-Path $target) {
+            $target = Join-Path $dst ("{0}_{1}{2}" -f $stem, $i, $ext)
+            $i++
+        }
+        try { Move-Item -LiteralPath $f.FullName -Destination $target -Force; $moved++ }
+        catch { Write-Log "Bild konnte nicht verschoben werden: $($f.Name)" }
+    }
+    Write-Log ("{0} Bild(er) ins Repo verschoben und lokal entfernt." -f $moved)
+}
+
+# --------------------------------------------------------------------------
+# Spielzeit-Erfassung + README-Statistik
+# --------------------------------------------------------------------------
+function Get-PlaytimePath { Join-Path $script:cfg.RepoPath 'playtime.json' }
+
+function Get-Playtime {
+    $p = Get-PlaytimePath
+    $h = @{}
+    if (Test-Path $p) {
+        try {
+            $j = Get-Content $p -Raw | ConvertFrom-Json
+            foreach ($prop in $j.PSObject.Properties) {
+                $v = $prop.Value
+                # <FIXED> Fehlende Felder sind erlaubt und werden zu 0 bzw. "".
+                # Ohne Get-JsonWert wuerde StrictMode hier abbrechen und die
+                # gesamte Statistik verwerfen, nur weil ein Eintrag unvollstaendig ist.
+                $h[$prop.Name] = @{
+                    TotalSeconds  = [double](Get-JsonWert $v 'TotalSeconds')
+                    Sessions      = [int](Get-JsonWert $v 'Sessions')
+                    LastPlayedUtc = [string](Get-JsonWert $v 'LastPlayedUtc')
+                }
+            }
+        }
+        catch {
+            Write-Log "WARNUNG: playtime.json ist beschaedigt - die Spielzeit-Statistik kann unvollstaendig sein."
+            Write-Log ("  Grund: {0}" -f $_.Exception.Message)
+        }
+    }
+    return $h
+}
+
+function Save-Playtime {
+    param($h)
+    ($h | ConvertTo-Json -Depth 5) | Set-Content -Path (Get-PlaytimePath) -Encoding UTF8
+}
+
+function Format-Duration {
+    param([double]$sec)
+    if ($sec -lt 0) { $sec = 0 }
+    $ts = [TimeSpan]::FromSeconds([math]::Round($sec))
+    if ($ts.TotalHours -ge 1) { return ("{0}h {1}m" -f [int][math]::Floor($ts.TotalHours), $ts.Minutes) }
+    elseif ($ts.TotalMinutes -ge 1) { return ("{0}m {1}s" -f $ts.Minutes, $ts.Seconds) }
+    else { return ("{0}s" -f $ts.Seconds) }
+}
+
+function Write-Readme {
+    param($h)
+    if ($null -eq $h) { $h = @{} }
+    $lines = @()
+    $lines += "# Gemeinsamer Animal-Crossing-Spielstand"
+    $lines += ""
+    $lines += "Verwaltet mit ``AC-SaveSync.ps1``."
+    $lines += ""
+    $lines += "## Spielzeiten"
+    $lines += ""
+    $lines += "| Spieler | Gesamt | Sitzungen | Zuletzt gespielt |"
+    $lines += "|---|---|---|---|"
+    $total = 0.0
+    if ($h.Keys.Count -eq 0) {
+        $lines += "| _noch keine Daten_ | - | - | - |"
+    }
+    else {
+        foreach ($name in ($h.Keys | Sort-Object)) {
+            $e = $h[$name]
+            $total += [double]$e.TotalSeconds
+            $last = "-"
+            if ($e.LastPlayedUtc) {
+                try { $last = [datetimeoffset]::Parse($e.LastPlayedUtc).LocalDateTime.ToString("yyyy-MM-dd HH:mm") }
+                catch { $last = "-" }   # unlesbarer Zeitstempel -> Strich in der Tabelle
+            }
+            $lines += ("| {0} | {1} | {2} | {3} |" -f $name, (Format-Duration $e.TotalSeconds), $e.Sessions, $last)
+        }
+    }
+    $lines += ""
+    $lines += ("**Gesamt zusammen:** {0}" -f (Format-Duration $total))
+
+    # Fotos-Galerie (falls Bilder im Repo liegen), neueste zuerst.
+    # Sortiert wird nach der Aufnahmezeit, NICHT nach dem Dateinamen: der
+    # faengt mit dem Spielernamen an, dadurch stand frueher alles von "Zoe"
+    # vor allem von "Anna" - auch wenn Zoes Bild zwei Wochen aelter war.
+    $picsDir = Join-Path $script:cfg.RepoPath 'pics'
+    if (Test-Path $picsDir) {
+        $imgExts = @('.jpg', '.jpeg', '.png')
+        # <FIXED> Ergebnis in @() klammern. Ohne das liefert die Pipeline bei
+        # GENAU EINEM Bild kein Feld, sondern das Bild selbst - und "$imgs.Count"
+        # ist unter StrictMode dann ein Fehler. Die Galerie fiel dadurch still
+        # aus der README, sobald nur ein einziges Foto im Ordner lag.
+        $imgs = @(Get-ChildItem -Path $picsDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $imgExts -contains $_.Extension.ToLowerInvariant() } |
+            Sort-Object @{ Expression = { Get-BildZeit $_ } }, @{ Expression = { $_.Name } } -Descending)
+        if ($imgs -and $imgs.Count -gt 0) {
+            $lines += ""
+            $lines += ("## Fotos ({0})" -f $imgs.Count)
+            $lines += ""
+            foreach ($img in $imgs) {
+                $lines += ("![{0}](pics/{1})" -f $img.BaseName, $img.Name)
+            }
+        }
+    }
+
+    $lines += ""
+    $lines += ("_Zuletzt aktualisiert: {0}_" -f (Get-Date).ToString("yyyy-MM-dd HH:mm"))
+    ($lines -join "`r`n") | Set-Content -Path (Join-Path $script:cfg.RepoPath 'README.md') -Encoding UTF8
+}
+
+# Rechnet die seit dem letzten Zeitpunkt vergangenen Sekunden dem aktuellen
+# Spieler an und aktualisiert playtime.json + README. Mit -EndSession wird
+# zusaetzlich der Sitzungszaehler erhoeht.
+function Add-Playtime {
+    param([switch]$EndSession)
+    $now = Get-Date
+    $deltaSec = ($now - $script:lastAccounted).TotalSeconds
+    if ($deltaSec -lt 0) { $deltaSec = 0 }
+    $script:lastAccounted = $now
+
+    $name = $script:cfg.PlayerName
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unbekannt" }
+    $h = Get-Playtime
+    if (-not $h.ContainsKey($name)) {
+        $h[$name] = @{ TotalSeconds = 0.0; Sessions = 0; LastPlayedUtc = "" }
+    }
+    $h[$name].TotalSeconds = [double]$h[$name].TotalSeconds + $deltaSec
+    $h[$name].LastPlayedUtc = [datetime]::UtcNow.ToString("o")
+    if ($EndSession) { $h[$name].Sessions = [int]$h[$name].Sessions + 1 }
+    Save-Playtime $h
+    Write-Readme $h
+}
+
+#endregion
+
+#region Lock/Sperre
+
 function Get-LockPath { Join-Path $script:cfg.RepoPath "PLAYING.lock" }
 
 # In der Sperrdatei stecken ZWEI Zeitpunkte, und sie haben verschiedene Aufgaben:
@@ -749,7 +1215,8 @@ function Set-LockFile {
         # Format schreiben, damit er beim naechsten Lesen eindeutig bleibt.
         try {
             $alt = Get-Content (Get-LockPath) -Raw -ErrorAction Stop | ConvertFrom-Json
-            $altStart = ConvertTo-UtcZeit $alt.startedUtc
+            # <FIXED> fehlendes startedUtc ist erlaubt (aeltere Sperr-Dateien)
+            $altStart = ConvertTo-UtcZeit (Get-JsonWert $alt 'startedUtc')
             if ($altStart) { $start = $altStart.ToString("o") }
         }
         catch { $start = $null }
@@ -783,22 +1250,25 @@ function Get-LockState {
     if (-not (Test-Path $lf)) { return [pscustomobject]@{ State = 'free' } }
     try {
         $j = Get-Content $lf -Raw -ErrorAction Stop | ConvertFrom-Json
-        $upd = ConvertTo-UtcZeit $j.updatedUtc
+        # <FIXED> Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
+        $upd = ConvertTo-UtcZeit (Get-JsonWert $j 'updatedUtc')
         if (-not $upd) { return [pscustomobject]@{ State = 'unknown' } }
         $age = ([datetime]::UtcNow - $upd).TotalMinutes
         if ($age -lt 0) { $age = 0 }       # abweichende Uhren nicht negativ anzeigen
 
         # Sperrdateien aus aelteren Fassungen haben noch keinen Startzeitpunkt -
         # dann bleibt nur der Herzschlag als Naeherung.
-        $start = ConvertTo-UtcZeit $j.startedUtc
+        $start = ConvertTo-UtcZeit (Get-JsonWert $j 'startedUtc')
         $dauer = if ($start) { ([datetime]::UtcNow - $start).TotalMinutes } else { $age }
         if ($dauer -lt 0) { $dauer = 0 }
 
-        $mine = ($j.owner -eq $script:cfg.PlayerName) -and ($j.machine -eq $env:COMPUTERNAME)
+        $besitzer = Get-JsonWert $j 'owner'
+        $rechner = Get-JsonWert $j 'machine'
+        $mine = ($besitzer -eq $script:cfg.PlayerName) -and ($rechner -eq $env:COMPUTERNAME)
         return [pscustomobject]@{
             State          = 'locked'
-            Owner          = $j.owner
-            Machine        = $j.machine
+            Owner          = $besitzer
+            Machine        = $rechner
             AgeMinutes     = $age       # seit dem letzten Herzschlag -> Ablauf
             SessionMinutes = $dauer     # seit Sitzungsbeginn -> Anzeige
             Stale          = ($age -gt $script:cfg.LeaseMinutes)
@@ -810,33 +1280,64 @@ function Get-LockState {
     }
 }
 
-# Liegt etwas zum Committen bereit? Ueber den Exitcode statt ueber den
-# Ausgabetext ("nothing to commit"), damit es auch mit anderssprachigem Git
-# funktioniert:  0 = Index deckt sich mit HEAD,  1 = es gibt Vorgemerktes.
-function Test-Staged {
-    return ((Invoke-Git @('diff', '--cached', '--quiet')).Code -ne 0)
-}
-
-# Committet die aktuellen Aenderungen und pusht sie. Rueckgabe wie Invoke-Git,
-# damit der Aufrufer an .Code erkennt, ob wirklich alles beim Remote angekommen
-# ist. WICHTIG: Scheitert schon der Commit, wird NICHT gepusht und der Fehler
-# durchgereicht - sonst wuerde ein "Everything up-to-date" des Push einen
-# Erfolg vortaeuschen und z. B. eine Sperre als gesichert gelten, die nie
-# beim anderen Spieler ankommt.
-function Invoke-GitCommitPush {
-    param([string]$msg)
-    Invoke-Git @('add', '-A') | Out-Null
-    if (Test-Staged) {
-        $c = Invoke-Git @('commit', '-m', $msg)
-        if ($c.Code -ne 0) {
-            Write-GitProblem "Speichern fehlgeschlagen - es wird nichts hochgeladen." $c
-            return [pscustomobject]@{ Code = $c.Code; Text = $c.Text; Stage = 'commit' }
+# --------------------------------------------------------------------------
+# Anzeige von allein auffrischen, waehrend der andere spielt
+# --------------------------------------------------------------------------
+# Liest den Stand der Sperre DIREKT vom Server, ohne den Arbeitsordner
+# anzufassen. Ein "reset --hard" waere dafuer viel zu grob - hier soll ja nur
+# die Anzeige stimmen, nicht der Spielstand wechseln.
+function Get-LockStateRemote {
+    $f = Invoke-Git @('fetch', 'origin')
+    if ($f.Code -ne 0) { return $null }
+    $j = Invoke-Git @('show', "origin/$($script:cfg.Branch):PLAYING.lock")
+    if ($j.Code -ne 0) { return [pscustomobject]@{ State = 'free' } }   # Datei fehlt = niemand spielt
+    try {
+        $o = $j.Text | ConvertFrom-Json
+        # <FIXED> Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
+        $upd = ConvertTo-UtcZeit (Get-JsonWert $o 'updatedUtc')
+        if (-not $upd) { return $null }
+        $age = ([datetime]::UtcNow - $upd).TotalMinutes
+        if ($age -lt 0) { $age = 0 }
+        $start = ConvertTo-UtcZeit (Get-JsonWert $o 'startedUtc')
+        $dauer = if ($start) { ([datetime]::UtcNow - $start).TotalMinutes } else { $age }
+        if ($dauer -lt 0) { $dauer = 0 }
+        $besitzer = Get-JsonWert $o 'owner'
+        $rechner = Get-JsonWert $o 'machine'
+        return [pscustomobject]@{
+            State          = 'locked'
+            Owner          = $besitzer
+            Machine        = $rechner
+            AgeMinutes     = $age
+            SessionMinutes = $dauer
+            Stale          = ($age -gt $script:cfg.LeaseMinutes)
+            Mine           = (($besitzer -eq $script:cfg.PlayerName) -and ($rechner -eq $env:COMPUTERNAME))
         }
     }
-    # Auch ohne neuen Commit pushen: es koennen aeltere Commits liegen
-    # geblieben sein, deren Push beim letzten Mal fehlgeschlagen ist.
-    $p = Invoke-Git @('push', 'origin', $script:cfg.Branch)
-    return [pscustomobject]@{ Code = $p.Code; Text = $p.Text; Stage = 'push' }
+    catch { return $null }
+}
+
+function Invoke-AutoAuffrischen {
+    # Nur wenn gerade nichts laeuft und alles eingerichtet ist.
+    if ($script:holdingLock -or -not $script:gitDa) { return }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { return }
+    if (-not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) { return }
+
+    $neu = Get-LockStateRemote
+    if (-not $neu) { return }        # kein Netz o. ae. - stillschweigend nichts tun
+
+    $vorher = $script:letzterFremdstand
+    Update-StatusUI $neu
+
+    # Nur melden, wenn sich wirklich etwas geaendert hat - sonst wuerde das
+    # Protokoll alle paar Minuten mit derselben Zeile volllaufen.
+    $jetzt = if ($neu.State -eq 'free') { 'frei' } else { "$($neu.Owner)" }
+    if ($vorher -and $vorher -ne 'frei' -and $jetzt -eq 'frei') {
+        Write-Log ("{0} hat aufgehoert - du kannst jetzt spielen." -f $vorher)
+    }
+    elseif ($vorher -ne $jetzt -and $jetzt -ne 'frei') {
+        Write-Log ("{0} spielt jetzt." -f $neu.Owner)
+    }
+    $script:letzterFremdstand = $jetzt
 }
 
 function Update-StatusUI {
@@ -868,6 +1369,10 @@ function Update-StatusUI {
         }
     }
 }
+
+#endregion
+
+#region Ablauf: Spielen starten, Herzschlag, Beenden
 
 # --------------------------------------------------------------------------
 # Ablauf: Spielen starten
@@ -1233,67 +1738,19 @@ function Update-Status {
     $lock = Get-LockState
     Update-StatusUI $lock
     if ($lock.State -eq 'free') { Write-Log "Frei - du kannst spielen." }
+    # <FIXED> Ist die Sperr-Datei unlesbar, liefert Get-LockState nur .State -
+    # ohne .Mine, .Stale und .Owner. Unter StrictMode waere jede Abfrage darauf
+    # ein Fehler, deshalb faengt dieser Zweig den Fall vorher ab. Vorher lief er
+    # bis in den letzten else-Zweig und meldete " spielt gerade." ohne Namen.
+    elseif ($lock.State -ne 'locked') { Write-Log "Status unbekannt - die Sperr-Datei ist unlesbar." }
     elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
     elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
     else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
 }
 
-# --------------------------------------------------------------------------
-# Anzeige von allein auffrischen, waehrend der andere spielt
-# --------------------------------------------------------------------------
-# Liest den Stand der Sperre DIREKT vom Server, ohne den Arbeitsordner
-# anzufassen. Ein "reset --hard" waere dafuer viel zu grob - hier soll ja nur
-# die Anzeige stimmen, nicht der Spielstand wechseln.
-function Get-LockStateRemote {
-    $f = Invoke-Git @('fetch', 'origin')
-    if ($f.Code -ne 0) { return $null }
-    $j = Invoke-Git @('show', "origin/$($script:cfg.Branch):PLAYING.lock")
-    if ($j.Code -ne 0) { return [pscustomobject]@{ State = 'free' } }   # Datei fehlt = niemand spielt
-    try {
-        $o = $j.Text | ConvertFrom-Json
-        $upd = ConvertTo-UtcZeit $o.updatedUtc
-        if (-not $upd) { return $null }
-        $age = ([datetime]::UtcNow - $upd).TotalMinutes
-        if ($age -lt 0) { $age = 0 }
-        $start = ConvertTo-UtcZeit $o.startedUtc
-        $dauer = if ($start) { ([datetime]::UtcNow - $start).TotalMinutes } else { $age }
-        if ($dauer -lt 0) { $dauer = 0 }
-        return [pscustomobject]@{
-            State          = 'locked'
-            Owner          = $o.owner
-            Machine        = $o.machine
-            AgeMinutes     = $age
-            SessionMinutes = $dauer
-            Stale          = ($age -gt $script:cfg.LeaseMinutes)
-            Mine           = (($o.owner -eq $script:cfg.PlayerName) -and ($o.machine -eq $env:COMPUTERNAME))
-        }
-    }
-    catch { return $null }
-}
+#endregion
 
-function Invoke-AutoAuffrischen {
-    # Nur wenn gerade nichts laeuft und alles eingerichtet ist.
-    if ($script:holdingLock -or -not $script:gitDa) { return }
-    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { return }
-    if (-not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) { return }
-
-    $neu = Get-LockStateRemote
-    if (-not $neu) { return }        # kein Netz o. ae. - stillschweigend nichts tun
-
-    $vorher = $script:letzterFremdstand
-    Update-StatusUI $neu
-
-    # Nur melden, wenn sich wirklich etwas geaendert hat - sonst wuerde das
-    # Protokoll alle paar Minuten mit derselben Zeile volllaufen.
-    $jetzt = if ($neu.State -eq 'free') { 'frei' } else { "$($neu.Owner)" }
-    if ($vorher -and $vorher -ne 'frei' -and $jetzt -eq 'frei') {
-        Write-Log ("{0} hat aufgehoert - du kannst jetzt spielen." -f $vorher)
-    }
-    elseif ($vorher -ne $jetzt -and $jetzt -ne 'frei') {
-        Write-Log ("{0} spielt jetzt." -f $neu.Owner)
-    }
-    $script:letzterFremdstand = $jetzt
-}
+#region Dialoge: Spielzeit, Spielstaende, Fotos, Selbsttest, Erweitert
 
 # --------------------------------------------------------------------------
 # Spielzeit ansehen
@@ -1750,228 +2207,8 @@ function Show-Fotos {
 }
 
 # --------------------------------------------------------------------------
-# Selbst aktualisieren
-# --------------------------------------------------------------------------
-# Holt die neueste Fassung direkt von GitHub, prueft sie und ersetzt die
-# eigene Datei. Das geht, weil weder die .cmd noch die .ps1 waehrend des
-# Laufens von Windows festgehalten wird: Der Starter liest die Datei einmal
-# ein und gibt sie sofort wieder frei.
-
-# Fragt GitHub nach dem neuesten Release. Rueckgabe: Objekt mit Version,
-# Beschreibung und Dateiliste - oder $null, wenn es nicht klappt (kein
-# Internet, GitHub gerade nicht erreichbar, Zaehlgrenze erreicht).
-function Get-NeuesteVersion {
-    try {
-        # Aeltere Windows-Fassungen sprechen von sich aus noch kein TLS 1.2,
-        # GitHub verlangt es aber - sonst bricht der Aufruf unverstaendlich ab.
-        [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-
-        $r = Invoke-RestMethod -Uri $script:ReleaseApi -TimeoutSec 15 `
-            -Headers @{ 'User-Agent' = 'AC-SaveSync'; 'Accept' = 'application/vnd.github+json' }
-        if (-not $r.tag_name) { return $null }
-        return [pscustomobject]@{
-            Version = ("$($r.tag_name)" -replace '^v', '')
-            Tag     = "$($r.tag_name)"
-            Text    = "$($r.body)"
-            Dateien = $r.assets
-        }
-    }
-    catch {
-        Write-Log "Update-Pruefung nicht moeglich: $($_.Exception.Message)"
-        return $null
-    }
-}
-
-# Vergleicht zwei Versionsangaben. Bewusst ueber [version] statt als Text:
-# als Text waere "1.9" groesser als "1.11".
-function Test-VersionNeuer {
-    param([string]$Kandidat, [string]$Aktuell)
-    try {
-        return ([version]($Kandidat -replace '^v', '')) -gt ([version]($Aktuell -replace '^v', ''))
-    }
-    catch { return $false }
-}
-
-# Prueft eine heruntergeladene Datei, BEVOR sie die laufende ersetzt.
-# Dieselben Pruefungen wie im Release-Workflow - eine halb geladene oder
-# beschaedigte Datei wuerde das Programm sonst unstartbar machen.
-function Test-UpdateDatei {
-    param([string]$Pfad, [string]$Endung)
-    if (-not (Test-Path -LiteralPath $Pfad)) { return "Datei fehlt" }
-    $bytes = [IO.File]::ReadAllBytes($Pfad)
-    if ($bytes.Length -lt 50000) { return "Datei ist verdaechtig klein ($($bytes.Length) Bytes)" }
-    if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return "Datei beginnt mit einem BOM" }
-
-    $text = [IO.File]::ReadAllText($Pfad, [Text.UTF8Encoding]::new($false))
-    $rumpf = $text
-    if ($Endung -eq '.cmd') {
-        $marke = [char]10 + '@@AC-SAVESYNC-POWERSHELL-' + 'BODY@@'
-        $i = $text.IndexOf($marke)
-        if ($i -lt 0) { return "Markerzeile fehlt - keine gueltige Starter-Datei" }
-        $rumpf = $text.Substring($i + $marke.Length)
-    }
-    $t = $null; $f = $null
-    [void][System.Management.Automation.Language.Parser]::ParseInput($rumpf, [ref]$t, [ref]$f)
-    if ($f -and $f.Count -gt 0) { return "Der Inhalt hat $($f.Count) Syntaxfehler" }
-    return ""   # leer = in Ordnung
-}
-
-# Laedt die neue Fassung, prueft sie, ersetzt die eigene Datei und startet neu.
-function Install-Update {
-    param($Info)
-
-    $selbst = $script:SelfPath
-    if ([string]::IsNullOrWhiteSpace($selbst) -or -not (Test-Path -LiteralPath $selbst)) {
-        Write-Log "Update nicht moeglich: der eigene Pfad ist unbekannt."
-        return $false
-    }
-    $endung = [IO.Path]::GetExtension($selbst).ToLowerInvariant()
-    $gesucht = if ($endung -eq '.cmd') { 'AC-SaveSync.cmd' } else { 'AC-SaveSync.ps1' }
-    $datei = $Info.Dateien | Where-Object { $_.name -eq $gesucht } | Select-Object -First 1
-    if (-not $datei) {
-        Write-Log "Im Release ist keine Datei '$gesucht' enthalten."
-        return $false
-    }
-
-    $ordner = Join-Path $script:AppDir 'update'
-    if (-not (Test-Path $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
-    $neu = Join-Path $ordner $gesucht
-
-    Write-Log ("Lade Version {0} herunter..." -f $Info.Version)
-    [Windows.Forms.Application]::DoEvents()
-    try {
-        [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $datei.browser_download_url -OutFile $neu -TimeoutSec 120 `
-            -UseBasicParsing -Headers @{ 'User-Agent' = 'AC-SaveSync' }
-    }
-    catch {
-        Write-Log "Herunterladen fehlgeschlagen: $($_.Exception.Message)"
-        return $false
-    }
-
-    $fehler = Test-UpdateDatei $neu $endung
-    if ($fehler) {
-        Write-Log "Die heruntergeladene Datei wurde NICHT uebernommen: $fehler"
-        Write-Log "Die vorhandene Fassung bleibt unveraendert."
-        return $false
-    }
-
-    # Sicherheitskopie daneben legen - falls doch etwas schiefgeht, ist der
-    # alte Stand einen Handgriff entfernt.
-    try { Copy-Item -LiteralPath $selbst -Destination (Join-Path $ordner ("vorher" + $endung)) -Force } catch { }
-
-    try {
-        Copy-Item -LiteralPath $neu -Destination $selbst -Force
-    }
-    catch {
-        Write-Log "Ersetzen fehlgeschlagen: $($_.Exception.Message)"
-        Write-Log "Laeuft das Programm aus einem geschuetzten Ordner? Dann bitte woanders hin legen."
-        return $false
-    }
-    Write-Log ("Aktualisiert auf Version {0}." -f $Info.Version)
-    return $true
-}
-
-# Der ganze Ablauf mit Rueckfragen. -Still: keine Meldung, wenn schon aktuell
-# (fuer die Pruefung beim Start).
-function Invoke-UpdatePruefung {
-    param([switch]$Still)
-
-    $info = Get-NeuesteVersion
-    if (-not $info) {
-        if (-not $Still) {
-            [void][Windows.Forms.MessageBox]::Show(
-                "Die Update-Pruefung hat nicht geklappt.`n`nMeist fehlt gerade die Internetverbindung. Einzelheiten stehen im Protokoll.",
-                "Nach Updates suchen", 'OK', 'Information')
-        }
-        return
-    }
-
-    if (-not (Test-VersionNeuer $info.Version $script:Version)) {
-        Write-Log ("Version {0} ist aktuell." -f $script:Version)
-        if (-not $Still) {
-            [void][Windows.Forms.MessageBox]::Show(
-                ("Du hast bereits die neueste Fassung (Version {0})." -f $script:Version),
-                "Nach Updates suchen", 'OK', 'Information')
-        }
-        return
-    }
-
-    Write-Log ("Neue Version verfuegbar: {0} (du hast {1})." -f $info.Version, $script:Version)
-    # Aus dem Release-Text nur den Abschnitt "Was ist neu" zeigen - alles
-    # andere ist die Installationsanleitung und hier fehl am Platz.
-    $was = ""
-    if ($info.Text) {
-        $zeilen = @()
-        $drin = $false
-        foreach ($z in ($info.Text -split "`r?`n")) {
-            if ($z -match '^##\s') { $drin = ($z -match 'Was ist neu'); continue }
-            if ($drin -and $z.Trim()) { $zeilen += $z.Trim() }
-        }
-        if ($zeilen.Count -gt 0) {
-            $was = "`n`nNeu darin:`n" + (($zeilen | Select-Object -First 5 | ForEach-Object { "- $_" }) -join "`n")
-        }
-    }
-
-    $r = [Windows.Forms.MessageBox]::Show(
-        ("Version {0} ist verfuegbar - du hast {1}.{2}`n`nJetzt aktualisieren? Das Programm startet dabei neu." -f
-        $info.Version, $script:Version, $was),
-        "Update verfuegbar", 'YesNo', 'Question')
-    if ($r -ne 'Yes') { return }
-
-    if ($script:holdingLock) {
-        [void][Windows.Forms.MessageBox]::Show(
-            "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach aktualisieren.",
-            "Noch nicht jetzt", 'OK', 'Warning')
-        return
-    }
-
-    if (Install-Update $info) {
-        [void][Windows.Forms.MessageBox]::Show(
-            ("Fertig - Version {0} ist installiert.`n`nDas Programm startet jetzt neu." -f $info.Version),
-            "Update abgeschlossen", 'OK', 'Information')
-        try {
-            $selbst = $script:SelfPath
-            if ([IO.Path]::GetExtension($selbst).ToLowerInvariant() -eq '.ps1') {
-                Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-                    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta', '-File', "`"$selbst`""
-            }
-            else {
-                Start-Process -FilePath $selbst
-            }
-        }
-        catch { Write-Log "Neustart fehlgeschlagen - bitte von Hand starten." }
-        $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
-        $script:mainForm.Close()
-    }
-    else {
-        [void][Windows.Forms.MessageBox]::Show(
-            ("Das Update hat nicht geklappt. Die vorhandene Fassung laeuft unveraendert weiter.`n`n" +
-            "Einzelheiten stehen im Protokoll. Du kannst die Datei auch von Hand holen:`n{0}" -f $script:ReleaseSeite),
-            "Update fehlgeschlagen", 'OK', 'Warning')
-    }
-}
-
-# --------------------------------------------------------------------------
 # Selbsttest: "Ist alles startklar?"
 # --------------------------------------------------------------------------
-# Ruft git auch ausserhalb des Repos auf (fuer --version und --global config)
-# und faengt ab, dass git ueberhaupt fehlt.
-function Invoke-GitRaw {
-    param([string[]]$GitArgs, [string]$WorkDir)
-    try {
-        if ($WorkDir) { $out = & git -C $WorkDir @GitArgs 2>&1 }
-        else { $out = & git @GitArgs 2>&1 }
-        return [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
-    }
-    catch {
-        # git nicht gefunden -> 9009 ist Windows' "Befehl nicht gefunden"
-        return [pscustomobject]@{ Code = 9009; Text = $_.Exception.Message }
-    }
-}
-
 # Prueft der Reihe nach alles, was zum Spielen noetig ist.
 # Rueckgabe: Liste aus Name / Ok / Hinweis / Roh (Originalmeldung von Git).
 function Test-Setup {
@@ -2034,7 +2271,7 @@ function Test-Setup {
 
     # 6) Repo-Ordner
     $istRepo = (-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
-               (Test-Path (Join-Path $script:cfg.RepoPath '.git'))
+    (Test-Path (Join-Path $script:cfg.RepoPath '.git'))
     if (-not $istRepo) {
         $e += Neu "Gemeinsamer Ordner" $false ("Unter '" + $script:cfg.RepoPath + "' liegt kein Git-Repo. " +
             "Unten auf 'Repo einrichten...' klicken - oder den Ordner korrigieren.") ""
@@ -2187,216 +2424,339 @@ function Show-SelfTest {
 }
 
 # --------------------------------------------------------------------------
-# Screenshots/Fotos ins Repo verschieben (mit kollisionssicheren Namen)
+# Selten gebrauchte Einstellungen
 # --------------------------------------------------------------------------
-# Liefert die Aufnahmezeit eines Bildes fuer die Sortierung der Galerie.
-# Move-Pics baut sie in den Dateinamen ein (Spieler_JJJJMMTT-HHMMSS_Name).
-# Bilder, die jemand von Hand in den pics-Ordner gelegt hat, haben dieses
-# Muster nicht - fuer die zaehlt die Aenderungszeit der Datei.
-function Get-BildZeit {
-    param($Datei)
-    if ($Datei.Name -match '_(\d{8})-(\d{6})_') {
-        $t = [datetime]::MinValue
-        $ok = [datetime]::TryParseExact(
-            ($Matches[1] + $Matches[2]), 'yyyyMMddHHmmss',
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::None, [ref]$t)
-        if ($ok) { return $t }
+# Die eigentlichen Felder liegen unsichtbar im Hauptfenster (siehe dort).
+# Dieser Dialog zeigt Kopien davon und schreibt beim Uebernehmen zurueck -
+# so bleibt Save-ConfigFromUI unveraendert.
+function Show-AdvancedDialog {
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = "Erweiterte Einstellungen"
+    # Hoch genug, dass die beiden Knopfreihen untereinander Platz haben:
+    # Werkzeuge (Verknuepfung/Updates), darunter Uebernehmen/Abbrechen.
+    $dlg.Size = New-Object Drawing.Size(600, 350)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    if ($script:appIcon) { $dlg.Icon = $script:appIcon }
+
+    $hinweis = New-Object Windows.Forms.Label
+    $hinweis.Text = "Diese Werte passen fuer die allermeisten so, wie sie sind."
+    $hinweis.Location = New-Object Drawing.Point(15, 12)
+    $hinweis.Size = New-Object Drawing.Size(560, 20)
+    $dlg.Controls.Add($hinweis)
+
+    function Zeile($text, $wert, $y, $breite) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $text; $l.Location = New-Object Drawing.Point(15, $y)
+        $l.Size = New-Object Drawing.Size(140, 22); $l.TextAlign = 'MiddleLeft'
+        $dlg.Controls.Add($l)
+        $t = New-Object Windows.Forms.TextBox
+        $t.Text = "$wert"; $t.Location = New-Object Drawing.Point(160, $y)
+        $t.Size = New-Object Drawing.Size($breite, 22)
+        $dlg.Controls.Add($t)
+        return $t
     }
-    return $Datei.LastWriteTime
+
+    $tPics = Zeile "Bilder-Ordner:" $script:txtPics.Text 46 340
+    $bPics = New-Object Windows.Forms.Button
+    $bPics.Text = "..."; $bPics.Location = New-Object Drawing.Point(508, 45)
+    $bPics.Size = New-Object Drawing.Size(60, 24)
+    $script:advPicsBox = $tPics
+    $bPics.Add_Click({
+            $p = Select-FolderModern $script:advPicsBox.Text "Bilder-Ordner waehlen"
+            if ($p) { $script:advPicsBox.Text = $p }
+        })
+    $dlg.Controls.Add($bPics)
+
+    $tBranch = Zeile "Branch:" $script:txtBranch.Text 82 140
+    $tLease = Zeile "Sperre gilt (Min):" $script:txtLease.Text 118 60
+    $tHeart = Zeile "Herzschlag (Sek):" $script:txtHeart.Text 154 60
+
+    Set-Tip ("Ordner mit deinen Screenshots/Fotos, z. B. ...\Load\WiiSDSync.`n" +
+        "Nach dem Spielen werden die Bilder ins Repo VERSCHOBEN (Unterordner 'pics')`n" +
+        "und sind danach hier lokal nicht mehr vorhanden.`n" +
+        "Leer lassen = Bilder bleiben unangetastet.") $tPics $bPics
+    Set-Tip ("Der Git-Zweig, auf dem synchronisiert wird - normalerweise 'main'.`n" +
+        "Beide Spieler muessen denselben Branch eingetragen haben.") $tBranch
+    Set-Tip ("Wie lange eine Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
+        "Danach gilt sie als abgelaufen und darf uebernommen werden - so bleibt`n" +
+        "sie nach einem Absturz nicht ewig haengen.`n" +
+        "Standard: 5, Minimum 1.") $tLease
+    Set-Tip ("Wie oft waehrend des Spielens gespeichert und hochgeladen wird (in Sekunden).`n" +
+        "Kleiner = bei einem Absturz geht weniger verloren, aber mehr Git-Verkehr.`n" +
+        "Sollte deutlich kleiner sein als 'Sperre gilt', sonst laeuft die Sperre`n" +
+        "zwischendurch ab.`n" +
+        "Standard: 60, Minimum 10.") $tHeart
+
+    $bVerk = New-Object Windows.Forms.Button
+    $bVerk.Text = "Verknuepfung auf dem Desktop anlegen"
+    $bVerk.Location = New-Object Drawing.Point(15, 190)
+    $bVerk.Size = New-Object Drawing.Size(280, 28)
+    $bVerk.Add_Click({ [void](New-DesktopShortcut) })
+    $dlg.Controls.Add($bVerk)
+
+    $bUpd = New-Object Windows.Forms.Button
+    $bUpd.Text = "Nach Updates suchen"
+    $bUpd.Location = New-Object Drawing.Point(305, 190)
+    $bUpd.Size = New-Object Drawing.Size(265, 28)
+    $bUpd.Add_Click({ Invoke-UpdatePruefung })
+    $dlg.Controls.Add($bUpd)
+    Set-Tip ("Holt die neueste Fassung direkt von GitHub und ersetzt`n" +
+        "dieses Programm - Herunterladen von Hand entfaellt.`n" +
+        "Beim Start wird ohnehin automatisch nachgesehen.") $bUpd
+
+    $lVer = New-Object Windows.Forms.Label
+    $lVer.Text = "Version $($script:Version)"
+    $lVer.Location = New-Object Drawing.Point(15, 232)
+    $lVer.Size = New-Object Drawing.Size(200, 20)
+    $lVer.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
+    $dlg.Controls.Add($lVer)
+    Set-Tip ("Legt eine Verknuepfung mit Symbol auf dem Desktop an.`n" +
+        "Die heruntergeladene .cmd-Datei selbst kann kein Symbol tragen -`n" +
+        "das legt Windows fuer alle Dateien dieser Art gemeinsam fest.") $bVerk
+
+    $ok = New-Object Windows.Forms.Button
+    $ok.Text = "Uebernehmen"; $ok.Location = New-Object Drawing.Point(340, 258)
+    $ok.Size = New-Object Drawing.Size(110, 30)
+    $ok.DialogResult = 'OK'
+    $dlg.Controls.Add($ok)
+    $ab = New-Object Windows.Forms.Button
+    $ab.Text = "Abbrechen"; $ab.Location = New-Object Drawing.Point(458, 258)
+    $ab.Size = New-Object Drawing.Size(110, 30)
+    $ab.DialogResult = 'Cancel'
+    $dlg.Controls.Add($ab)
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $ab
+
+    Set-UiScale $dlg
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $script:txtPics.Text = $tPics.Text
+        $script:txtBranch.Text = $tBranch.Text
+        $script:txtLease.Text = $tLease.Text
+        $script:txtHeart.Text = $tHeart.Text
+        Save-ConfigFromUI
+        Write-Log "Erweiterte Einstellungen uebernommen."
+    }
 }
 
-function Move-Pics {
-    $src = $script:cfg.PicsFolder
-    if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
-    if (-not (Test-Path $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
-    $dst = Join-Path $script:cfg.RepoPath 'pics'
-    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+#endregion
 
-    $exts = @('.jpg', '.jpeg', '.png')
-    $files = Get-ChildItem -Path $src -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object { $exts -contains $_.Extension.ToLowerInvariant() }
-    if (-not $files) { Write-Log "Keine neuen Bilder gefunden."; return }
+#region Selbst aktualisieren
 
-    $safe = ($script:cfg.PlayerName -replace '[^\w\-]', '_')
-    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "Unbekannt" }
+# --------------------------------------------------------------------------
+# Selbst aktualisieren
+# --------------------------------------------------------------------------
+# Holt die neueste Fassung direkt von GitHub, prueft sie und ersetzt die
+# eigene Datei. Das geht, weil weder die .cmd noch die .ps1 waehrend des
+# Laufens von Windows festgehalten wird: Der Starter liest die Datei einmal
+# ein und gibt sie sofort wieder frei.
 
-    $moved = 0
-    foreach ($f in $files) {
-        # Eindeutiger Name: Spieler + Aufnahme-Zeit + Originalname (alles bereinigt)
-        $stamp = $f.LastWriteTime.ToString("yyyyMMdd-HHmmss")
-        $stem = ("{0}_{1}_{2}" -f $safe, $stamp, $f.BaseName) -replace '[^\w\-]', '_'
-        $ext = $f.Extension.ToLowerInvariant()
-        $target = Join-Path $dst ($stem + $ext)
-        $i = 1
-        while (Test-Path $target) {
-            $target = Join-Path $dst ("{0}_{1}{2}" -f $stem, $i, $ext)
-            $i++
+# Fragt GitHub nach dem neuesten Release. Rueckgabe: Objekt mit Version,
+# Beschreibung und Dateiliste - oder $null, wenn es nicht klappt (kein
+# Internet, GitHub gerade nicht erreichbar, Zaehlgrenze erreicht).
+function Get-NeuesteVersion {
+    try {
+        # Aeltere Windows-Fassungen sprechen von sich aus noch kein TLS 1.2,
+        # GitHub verlangt es aber - sonst bricht der Aufruf unverstaendlich ab.
+        [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+        $r = Invoke-RestMethod -Uri $script:ReleaseApi -TimeoutSec 15 `
+            -Headers @{ 'User-Agent' = 'AC-SaveSync'; 'Accept' = 'application/vnd.github+json' }
+        # <FIXED> Antwort ueber Get-JsonWert auswerten: Bei einer Fehlermeldung
+        # von GitHub (Zaehlgrenze erreicht, Repo ohne Release) fehlen diese
+        # Felder - unter StrictMode waere das ein Fehler statt eines sauberen
+        # "keine Auskunft moeglich".
+        $tag = Get-JsonWert $r 'tag_name'
+        if (-not $tag) { return $null }
+        return [pscustomobject]@{
+            Version = ("$tag" -replace '^v', '')
+            Tag     = "$tag"
+            Text    = "$(Get-JsonWert $r 'body')"
+            Dateien = @(Get-JsonWert $r 'assets')
         }
-        try { Move-Item -LiteralPath $f.FullName -Destination $target -Force; $moved++ }
-        catch { Write-Log "Bild konnte nicht verschoben werden: $($f.Name)" }
     }
-    Write-Log ("{0} Bild(er) ins Repo verschoben und lokal entfernt." -f $moved)
+    catch {
+        Write-Log "Update-Pruefung nicht moeglich: $($_.Exception.Message)"
+        return $null
+    }
 }
 
-# --------------------------------------------------------------------------
-# Spielstaende zwischen Dolphin-Ordner und Repo kopieren
-# --------------------------------------------------------------------------
-function Get-RepoSaveDir { Join-Path $script:cfg.RepoPath 'save' }
-
-# true = ok/uebersprungen, false = echter Fehler
-function Restore-Saves {
-    $src = Get-RepoSaveDir
-    $dst = $script:cfg.SaveFolder
-    if ([string]::IsNullOrWhiteSpace($dst)) { return $true }   # Feld leer -> Funktion aus
-    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-        Write-Log "Noch kein Spielstand im Repo - vorhandener Dolphin-Save bleibt unangetastet."
-        return $true
+# Vergleicht zwei Versionsangaben. Bewusst ueber [version] statt als Text:
+# als Text waere "1.9" groesser als "1.11".
+function Test-VersionNeuer {
+    param([string]$Kandidat, [string]$Aktuell)
+    try {
+        return ([version]($Kandidat -replace '^v', '')) -gt ([version]($Aktuell -replace '^v', ''))
     }
-    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
-    Write-Log "Schreibe Spielstand aus dem Repo in den Dolphin-Ordner..."
-    # /E = inkl. Unterordner, ueberschreibt; bewusst OHNE Loeschen, damit im
-    # Dolphin-Ordner nichts Fremdes geloescht wird.
-    $null = robocopy $src $dst /E /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
-    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Zurueckschreiben (robocopy-Code $LASTEXITCODE)."; return $false }
+    catch { return $false }
+}
+
+# Prueft eine heruntergeladene Datei, BEVOR sie die laufende ersetzt.
+# Dieselben Pruefungen wie im Release-Workflow - eine halb geladene oder
+# beschaedigte Datei wuerde das Programm sonst unstartbar machen.
+function Test-UpdateDatei {
+    param([string]$Pfad, [string]$Endung)
+    if (-not (Test-Path -LiteralPath $Pfad)) { return "Datei fehlt" }
+    $bytes = [IO.File]::ReadAllBytes($Pfad)
+    if ($bytes.Length -lt 50000) { return "Datei ist verdaechtig klein ($($bytes.Length) Bytes)" }
+    if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return "Datei beginnt mit einem BOM" }
+
+    $text = [IO.File]::ReadAllText($Pfad, [Text.UTF8Encoding]::new($false))
+    $rumpf = $text
+    if ($Endung -eq '.cmd') {
+        $marke = [char]10 + '@@AC-SAVESYNC-POWERSHELL-' + 'BODY@@'
+        $i = $text.IndexOf($marke)
+        if ($i -lt 0) { return "Markerzeile fehlt - keine gueltige Starter-Datei" }
+        $rumpf = $text.Substring($i + $marke.Length)
+    }
+    $t = $null; $f = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($rumpf, [ref]$t, [ref]$f)
+    if ($f -and $f.Count -gt 0) { return "Der Inhalt hat $($f.Count) Syntaxfehler" }
+    return ""   # leer = in Ordnung
+}
+
+# Laedt die neue Fassung, prueft sie, ersetzt die eigene Datei und startet neu.
+function Install-Update {
+    param($Info)
+
+    $selbst = $script:SelfPath
+    if ([string]::IsNullOrWhiteSpace($selbst) -or -not (Test-Path -LiteralPath $selbst)) {
+        Write-Log "Update nicht moeglich: der eigene Pfad ist unbekannt."
+        return $false
+    }
+    $endung = [IO.Path]::GetExtension($selbst).ToLowerInvariant()
+    $gesucht = if ($endung -eq '.cmd') { 'AC-SaveSync.cmd' } else { 'AC-SaveSync.ps1' }
+    # <FIXED> Namen der Release-Dateien ueber Get-JsonWert vergleichen.
+    $datei = $Info.Dateien | Where-Object { (Get-JsonWert $_ 'name') -eq $gesucht } | Select-Object -First 1
+    if (-not $datei) {
+        Write-Log "Im Release ist keine Datei '$gesucht' enthalten."
+        return $false
+    }
+
+    $ordner = Join-Path $script:AppDir 'update'
+    if (-not (Test-Path $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
+    $neu = Join-Path $ordner $gesucht
+
+    Write-Log ("Lade Version {0} herunter..." -f $Info.Version)
+    [Windows.Forms.Application]::DoEvents()
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri (Get-JsonWert $datei 'browser_download_url') -OutFile $neu -TimeoutSec 120 `
+            -UseBasicParsing -Headers @{ 'User-Agent' = 'AC-SaveSync' }
+    }
+    catch {
+        Write-Log "Herunterladen fehlgeschlagen: $($_.Exception.Message)"
+        return $false
+    }
+
+    $fehler = Test-UpdateDatei $neu $endung
+    if ($fehler) {
+        Write-Log "Die heruntergeladene Datei wurde NICHT uebernommen: $fehler"
+        Write-Log "Die vorhandene Fassung bleibt unveraendert."
+        return $false
+    }
+
+    # Sicherheitskopie daneben legen - falls doch etwas schiefgeht, ist der
+    # alte Stand einen Handgriff entfernt.
+    try { Copy-Item -LiteralPath $selbst -Destination (Join-Path $ordner ("vorher" + $endung)) -Force } catch { }
+
+    try {
+        Copy-Item -LiteralPath $neu -Destination $selbst -Force
+    }
+    catch {
+        Write-Log "Ersetzen fehlgeschlagen: $($_.Exception.Message)"
+        Write-Log "Laeuft das Programm aus einem geschuetzten Ordner? Dann bitte woanders hin legen."
+        return $false
+    }
+    Write-Log ("Aktualisiert auf Version {0}." -f $Info.Version)
     return $true
 }
 
-function Backup-Saves {
-    $src = $script:cfg.SaveFolder
-    $dst = Get-RepoSaveDir
-    if ([string]::IsNullOrWhiteSpace($src)) { return $true }   # Feld leer -> Funktion aus
-    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-        Write-Log "Dolphin-Save-Ordner ist leer/fehlt - nichts zu sichern."
-        return $true
+# Der ganze Ablauf mit Rueckfragen. -Still: keine Meldung, wenn schon aktuell
+# (fuer die Pruefung beim Start).
+function Invoke-UpdatePruefung {
+    param([switch]$Still)
+
+    $info = Get-NeuesteVersion
+    if (-not $info) {
+        if (-not $Still) {
+            [void][Windows.Forms.MessageBox]::Show(
+                "Die Update-Pruefung hat nicht geklappt.`n`nMeist fehlt gerade die Internetverbindung. Einzelheiten stehen im Protokoll.",
+                "Nach Updates suchen", 'OK', 'Information')
+        }
+        return
     }
-    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
-    # /MIR = spiegelt exakt ins repo-eigene 'save/' (dort ist Spiegeln sicher).
-    $null = robocopy $src $dst /MIR /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
-    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Sichern (robocopy-Code $LASTEXITCODE)."; return $false }
-    return $true
-}
 
-# --------------------------------------------------------------------------
-# Spielzeit-Erfassung + README-Statistik
-# --------------------------------------------------------------------------
-function Get-PlaytimePath { Join-Path $script:cfg.RepoPath 'playtime.json' }
+    if (-not (Test-VersionNeuer $info.Version $script:Version)) {
+        Write-Log ("Version {0} ist aktuell." -f $script:Version)
+        if (-not $Still) {
+            [void][Windows.Forms.MessageBox]::Show(
+                ("Du hast bereits die neueste Fassung (Version {0})." -f $script:Version),
+                "Nach Updates suchen", 'OK', 'Information')
+        }
+        return
+    }
 
-function Get-Playtime {
-    $p = Get-PlaytimePath
-    $h = @{}
-    if (Test-Path $p) {
+    Write-Log ("Neue Version verfuegbar: {0} (du hast {1})." -f $info.Version, $script:Version)
+    # Aus dem Release-Text nur den Abschnitt "Was ist neu" zeigen - alles
+    # andere ist die Installationsanleitung und hier fehl am Platz.
+    $was = ""
+    if ($info.Text) {
+        $zeilen = @()
+        $drin = $false
+        foreach ($z in ($info.Text -split "`r?`n")) {
+            if ($z -match '^##\s') { $drin = ($z -match 'Was ist neu'); continue }
+            if ($drin -and $z.Trim()) { $zeilen += $z.Trim() }
+        }
+        if ($zeilen.Count -gt 0) {
+            $was = "`n`nNeu darin:`n" + (($zeilen | Select-Object -First 5 | ForEach-Object { "- $_" }) -join "`n")
+        }
+    }
+
+    $r = [Windows.Forms.MessageBox]::Show(
+        ("Version {0} ist verfuegbar - du hast {1}.{2}`n`nJetzt aktualisieren? Das Programm startet dabei neu." -f
+        $info.Version, $script:Version, $was),
+        "Update verfuegbar", 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    if ($script:holdingLock) {
+        [void][Windows.Forms.MessageBox]::Show(
+            "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach aktualisieren.",
+            "Noch nicht jetzt", 'OK', 'Warning')
+        return
+    }
+
+    if (Install-Update $info) {
+        [void][Windows.Forms.MessageBox]::Show(
+            ("Fertig - Version {0} ist installiert.`n`nDas Programm startet jetzt neu." -f $info.Version),
+            "Update abgeschlossen", 'OK', 'Information')
         try {
-            $j = Get-Content $p -Raw | ConvertFrom-Json
-            foreach ($prop in $j.PSObject.Properties) {
-                $v = $prop.Value
-                $h[$prop.Name] = @{
-                    TotalSeconds  = [double]$v.TotalSeconds
-                    Sessions      = [int]$v.Sessions
-                    LastPlayedUtc = [string]$v.LastPlayedUtc
-                }
+            $selbst = $script:SelfPath
+            if ([IO.Path]::GetExtension($selbst).ToLowerInvariant() -eq '.ps1') {
+                Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+                    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta', '-File', "`"$selbst`""
+            }
+            else {
+                Start-Process -FilePath $selbst
             }
         }
-        catch {
-            Write-Log "WARNUNG: playtime.json ist beschaedigt - die Spielzeit-Statistik kann unvollstaendig sein."
-            Write-Log ("  Grund: {0}" -f $_.Exception.Message)
-        }
-    }
-    return $h
-}
-
-function Save-Playtime {
-    param($h)
-    ($h | ConvertTo-Json -Depth 5) | Set-Content -Path (Get-PlaytimePath) -Encoding UTF8
-}
-
-function Format-Duration {
-    param([double]$sec)
-    if ($sec -lt 0) { $sec = 0 }
-    $ts = [TimeSpan]::FromSeconds([math]::Round($sec))
-    if ($ts.TotalHours -ge 1) { return ("{0}h {1}m" -f [int][math]::Floor($ts.TotalHours), $ts.Minutes) }
-    elseif ($ts.TotalMinutes -ge 1) { return ("{0}m {1}s" -f $ts.Minutes, $ts.Seconds) }
-    else { return ("{0}s" -f $ts.Seconds) }
-}
-
-function Write-Readme {
-    param($h)
-    if ($null -eq $h) { $h = @{} }
-    $lines = @()
-    $lines += "# Gemeinsamer Animal-Crossing-Spielstand"
-    $lines += ""
-    $lines += "Verwaltet mit ``AC-SaveSync.ps1``."
-    $lines += ""
-    $lines += "## Spielzeiten"
-    $lines += ""
-    $lines += "| Spieler | Gesamt | Sitzungen | Zuletzt gespielt |"
-    $lines += "|---|---|---|---|"
-    $total = 0.0
-    if ($h.Keys.Count -eq 0) {
-        $lines += "| _noch keine Daten_ | - | - | - |"
+        catch { Write-Log "Neustart fehlgeschlagen - bitte von Hand starten." }
+        $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
+        $script:mainForm.Close()
     }
     else {
-        foreach ($name in ($h.Keys | Sort-Object)) {
-            $e = $h[$name]
-            $total += [double]$e.TotalSeconds
-            $last = "-"
-            if ($e.LastPlayedUtc) {
-                try { $last = [datetimeoffset]::Parse($e.LastPlayedUtc).LocalDateTime.ToString("yyyy-MM-dd HH:mm") }
-                catch { $last = "-" }   # unlesbarer Zeitstempel -> Strich in der Tabelle
-            }
-            $lines += ("| {0} | {1} | {2} | {3} |" -f $name, (Format-Duration $e.TotalSeconds), $e.Sessions, $last)
-        }
+        [void][Windows.Forms.MessageBox]::Show(
+            ("Das Update hat nicht geklappt. Die vorhandene Fassung laeuft unveraendert weiter.`n`n" +
+            "Einzelheiten stehen im Protokoll. Du kannst die Datei auch von Hand holen:`n{0}" -f $script:ReleaseSeite),
+            "Update fehlgeschlagen", 'OK', 'Warning')
     }
-    $lines += ""
-    $lines += ("**Gesamt zusammen:** {0}" -f (Format-Duration $total))
-
-    # Fotos-Galerie (falls Bilder im Repo liegen), neueste zuerst.
-    # Sortiert wird nach der Aufnahmezeit, NICHT nach dem Dateinamen: der
-    # faengt mit dem Spielernamen an, dadurch stand frueher alles von "Zoe"
-    # vor allem von "Anna" - auch wenn Zoes Bild zwei Wochen aelter war.
-    $picsDir = Join-Path $script:cfg.RepoPath 'pics'
-    if (Test-Path $picsDir) {
-        $imgExts = @('.jpg', '.jpeg', '.png')
-        $imgs = Get-ChildItem -Path $picsDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $imgExts -contains $_.Extension.ToLowerInvariant() } |
-        Sort-Object @{ Expression = { Get-BildZeit $_ } }, @{ Expression = { $_.Name } } -Descending
-        if ($imgs -and $imgs.Count -gt 0) {
-            $lines += ""
-            $lines += ("## Fotos ({0})" -f $imgs.Count)
-            $lines += ""
-            foreach ($img in $imgs) {
-                $lines += ("![{0}](pics/{1})" -f $img.BaseName, $img.Name)
-            }
-        }
-    }
-
-    $lines += ""
-    $lines += ("_Zuletzt aktualisiert: {0}_" -f (Get-Date).ToString("yyyy-MM-dd HH:mm"))
-    ($lines -join "`r`n") | Set-Content -Path (Join-Path $script:cfg.RepoPath 'README.md') -Encoding UTF8
 }
 
-# Rechnet die seit dem letzten Zeitpunkt vergangenen Sekunden dem aktuellen
-# Spieler an und aktualisiert playtime.json + README. Mit -EndSession wird
-# zusaetzlich der Sitzungszaehler erhoeht.
-function Add-Playtime {
-    param([switch]$EndSession)
-    $now = Get-Date
-    $deltaSec = ($now - $script:lastAccounted).TotalSeconds
-    if ($deltaSec -lt 0) { $deltaSec = 0 }
-    $script:lastAccounted = $now
+#endregion
 
-    $name = $script:cfg.PlayerName
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unbekannt" }
-    $h = Get-Playtime
-    if (-not $h.ContainsKey($name)) {
-        $h[$name] = @{ TotalSeconds = 0.0; Sessions = 0; LastPlayedUtc = "" }
-    }
-    $h[$name].TotalSeconds = [double]$h[$name].TotalSeconds + $deltaSec
-    $h[$name].LastPlayedUtc = [datetime]::UtcNow.ToString("o")
-    if ($EndSession) { $h[$name].Sessions = [int]$h[$name].Sessions + 1 }
-    Save-Playtime $h
-    Write-Readme $h
-}
+#region Repo-Einrichtung und Assistenten
 
 # --------------------------------------------------------------------------
 # Repo-Einrichtung (gemeinsames Git-Repo erstellen / verbinden / klonen)
@@ -2770,122 +3130,6 @@ function Invoke-WizClone {
 }
 
 # --------------------------------------------------------------------------
-# Selten gebrauchte Einstellungen
-# --------------------------------------------------------------------------
-# Die eigentlichen Felder liegen unsichtbar im Hauptfenster (siehe dort).
-# Dieser Dialog zeigt Kopien davon und schreibt beim Uebernehmen zurueck -
-# so bleibt Save-ConfigFromUI unveraendert.
-function Show-AdvancedDialog {
-    $dlg = New-Object Windows.Forms.Form
-    $dlg.Text = "Erweiterte Einstellungen"
-    # Hoch genug, dass die beiden Knopfreihen untereinander Platz haben:
-    # Werkzeuge (Verknuepfung/Updates), darunter Uebernehmen/Abbrechen.
-    $dlg.Size = New-Object Drawing.Size(600, 350)
-    $dlg.StartPosition = "CenterParent"
-    $dlg.FormBorderStyle = 'FixedDialog'
-    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
-    if ($script:appIcon) { $dlg.Icon = $script:appIcon }
-
-    $hinweis = New-Object Windows.Forms.Label
-    $hinweis.Text = "Diese Werte passen fuer die allermeisten so, wie sie sind."
-    $hinweis.Location = New-Object Drawing.Point(15, 12)
-    $hinweis.Size = New-Object Drawing.Size(560, 20)
-    $dlg.Controls.Add($hinweis)
-
-    function Zeile($text, $wert, $y, $breite) {
-        $l = New-Object Windows.Forms.Label
-        $l.Text = $text; $l.Location = New-Object Drawing.Point(15, $y)
-        $l.Size = New-Object Drawing.Size(140, 22); $l.TextAlign = 'MiddleLeft'
-        $dlg.Controls.Add($l)
-        $t = New-Object Windows.Forms.TextBox
-        $t.Text = "$wert"; $t.Location = New-Object Drawing.Point(160, $y)
-        $t.Size = New-Object Drawing.Size($breite, 22)
-        $dlg.Controls.Add($t)
-        return $t
-    }
-
-    $tPics = Zeile "Bilder-Ordner:" $script:txtPics.Text 46 340
-    $bPics = New-Object Windows.Forms.Button
-    $bPics.Text = "..."; $bPics.Location = New-Object Drawing.Point(508, 45)
-    $bPics.Size = New-Object Drawing.Size(60, 24)
-    $script:advPicsBox = $tPics
-    $bPics.Add_Click({
-            $p = Select-FolderModern $script:advPicsBox.Text "Bilder-Ordner waehlen"
-            if ($p) { $script:advPicsBox.Text = $p }
-        })
-    $dlg.Controls.Add($bPics)
-
-    $tBranch = Zeile "Branch:" $script:txtBranch.Text 82 140
-    $tLease = Zeile "Sperre gilt (Min):" $script:txtLease.Text 118 60
-    $tHeart = Zeile "Herzschlag (Sek):" $script:txtHeart.Text 154 60
-
-    Set-Tip ("Ordner mit deinen Screenshots/Fotos, z. B. ...\Load\WiiSDSync.`n" +
-        "Nach dem Spielen werden die Bilder ins Repo VERSCHOBEN (Unterordner 'pics')`n" +
-        "und sind danach hier lokal nicht mehr vorhanden.`n" +
-        "Leer lassen = Bilder bleiben unangetastet.") $tPics $bPics
-    Set-Tip ("Der Git-Zweig, auf dem synchronisiert wird - normalerweise 'main'.`n" +
-        "Beide Spieler muessen denselben Branch eingetragen haben.") $tBranch
-    Set-Tip ("Wie lange eine Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
-        "Danach gilt sie als abgelaufen und darf uebernommen werden - so bleibt`n" +
-        "sie nach einem Absturz nicht ewig haengen.`n" +
-        "Standard: 5, Minimum 1.") $tLease
-    Set-Tip ("Wie oft waehrend des Spielens gespeichert und hochgeladen wird (in Sekunden).`n" +
-        "Kleiner = bei einem Absturz geht weniger verloren, aber mehr Git-Verkehr.`n" +
-        "Sollte deutlich kleiner sein als 'Sperre gilt', sonst laeuft die Sperre`n" +
-        "zwischendurch ab.`n" +
-        "Standard: 60, Minimum 10.") $tHeart
-
-    $bVerk = New-Object Windows.Forms.Button
-    $bVerk.Text = "Verknuepfung auf dem Desktop anlegen"
-    $bVerk.Location = New-Object Drawing.Point(15, 190)
-    $bVerk.Size = New-Object Drawing.Size(280, 28)
-    $bVerk.Add_Click({ [void](New-DesktopShortcut) })
-    $dlg.Controls.Add($bVerk)
-
-    $bUpd = New-Object Windows.Forms.Button
-    $bUpd.Text = "Nach Updates suchen"
-    $bUpd.Location = New-Object Drawing.Point(305, 190)
-    $bUpd.Size = New-Object Drawing.Size(265, 28)
-    $bUpd.Add_Click({ Invoke-UpdatePruefung })
-    $dlg.Controls.Add($bUpd)
-    Set-Tip ("Holt die neueste Fassung direkt von GitHub und ersetzt`n" +
-        "dieses Programm - Herunterladen von Hand entfaellt.`n" +
-        "Beim Start wird ohnehin automatisch nachgesehen.") $bUpd
-
-    $lVer = New-Object Windows.Forms.Label
-    $lVer.Text = "Version $($script:Version)"
-    $lVer.Location = New-Object Drawing.Point(15, 232)
-    $lVer.Size = New-Object Drawing.Size(200, 20)
-    $lVer.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
-    $dlg.Controls.Add($lVer)
-    Set-Tip ("Legt eine Verknuepfung mit Symbol auf dem Desktop an.`n" +
-        "Die heruntergeladene .cmd-Datei selbst kann kein Symbol tragen -`n" +
-        "das legt Windows fuer alle Dateien dieser Art gemeinsam fest.") $bVerk
-
-    $ok = New-Object Windows.Forms.Button
-    $ok.Text = "Uebernehmen"; $ok.Location = New-Object Drawing.Point(340, 258)
-    $ok.Size = New-Object Drawing.Size(110, 30)
-    $ok.DialogResult = 'OK'
-    $dlg.Controls.Add($ok)
-    $ab = New-Object Windows.Forms.Button
-    $ab.Text = "Abbrechen"; $ab.Location = New-Object Drawing.Point(458, 258)
-    $ab.Size = New-Object Drawing.Size(110, 30)
-    $ab.DialogResult = 'Cancel'
-    $dlg.Controls.Add($ab)
-    $dlg.AcceptButton = $ok; $dlg.CancelButton = $ab
-
-    Set-UiScale $dlg
-    if ($dlg.ShowDialog() -eq 'OK') {
-        $script:txtPics.Text = $tPics.Text
-        $script:txtBranch.Text = $tBranch.Text
-        $script:txtLease.Text = $tLease.Text
-        $script:txtHeart.Text = $tHeart.Text
-        Save-ConfigFromUI
-        Write-Log "Erweiterte Einstellungen uebernommen."
-    }
-}
-
-# --------------------------------------------------------------------------
 # Repo einrichten - erst die Rolle, dann nur der passende Weg
 # --------------------------------------------------------------------------
 # Frueher standen alle vier Knoepfe gleichzeitig da und man musste selbst
@@ -3207,6 +3451,10 @@ function Show-SetupDialog {
     [void]$dlg.ShowDialog()
 }
 
+#endregion
+
+#region Main logic (UI-Aufbau, Timer, Buttons)
+
 # ==========================================================================
 # Grafische Oberflaeche
 # ==========================================================================
@@ -3226,28 +3474,6 @@ $form.MinimumSize = New-Object Drawing.Size(660, 742)
 $script:mainForm = $form
 $ico = Get-AppIcon
 if ($ico) { $form.Icon = $ico }
-
-function New-Label {
-    param($text, $x, $y, $w = 120)
-    $l = New-Object Windows.Forms.Label
-    $l.Text = $text; $l.Location = New-Object Drawing.Point($x, $y)
-    $l.Size = New-Object Drawing.Size($w, 22); $l.TextAlign = 'MiddleLeft'
-    $form.Controls.Add($l); return $l
-}
-function New-Text {
-    param($val, $x, $y, $w)
-    $t = New-Object Windows.Forms.TextBox
-    $t.Text = "$val"; $t.Location = New-Object Drawing.Point($x, $y)
-    $t.Size = New-Object Drawing.Size($w, 22)
-    $form.Controls.Add($t); return $t
-}
-function New-Button {
-    param($text, $x, $y, $w, $h = 28)
-    $b = New-Object Windows.Forms.Button
-    $b.Text = $text; $b.Location = New-Object Drawing.Point($x, $y)
-    $b.Size = New-Object Drawing.Size($w, $h)
-    $form.Controls.Add($b); return $b
-}
 
 # --- Deko-Banner oben ---
 $banner = New-Object Windows.Forms.PictureBox
@@ -3509,23 +3735,6 @@ $script:startTimer.Add_Tick({
     })
 
 # Ereignisse verdrahten
-# Moderner, Explorer-artiger Ordner-Dialog (statt der alten Baum-Ansicht).
-# Trick: OpenFileDialog als Ordnerauswahl nutzen -> in den gewuenschten Ordner
-# wechseln und unten auf "Oeffnen" klicken; wir nehmen dann dessen Verzeichnis.
-function Select-FolderModern {
-    param([string]$InitialPath = "", [string]$Title = "Ordner auswaehlen")
-    $d = New-Object Windows.Forms.OpenFileDialog
-    $d.Title = $Title
-    $d.ValidateNames = $false
-    $d.CheckFileExists = $false
-    $d.CheckPathExists = $true
-    $d.Multiselect = $false
-    $d.FileName = "Diesen Ordner waehlen"
-    if ($InitialPath -and (Test-Path $InitialPath)) { $d.InitialDirectory = $InitialPath }
-    if ($d.ShowDialog() -eq 'OK') { return [IO.Path]::GetDirectoryName($d.FileName) }
-    return $null
-}
-
 $btnBrowseDolphin.Add_Click({
         $d = New-Object Windows.Forms.OpenFileDialog
         $d.Filter = "Dolphin (Dolphin.exe)|Dolphin.exe|Alle Dateien|*.*"
@@ -3583,3 +3792,5 @@ $form.Add_Shown({ $script:startTimer.Start() })
 Write-Log "Bereit."
 Set-UiScale $form
 [void]$form.ShowDialog()
+
+#endregion
