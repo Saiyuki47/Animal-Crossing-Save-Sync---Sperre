@@ -367,8 +367,8 @@ verloren. Der Sitzungszähler erhöht sich nur beim sauberen Beenden.
 
 Mehr zeigt der Knopf **„Spielzeit"** im Programm, auf drei Reitern:
 
-- **Gesamt** – je Spieler Gesamtzeit, Sitzungen, Durchschnitt, längste Sitzung, Spieltage am
-  Stück und wann zuletzt gespielt.
+- **Gesamt** – je Spieler Gesamtzeit, Sitzungen, längste Sitzung, Schnitt pro Sitzung und wann
+  zuletzt gespielt.
 - **Wochen** – die letzten acht Wochen (Kalenderwochen, Montag bis Sonntag) mit der Zeit je
   Spieler und einem Balken für die ganze Woche. Alle Balken haben denselben Maßstab und sind so
   direkt vergleichbar. Darunter steht der Schnitt pro Woche – gerechnet ab der Woche der ersten
