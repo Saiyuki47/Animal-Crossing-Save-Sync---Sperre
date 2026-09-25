@@ -18,7 +18,9 @@
     4. pruefen: Sperre frei, neuer Spielstand und Spielzeit auf dem Server
     5. Spielzeit-Dialog oeffnen, alle drei Reiter fotografieren
        (der Verlauf enthaelt dafuer vorbereitete Sitzungen von Anna und Max)
-    6. Programm schliessen, pruefen: keine Fehler auf stderr
+    6. Ruebenkurs oeffnen, Preise eintragen, speichern - sie muessen samt
+       README-Abschnitt auf dem Server ankommen
+    7. Programm schliessen, pruefen: keine Fehler auf stderr
 
   Nach jedem Schritt entsteht ein Bildschirmfoto in -Ausgabe, dazu das
   Protokoll des Programms. Exitcode 0 = alles gut.
@@ -141,6 +143,7 @@ function Write-Elementbaum {
 Add-Type -Namespace AcssUi -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
 [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr w, string l);
 '@
 
 # Reagiert das Fenster? Schickt eine leere Nachricht und wartet hoechstens
@@ -416,6 +419,60 @@ try {
     while ((Get-ProgrammFenster | Where-Object { $_.Current.Name -eq 'Spielzeit' }) -and (Get-Date) -lt $ende) { Start-Sleep -Milliseconds 300 }
     if (Get-ProgrammFenster | Where-Object { $_.Current.Name -eq 'Spielzeit' }) { Stop-MitFehler "Spielzeit-Dialog schliesst sich nicht" }
     Write-Host "   Dialog geoeffnet, drei Reiter, geschlossen: ok"
+
+    Schritt "Ruebenkurs: Preise eintragen und speichern"
+    $rkName = "R$([char]0xFC)benkurs"
+    Invoke-Knopf $rkName
+    $dlg = $null
+    $ende = (Get-Date).AddSeconds(60)
+    while (-not $dlg -and (Get-Date) -lt $ende) {
+        $dlg = Get-ProgrammFenster | Where-Object { $_.Current.Name -eq $rkName } | Select-Object -First 1
+        Start-Sleep -Milliseconds 300
+    }
+    if (-not $dlg) { Stop-MitFehler "Der Ruebenkurs geht nicht auf" }
+    Start-Sleep -Seconds 1
+    # Eintragen per WM_SETTEXT - das Programm bekommt dabei dieselbe
+    # Aenderungsmeldung wie beim Tippen.
+    $eintraege = [ordered]@{
+        'Sigrids Preis' = '100'; 'Deine Rueben' = '400'
+        'Preis Mo vormittags' = '88'; 'Preis Mo nachmittags' = '85'; 'Preis Di vormittags' = '120'; 'Preis Di nachmittags' = '180'
+    }
+    foreach ($k in $eintraege.Keys) {
+        $feld = Find-InFenster $dlg -Name $k
+        if (-not $feld) { Stop-MitFehler "Eingabefeld '$k' nicht gefunden" }
+        [void][AcssUi.Win]::SendMessage([IntPtr]$feld.Current.NativeWindowHandle, 0x000C, [IntPtr]::Zero, $eintraege[$k])   # WM_SETTEXT
+    }
+    Start-Sleep -Seconds 2
+    Save-Bild 'ruebenkurs'
+    $prozent = @($dlg.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+        ForEach-Object { $_.Current.Name } | Where-Object { $_ -match '^\d+\s?%$' })
+    Write-Host ("   Muster-Anzeige: {0}" -f ($prozent -join ' / '))
+    if ($prozent -notcontains '100 %' -and $prozent -notcontains '100%') { Stop-MitFehler "Die Einschaetzung zeigt nicht 100 % fuer die grosse Spitze" }
+    $speichern = Find-InFenster $dlg -Name 'Speichern'
+    if (-not $speichern) { Stop-MitFehler "Knopf 'Speichern' nicht gefunden" }
+    [void][AcssUi.Win]::PostMessage([IntPtr]$speichern.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    $ende = (Get-Date).AddSeconds(60)
+    $json = ''
+    while ((Get-Date) -lt $ende) {
+        $alt = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $json = (& git --git-dir $server show main:rueben.json 2>$null) -join "`n"
+        $ErrorActionPreference = $alt
+        if ($json -match '"400"|: 400' -and $json -match '180') { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($json -notmatch '180') { Stop-MitFehler "Die Preise sind nicht auf dem Server angekommen: $json" }
+    $readme = G --git-dir $server show main:README.md
+    if ($readme -notmatch 'Sigrids Preis: 100 Sternis' -or $readme -notmatch '\| vormittags \| 88 \| 120') { Stop-MitFehler "README-Abschnitt fehlt oder ist falsch: $readme" }
+    Write-Host "   Preise und README-Abschnitt auf dem Server: ok"
+    Start-Sleep -Seconds 1
+    Save-Bild 'ruebenkurs-gespeichert'
+    $zu = Find-InFenster $dlg -Name 'Schliessen'
+    if (-not $zu) { Stop-MitFehler "Knopf 'Schliessen' im Ruebenkurs nicht gefunden" }
+    [void][AcssUi.Win]::PostMessage([IntPtr]$zu.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    $ende = (Get-Date).AddSeconds(10)
+    while ((Get-ProgrammFenster | Where-Object { $_.Current.Name -eq $rkName }) -and (Get-Date) -lt $ende) { Start-Sleep -Milliseconds 300 }
+    if (Get-ProgrammFenster | Where-Object { $_.Current.Name -eq $rkName }) { Stop-MitFehler "Ruebenkurs schliesst sich nicht (Rueckfrage offen?)" }
+    Write-Host "   Ruebenkurs geoeffnet, gespeichert, geschlossen: ok"
 
     Schritt "Programm schliessen"
     [void]$script:app.CloseMainWindow()

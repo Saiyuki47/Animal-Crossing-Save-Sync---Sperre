@@ -1154,6 +1154,13 @@ function Invoke-GitCommitPush {
     # Auch ohne neuen Commit pushen: es koennen aeltere Commits liegen
     # geblieben sein, deren Push beim letzten Mal fehlgeschlagen ist.
     $p = Invoke-Git @('push', 'origin', $script:cfg.Branch)
+    # Abgelehnt, weil der Mitspieler inzwischen nur etwas in den Ruebenkurs
+    # eingetragen hat? Dann dessen Eintraege einmischen und noch einmal.
+    # Alles andere (z. B. eine fremde Sperre) bleibt eine Ablehnung.
+    for ($versuch = 1; $p.Code -ne 0 -and $versuch -le 3; $versuch++) {
+        if (-not (Merge-RkVomServer)) { break }
+        $p = Invoke-Git @('push', 'origin', $script:cfg.Branch)
+    }
     return [pscustomobject]@{ Code = $p.Code; Text = $p.Text; Stage = 'push' }
 }
 
@@ -1558,6 +1565,13 @@ function Write-Readme {
     }
     $lines += ""
     $lines += ("**Gesamt zusammen:** {0}" -f (Format-Duration $total))
+
+    # Ruebenkurs der laufenden Woche - nur, wenn ihr ihn benutzt.
+    $rueben = Read-RkLokal
+    if ($rueben.wochen.Count -gt 0) {
+        $lines += ""
+        $lines += @(Format-RkReadme $rueben)
+    }
 
     # Fotos-Galerie (falls Bilder im Repo liegen), neueste zuerst.
     # Sortiert wird nach der Aufnahmezeit, NICHT nach dem Dateinamen: der
@@ -2499,6 +2513,1162 @@ function Update-Status {
     elseif ($lock.Mine) { Write-Log "Die Sperre liegt bei dir." }
     elseif ($lock.Stale) { Write-Log ("Abgelaufene Sperre von {0} - kann uebernommen werden." -f $lock.Owner) }
     else { Write-Log ("{0} spielt gerade." -f $lock.Owner) }
+    # Eintraege im Ruebenkurs, die beim letzten Mal nicht hochkamen
+    Send-RkOffen
+}
+
+#endregion
+
+#region Ruebenkurs: Einschaetzung der Wochenpreise
+
+# --------------------------------------------------------------------------
+# Ruebenkurs - wie Nook die Preise einer Woche festlegt
+# --------------------------------------------------------------------------
+# Sigrid verkauft sonntags Rueben fuer 90 bis 110 Sternis (der "Grundpreis"
+# der Woche). Nook zahlt Mo bis Sa je einen Preis vormittags und einen
+# nachmittags - zwoelf Preise, hier "Halbtage" 0 (Mo vormittag) bis 11
+# (Sa nachmittag). Jede Woche folgt einem von vier Mustern.
+#
+# Die Regeln stammen aus dem ausgelesenen Code von "New Horizons". Alles,
+# was ueber "Let's Go to the City" bekannt ist, passt dazu (Kaufpreis 90-110,
+# zwei Preise am Tag, vier Muster, hoechstens 660 Sternis = 6 x 110), und
+# fuer "New Leaf" - laut Community dieselbe Logik wie City Folk - passen auch
+# aufgezeichnete Wochen. Bewiesen ist das fuer City Folk nicht: Deshalb
+# meldet die Auswertung, wenn Preise zu keinem Muster passen.
+#
+# Ein Preis entsteht immer als "Faktor x Grundpreis", aufgerundet. Die
+# Faktoren je Halbtag:
+#   Schwankend     Hoch-Phasen mit je 0,9-1,4 und zwei fallende Phasen
+#                  (2 und 3 Halbtage), die bei 0,6-0,8 beginnen und pro
+#                  Halbtag um 0,04-0,10 sinken
+#   Grosse Spitze  1-7 Halbtage fallend (Beginn 0,85-0,9, je 0,03-0,05
+#                  weniger), dann 0,9-1,4 / 1,4-2,0 / 2,0-6,0 / 1,4-2,0 /
+#                  0,9-1,4, danach 0,4-0,9
+#   Fallend        Beginn 0,85-0,9, jeden Halbtag 0,03-0,05 weniger
+#   Kleine Spitze  0-7 Halbtage fallend (Beginn 0,4-0,9), dann zweimal
+#                  0,9-1,4, dann die Spitze: Mitte 1,4-2,0 (= "R"), links
+#                  und rechts davon 1,4 bis R (einen Stern weniger), danach
+#                  wieder fallend ab 0,4-0,9
+# Welches Muster kommt, haengt vom Muster der Vorwoche ab (Get-RkUebergang).
+#
+# Die Auswertung probiert alle 72 moeglichen Verlaeufe (bei unbekanntem
+# Sonntagspreis mit jedem Grundpreis von 90 bis 110), streicht die, die
+# nicht zu den eingetragenen Preisen passen, und gewichtet den Rest. Das
+# rechnet ein kleiner C#-Teil: in PowerShell dauerte es mehrere Sekunden.
+
+function Get-RkMusterNamen { return @('Schwankend', 'Grosse Spitze', 'Fallend', 'Kleine Spitze') }
+
+# Wahrscheinlichkeit fuer das Muster dieser Woche, je nach Muster der
+# Vorwoche (Zeile) - Reihenfolge wie Get-RkMusterNamen.
+function Get-RkUebergang {
+    return @(
+        @(0.20, 0.30, 0.15, 0.35),   # nach Schwankend
+        @(0.50, 0.05, 0.20, 0.25),   # nach Grosse Spitze
+        @(0.25, 0.45, 0.05, 0.25),   # nach Fallend
+        @(0.45, 0.25, 0.15, 0.15)    # nach Kleine Spitze
+    )
+}
+
+# Langfristige Haeufigkeit der Muster - fuer Wochen ohne bekannte Vorwoche.
+# Ergibt sich aus der Tabelle oben (etwa 35 / 25 / 15 / 26 %).
+function Get-RkGrundverteilung {
+    $t = Get-RkUebergang
+    $p = @(0.25, 0.25, 0.25, 0.25)
+    for ($n = 0; $n -lt 200; $n++) {
+        $neu = @(0.0, 0.0, 0.0, 0.0)
+        for ($i = 0; $i -lt 4; $i++) { for ($j = 0; $j -lt 4; $j++) { $neu[$j] += $p[$i] * $t[$i][$j] } }
+        $p = $neu
+    }
+    return $p
+}
+
+# Uebersetzt den Rechenteil beim ersten Gebrauch.
+function Initialize-RkRechner {
+    if ('ACSS.Ruebenkurs' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+namespace ACSS {
+    public class RkTreffer {
+        public int Muster;      // 0 Schwankend, 1 Grosse Spitze, 2 Fallend, 3 Kleine Spitze
+        public int Grund;       // Grundpreis, mit dem der Verlauf passt
+        public int Spitze;      // Halbtag der Spitze (-1 ohne)
+        public double W;        // Wahrscheinlichkeit dieses Verlaufs
+        public int[] Min;       // moegliche Preise je Halbtag
+        public int[] Max;
+    }
+    public class RkErgebnis {
+        public bool Passt;
+        public int Toleranz;
+        public double[] Muster = new double[4];
+        public int[] Min = new int[12];   // -1 = unbekannt
+        public int[] Max = new int[12];
+        public RkTreffer[] Treffer = new RkTreffer[0];
+    }
+    public static class Ruebenkurs {
+        // Feldarten eines Halbtags
+        const int Zufall = 0, Kette = 1, Nachbar = 2, Mitte = 3;
+        class Feld { public int Art; public double A, B, S1, S2; public int Nr; }
+        class Verlauf { public int Muster; public double P; public int Spitze; public Feld[] Felder; }
+        static List<Verlauf> verlaeufe;
+
+        static Feld Z(double a, double b) { Feld f = new Feld(); f.Art = Zufall; f.A = a; f.B = b; return f; }
+        static Feld K(double a, double b, double s1, double s2, int nr) {
+            Feld f = new Feld(); f.Art = Kette; f.A = a; f.B = b; f.S1 = s1; f.S2 = s2; f.Nr = nr; return f;
+        }
+        static Feld F(int art) { Feld f = new Feld(); f.Art = art; return f; }
+        static void Mal(List<Feld> l, int n, Func<Feld> neu) { for (int i = 0; i < n; i++) l.Add(neu()); }
+        static void Neu(int muster, double p, int spitze, List<Feld> l) {
+            Verlauf v = new Verlauf(); v.Muster = muster; v.P = p; v.Spitze = spitze; v.Felder = l.ToArray();
+            if (v.Felder.Length != 12) throw new InvalidOperationException("Verlauf hat nicht 12 Halbtage");
+            verlaeufe.Add(v);
+        }
+        static void Aufbauen() {
+            if (verlaeufe != null) return;
+            verlaeufe = new List<Verlauf>();
+            // Schwankend
+            for (int h1 = 0; h1 <= 6; h1++) {
+                foreach (int d1 in new int[] { 2, 3 }) {
+                    int h23 = 7 - h1;
+                    for (int h3 = 0; h3 < h23; h3++) {
+                        List<Feld> l = new List<Feld>();
+                        Mal(l, h1, () => Z(0.9, 1.4));
+                        Mal(l, d1, () => K(0.6, 0.8, 0.04, 0.10, 1));
+                        Mal(l, h23 - h3, () => Z(0.9, 1.4));
+                        Mal(l, 5 - d1, () => K(0.6, 0.8, 0.04, 0.10, 2));
+                        Mal(l, h3, () => Z(0.9, 1.4));
+                        Neu(0, (1.0 / 7) * 0.5 * (1.0 / h23), -1, l);
+                    }
+                }
+            }
+            // Grosse Spitze: 1 bis 7 fallende Halbtage, dann der Anstieg
+            for (int d = 1; d <= 7; d++) {
+                List<Feld> l = new List<Feld>();
+                Mal(l, d, () => K(0.85, 0.9, 0.03, 0.05, 1));
+                l.Add(Z(0.9, 1.4)); l.Add(Z(1.4, 2.0)); l.Add(Z(2.0, 6.0)); l.Add(Z(1.4, 2.0)); l.Add(Z(0.9, 1.4));
+                Mal(l, 12 - d - 5, () => Z(0.4, 0.9));
+                Neu(1, 1.0 / 7, d + 2, l);
+            }
+            // Fallend
+            {
+                List<Feld> l = new List<Feld>();
+                Mal(l, 12, () => K(0.85, 0.9, 0.03, 0.05, 1));
+                Neu(2, 1.0, -1, l);
+            }
+            // Kleine Spitze: 0 bis 7 fallende Halbtage vorweg
+            for (int d = 0; d <= 7; d++) {
+                List<Feld> l = new List<Feld>();
+                Mal(l, d, () => K(0.4, 0.9, 0.03, 0.05, 1));
+                l.Add(Z(0.9, 1.4)); l.Add(Z(0.9, 1.4));
+                l.Add(F(Nachbar)); l.Add(F(Mitte)); l.Add(F(Nachbar));
+                Mal(l, 12 - d - 5, () => K(0.4, 0.9, 0.03, 0.05, 2));
+                Neu(3, 1.0 / 8, d + 3, l);
+            }
+        }
+
+        public static int AnzahlVerlaeufe() { Aufbauen(); return verlaeufe.Count; }
+
+        // Aufrunden wie im Spiel
+        static int Preis(double faktor, int grund) { return (int)Math.Floor(faktor * grund + 0.99999); }
+
+        // Prueft einen Verlauf gegen die eingetragenen Preise (-1 = leer).
+        // null = passt nicht; sonst Gewicht und Spannen je Halbtag.
+        static RkTreffer Pruefen(Verlauf v, int grund, int[] preise, int tol) {
+            RkTreffer t = new RkTreffer();
+            t.Min = new int[12]; t.Max = new int[12];
+            double gewicht = 1.0;
+            double[] kLo = new double[3], kHi = new double[3];
+            bool[] kDa = new bool[3];
+            double rLo = 1.4, rHi = 2.0;          // Mitte der kleinen Spitze
+            List<int> spitze = new List<int>();
+            for (int i = 0; i < 12; i++) {
+                Feld f = v.Felder[i];
+                int p = preise[i];
+                // Faktoren, die genau diesen Preis ergeben
+                double iLo = (p - 0.99999 - tol) / grund, iHi = (p + 0.00001 + tol) / grund;
+                double lo, hi;
+                switch (f.Art) {
+                    case Zufall:
+                        if (p >= 0) {
+                            lo = Math.Max(f.A, iLo); hi = Math.Min(f.B, iHi);
+                            if (lo > hi) return null;
+                            gewicht *= Math.Max((hi - lo) / (f.B - f.A), 1e-9);
+                            t.Min[i] = p; t.Max[i] = p;
+                        } else { t.Min[i] = Preis(f.A, grund); t.Max[i] = Preis(f.B, grund); }
+                        break;
+                    case Kette:
+                        if (!kDa[f.Nr]) { kLo[f.Nr] = f.A; kHi[f.Nr] = f.B; kDa[f.Nr] = true; }
+                        if (p >= 0) {
+                            lo = Math.Max(kLo[f.Nr], iLo); hi = Math.Min(kHi[f.Nr], iHi);
+                            if (lo > hi) return null;
+                            double breite = kHi[f.Nr] - kLo[f.Nr];
+                            if (breite > 1e-9) gewicht *= Math.Max((hi - lo) / breite, 1e-9);
+                            kLo[f.Nr] = lo; kHi[f.Nr] = hi;
+                            t.Min[i] = p; t.Max[i] = p;
+                        } else { t.Min[i] = Preis(kLo[f.Nr], grund); t.Max[i] = Preis(kHi[f.Nr], grund); }
+                        // naechster Halbtag: um S1 bis S2 niedriger
+                        kLo[f.Nr] -= f.S2; kHi[f.Nr] -= f.S1;
+                        break;
+                    case Nachbar:
+                        spitze.Add(i);
+                        if (p >= 0) {
+                            // Preis = aufgerundet(U x Grund) - 1, U zwischen 1,4 und R
+                            double uLo = (p + 1 - 0.99999 - tol) / grund, uHi = (p + 1 + 0.00001 + tol) / grund;
+                            lo = Math.Max(1.4, uLo); hi = Math.Min(rHi, uHi);
+                            if (lo > hi) return null;
+                            gewicht *= Math.Max((hi - lo) / (rHi - 1.4), 1e-9);
+                            rLo = Math.Max(rLo, lo);
+                            if (rLo > rHi) return null;
+                        }
+                        break;
+                    case Mitte:
+                        spitze.Add(i);
+                        if (p >= 0) {
+                            lo = Math.Max(rLo, iLo); hi = Math.Min(rHi, iHi);
+                            if (lo > hi) return null;
+                            double breite = rHi - rLo;
+                            if (breite > 1e-9) gewicht *= Math.Max((hi - lo) / breite, 1e-9);
+                            rLo = lo; rHi = hi;
+                        }
+                        break;
+                }
+            }
+            // Spannen der kleinen Spitze erst am Ende: ein spaeter
+            // eingetragener Preis grenzt auch die Halbtage davor ein.
+            foreach (int i in spitze) {
+                if (preise[i] >= 0) { t.Min[i] = preise[i]; t.Max[i] = preise[i]; continue; }
+                if (v.Felder[i].Art == Mitte) { t.Min[i] = Preis(rLo, grund); t.Max[i] = Preis(rHi, grund); }
+                else { t.Min[i] = Preis(1.4, grund) - 1; t.Max[i] = Preis(rHi, grund) - 1; }
+            }
+            t.W = gewicht;
+            return t;
+        }
+
+        // grundpreis 0 = unbekannt (dann 90 bis 110), preise: 12 Werte, -1 = leer,
+        // vorher: Wahrscheinlichkeit der vier Muster vor Blick auf die Preise.
+        public static RkErgebnis Auswerten(int grundpreis, int[] preise, double[] vorher) {
+            Aufbauen();
+            if (preise == null || preise.Length != 12) throw new ArgumentException("Es braucht genau 12 Preise.");
+            int[] grundListe;
+            if (grundpreis > 0) grundListe = new int[] { grundpreis };
+            else { grundListe = new int[21]; for (int g = 0; g < 21; g++) grundListe[g] = 90 + g; }
+            bool etwas = false;
+            foreach (int p in preise) if (p >= 0) etwas = true;
+
+            RkErgebnis e = new RkErgebnis();
+            List<RkTreffer> treffer = new List<RkTreffer>();
+            double summe = 0;
+            int tolGenutzt = 0;
+            // Passt gar nichts, wird ein wenig Abweichung zugelassen - falls
+            // das Spiel minimal anders rundet.
+            for (int tol = 0; tol <= 3; tol++) {
+                if (tol > 0 && !etwas) break;
+                treffer.Clear(); summe = 0;
+                foreach (Verlauf v in verlaeufe) {
+                    double vorab = vorher[v.Muster] * v.P / grundListe.Length;
+                    if (vorab <= 0) continue;
+                    foreach (int g in grundListe) {
+                        RkTreffer t = Pruefen(v, g, preise, tol);
+                        if (t == null) continue;
+                        t.Muster = v.Muster; t.Grund = g; t.Spitze = v.Spitze;
+                        t.W *= vorab;
+                        summe += t.W;
+                        treffer.Add(t);
+                    }
+                }
+                tolGenutzt = tol;
+                if (summe > 0) break;
+            }
+            for (int i = 0; i < 12; i++) { e.Min[i] = -1; e.Max[i] = -1; }
+            if (summe <= 0) return e;
+            e.Passt = true; e.Toleranz = tolGenutzt;
+            foreach (RkTreffer t in treffer) {
+                t.W /= summe;
+                e.Muster[t.Muster] += t.W;
+                for (int i = 0; i < 12; i++) {
+                    if (e.Min[i] < 0 || t.Min[i] < e.Min[i]) e.Min[i] = t.Min[i];
+                    if (t.Max[i] > e.Max[i]) e.Max[i] = t.Max[i];
+                }
+            }
+            e.Treffer = treffer.ToArray();
+            return e;
+        }
+    }
+}
+'@
+}
+
+# Wertet eine Woche aus.
+#   $Grundpreis  Sigrids Sonntagspreis, 0 wenn unbekannt
+#   $Preise      12 Eintraege (Zahl oder $null), Mo vormittag bis Sa nachmittag
+#   $Vorher      Wahrscheinlichkeit der vier Muster, bevor die Preise der
+#                Woche bekannt sind (Get-RkVorwissen); ohne: Grundverteilung
+# Rueckgabe (ACSS.RkErgebnis):
+#   Passt     $false, wenn kein Muster zu den Preisen passt
+#   Toleranz  0 - oder die Abweichung in Sternis, mit der es doch passt
+#   Muster    Wahrscheinlichkeit je Muster (Summe 1)
+#   Min/Max   moegliche Spanne je Halbtag (-1 = unbekannt)
+#   Treffer   alle passenden Verlaeufe mit Wahrscheinlichkeit W
+function Get-RkAuswertung {
+    param([int]$Grundpreis, [object[]]$Preise, [double[]]$Vorher)
+    Initialize-RkRechner
+    if (-not $Vorher) { $Vorher = Get-RkGrundverteilung }
+    $werte = New-Object int[] 12
+    for ($i = 0; $i -lt 12; $i++) {
+        $p = if ($null -ne $Preise -and $i -lt $Preise.Count) { $Preise[$i] } else { $null }
+        $werte[$i] = if ($null -eq $p) { -1 } else { [int]$p }
+    }
+    return [ACSS.Ruebenkurs]::Auswerten($Grundpreis, $werte, [double[]]$Vorher)
+}
+
+# Wie der Knopf und das Fenster heissen (mit echtem ue).
+function Get-RkName { return "R$([char]0xFC)benkurs" }
+
+# Vorwissen fuer eine Woche: Wahrscheinlichkeit der vier Muster, bevor ihre
+# Preise bekannt sind. Haengt vom Muster der Vorwoche ab - das wird aus
+# deren Preisen erkannt ("automatisch") oder von Hand gewaehlt.
+# Rueckgabe: Werte (4 Zahlen) und Text (fuer die Anzeige).
+function Get-RkVorwissen {
+    param($Daten, [string]$Woche)
+    $namen = Get-RkMusterNamen
+    $t = Get-RkUebergang
+    $wahl = Get-RkWert (Get-RkWoche $Daten $Woche).vorwoche
+    if ($wahl -match '^[0-3]$') {
+        return [pscustomobject]@{ Werte = [double[]]$t[[int]$wahl]; Text = ("Vorwoche: {0} (von Hand gewaehlt)" -f $namen[[int]$wahl]) }
+    }
+    $grund = Get-RkGrundverteilung
+    if ($wahl -eq 'unbekannt') { return [pscustomobject]@{ Werte = [double[]]$grund; Text = 'Vorwoche: unbekannt' } }
+
+    $vorKey = ([datetime]::ParseExact($Woche, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)).AddDays(-7).ToString('yyyy-MM-dd')
+    $vor = Get-RkWoche $Daten $vorKey
+    $vorPreise = Get-RkPreise $vor
+    if (@($vorPreise | Where-Object { $null -ne $_ }).Count -eq 0) {
+        return [pscustomobject]@{ Werte = [double[]]$grund; Text = 'Vorwoche: keine Preise eingetragen' }
+    }
+    $a = Get-RkAuswertung -Grundpreis ([int](Get-RkWert $vor.sonntag)) -Preise $vorPreise -Vorher $grund
+    if (-not $a.Passt) { return [pscustomobject]@{ Werte = [double[]]$grund; Text = 'Vorwoche: passte zu keinem Muster' } }
+    # Gewichtete Mischung: sicher erkannte Vorwoche = genau ihre Zeile.
+    $werte = @(0.0, 0.0, 0.0, 0.0)
+    for ($i = 0; $i -lt 4; $i++) { for ($j = 0; $j -lt 4; $j++) { $werte[$j] += $a.Muster[$i] * $t[$i][$j] } }
+    $best = 0
+    for ($i = 1; $i -lt 4; $i++) { if ($a.Muster[$i] -gt $a.Muster[$best]) { $best = $i } }
+    return [pscustomobject]@{
+        Werte = [double[]]$werte
+        Text  = ("Vorwoche: wahrscheinlich {0} ({1:P0})" -f $namen[$best], $a.Muster[$best])
+    }
+}
+
+# Name eines Halbtags, z. B. "Mi nachmittags".
+function Get-RkHalbtagName {
+    param([int]$Halbtag)
+    $tage = @('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa')
+    return ("{0} {1}" -f $tage[[math]::Floor($Halbtag / 2)], $(if ($Halbtag % 2) { 'nachmittags' } else { 'vormittags' }))
+}
+
+# Die Woche beginnt mit Sigrids Sonntag. Schluessel: das Datum des Sonntags.
+function Get-RkWochenKey {
+    param([datetime]$Tag)
+    return $Tag.Date.AddDays(-[int]$Tag.DayOfWeek).ToString('yyyy-MM-dd')
+}
+
+# Welcher Halbtag ist gerade (in der Woche $Woche)?
+# -1 = noch Sonntag (vor dem ersten Preis), 0-11 = Mo vormittag bis Sa
+# nachmittag, 12 = Woche vorbei. Nook wechselt den Preis um 12 Uhr.
+function Get-RkHalbtag {
+    param([datetime]$Jetzt, [string]$Woche)
+    $sonntag = [datetime]::ParseExact($Woche, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $tage = [math]::Floor(($Jetzt.Date - $sonntag).TotalDays)
+    if ($tage -lt 1) { return -1 }
+    if ($tage -gt 6) { return 12 }
+    return [int](($tage - 1) * 2 + $(if ($Jetzt.Hour -ge 12) { 1 } else { 0 }))
+}
+
+# Empfehlung fuer den Halbtag $Jetzt (siehe Get-RkHalbtag).
+# Rueckgabe: Titel, Text und Chance (Wahrscheinlichkeit fuer einen spaeter
+# hoeheren Preis, oder $null).
+function Get-RkEmpfehlung {
+    param($Auswertung, [object[]]$Preise, [int]$Jetzt, [int]$Grundpreis)
+    $namen = Get-RkMusterNamen
+    $a = $Auswertung
+    $antwort = { param($titel, $text, $chance) [pscustomobject]@{ Titel = $titel; Text = $text; Chance = $chance } }
+
+    if (-not $a.Passt) {
+        return (& $antwort 'Passt zu keinem bekannten Muster' ("Bitte die Preise auf Tippfehler pruefen. Stimmen sie, rechnet " +
+                "Let's Go to the City hier anders als bekannt - dann gibt es fuer diese Woche keine Einschaetzung.") $null)
+    }
+    if ($Jetzt -ge 12) { return (& $antwort 'Diese Woche ist vorbei' 'Nicht verkaufte Rueben sind am Sonntag verfault.' $null) }
+
+    # Das wahrscheinlichste Muster und - falls moeglich - wann die grosse
+    # Spitze noch kommen kann.
+    $best = 0
+    for ($i = 1; $i -lt 4; $i++) { if ($a.Muster[$i] -gt $a.Muster[$best]) { $best = $i } }
+    $zusatz = @()
+    $pSpitze = 0.0; $von = 12; $bis = -1
+    foreach ($t in $a.Treffer) {
+        if ($t.Muster -ne 1 -or $t.Spitze -le $Jetzt) { continue }
+        $pSpitze += $t.W
+        $von = [math]::Min($von, $t.Spitze); $bis = [math]::Max($bis, $t.Spitze)
+    }
+    if ($pSpitze -ge 0.05) {
+        $wann = if ($von -eq $bis) { Get-RkHalbtagName $von } else { "zwischen {0} und {1}" -f (Get-RkHalbtagName $von), (Get-RkHalbtagName $bis) }
+        $zusatz += ("Grosse Spitze noch moeglich ({0:P0}): {1}." -f $pSpitze, $wann)
+    }
+
+    if ($Jetzt -lt 0) {
+        return (& $antwort 'Heute ist Sonntag' ((@("Sigrid verkauft bis 12 Uhr, Nook kauft ab Montag. Am wahrscheinlichsten: {0} ({1:P0})." -f
+                        $namen[$best], $a.Muster[$best]) + $zusatz) -join ' ') $null)
+    }
+    $jetztPreis = $Preise[$Jetzt]
+    if ($null -eq $jetztPreis) {
+        return (& $antwort 'Preis von jetzt eintragen' ((@(("Trag ein, was Nook gerade zahlt ({0}) - dann gibt es eine Empfehlung. " +
+                            "Am wahrscheinlichsten: {1} ({2:P0}).") -f (Get-RkHalbtagName $Jetzt), $namen[$best], $a.Muster[$best]) + $zusatz) -join ' ') $null)
+    }
+    if ($Jetzt -eq 11) {
+        return (& $antwort 'Heute verkaufen' 'Das ist der letzte Preis der Woche - am Sonntag verfaulen die Rueben.' $null)
+    }
+
+    # Chance, dass Nook spaeter mehr zahlt: je Verlauf der Anteil moeglicher
+    # Preise ueber dem jetzigen, fuer alle folgenden Halbtage zusammen.
+    $chance = 0.0; $hoechst = 0
+    foreach ($t in $a.Treffer) {
+        $keinerHoeher = 1.0
+        for ($i = $Jetzt + 1; $i -lt 12; $i++) {
+            $lo = $t.Min[$i]; $hi = $t.Max[$i]
+            if ($hi -gt $hoechst -and $t.W -gt 1e-6) { $hoechst = $hi }
+            if ($hi -le $jetztPreis) { continue }
+            $anteil = ($hi - [math]::Max($lo - 1, $jetztPreis)) / ($hi - $lo + 1)
+            $keinerHoeher *= (1 - $anteil)
+        }
+        $chance += $t.W * (1 - $keinerHoeher)
+    }
+    if ($Grundpreis -gt 0 -and $hoechst -lt $Grundpreis -and $jetztPreis -lt $Grundpreis) {
+        $zusatz += ("Mit Gewinn wird es diese Woche wohl nichts mehr: ueber den Kaufpreis von {0} steigt der Preis voraussichtlich nicht." -f $Grundpreis)
+    }
+    if ($Jetzt -eq 10) { $zusatz += 'Heute ist der letzte Verkaufstag - am Sonntag verfaulen die Rueben.' }
+
+    if ($chance -lt 0.2) {
+        return (& $antwort 'Jetzt verkaufen' ((@("Ein hoeherer Preis ist unwahrscheinlich ({0:P0})." -f $chance) + $zusatz) -join ' ') $chance)
+    }
+    if ($chance -ge 0.6) {
+        return (& $antwort 'Warten' ((@("Mit {0:P0} Wahrscheinlichkeit zahlt Nook spaeter mehr - bis zu {1} Sternis." -f $chance, $hoechst) + $zusatz) -join ' ') $chance)
+    }
+    return (& $antwort 'Knapp' ((@(("Mit {0:P0} Wahrscheinlichkeit zahlt Nook spaeter mehr (bis zu {1} Sternis). " +
+                        "Wer auf Nummer sicher gehen will, verkauft jetzt.") -f $chance, $hoechst) + $zusatz) -join ' ') $chance)
+}
+
+#endregion
+
+#region Ruebenkurs: Daten im gemeinsamen Repo (rueben.json)
+
+# --------------------------------------------------------------------------
+# rueben.json - die eingetragenen Preise beider Spieler
+# --------------------------------------------------------------------------
+# Aufbau (je Woche, Schluessel = Datum von Sigrids Sonntag):
+#   { "format": 1, "wochen": { "2026-09-20": {
+#       "sonntag":  Eintrag,                  Sigrids Preis
+#       "vorwoche": Eintrag,                  "auto", "unbekannt" oder "0"-"3"
+#       "kauf":     { "Anna": Eintrag, ... }, gekaufte Rueben je Spieler
+#       "preise":   { "0": Eintrag, ... }     Halbtag 0 (Mo vorm.) bis 11
+#   } } }
+# Ein Eintrag ist { "wert": ..., "von": "Anna", "zeit": "2026-09-21 10:02:11.123 UTC" }.
+# (Die Zeit bewusst nicht im ISO-Format: PowerShell 7 machte daraus beim
+# Einlesen ein Datum in Ortszeit, und der Vergleich "wer ist neuer" kippte.)
+# Geloeschte Werte bleiben als "wert": null stehen - sonst kaeme ein Wert
+# beim Zusammenfuehren mit dem Stand des anderen wieder zurueck.
+#
+# Eingetragen werden darf jederzeit, auch waehrend der andere spielt. Dann
+# gelangt nur diese Datei (und der Abschnitt in der README) auf den Server,
+# als eigener Commit oben auf dem Server-Stand - ohne die Sperre und ohne den
+# eigenen Ordner anzufassen (Save-RkDaten). Treffen zwei Staende aufeinander,
+# wird Feld fuer Feld zusammengefuehrt: der neuere Eintrag gewinnt.
+
+function Get-RkPfad { Join-Path $script:cfg.RepoPath 'rueben.json' }
+# Eintraege, die noch nicht auf dem Server sind (z. B. ohne Internet).
+function Get-RkOffenPfad { Join-Path $script:AppDir 'rueben-offen.json' }
+
+function New-RkDaten { return @{ format = 1; wochen = @{} } }
+
+function Get-RkWert {
+    param($Eintrag)
+    if ($null -eq $Eintrag) { return $null }
+    return $Eintrag.wert
+}
+
+# Eine Woche (leer, wenn es sie nicht gibt - dann wird nichts angelegt).
+function Get-RkWoche {
+    param($Daten, [string]$Woche)
+    if ($Daten -and $Daten.wochen.ContainsKey($Woche)) { return $Daten.wochen[$Woche] }
+    return @{ sonntag = $null; vorwoche = $null; kauf = @{}; preise = @{} }
+}
+
+# Die zwoelf Preise einer Woche (Zahl oder $null).
+function Get-RkPreise {
+    param($WocheDaten)
+    $p = @($null) * 12
+    for ($i = 0; $i -lt 12; $i++) {
+        $w = Get-RkWert $WocheDaten.preise["$i"]
+        if ($null -ne $w) { $p[$i] = [int]$w }
+    }
+    return , $p
+}
+
+# Setzt einen Wert (oder loescht ihn mit $null) im Namen des eigenen Spielers.
+#   $Feld: 'sonntag', 'vorwoche', 'kauf' (mit $Name = Spieler) oder
+#          'preise' (mit $Name = Halbtag 0-11)
+function Set-RkWert {
+    param($Daten, [string]$Woche, [string]$Feld, [string]$Name, $Wert)
+    if (-not $Daten.wochen.ContainsKey($Woche)) {
+        $Daten.wochen[$Woche] = @{ sonntag = $null; vorwoche = $null; kauf = @{}; preise = @{} }
+    }
+    $wer = $script:cfg.PlayerName
+    if ([string]::IsNullOrWhiteSpace($wer)) { $wer = 'Unbekannt' }
+    $eintrag = @{ wert = $Wert; von = $wer; zeit = [datetime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ' UTC' }
+    if ($Feld -eq 'kauf' -or $Feld -eq 'preise') { $Daten.wochen[$Woche][$Feld][$Name] = $eintrag }
+    else { $Daten.wochen[$Woche][$Feld] = $eintrag }
+}
+
+# Macht aus dem, was ConvertFrom-Json liefert, Hashtables.
+function ConvertTo-RkHashtable {
+    param($Objekt)
+    if ($null -eq $Objekt) { return $null }
+    if ($Objekt -is [Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $Objekt.PSObject.Properties) { $h[$p.Name] = ConvertTo-RkHashtable $p.Value }
+        return $h
+    }
+    return $Objekt
+}
+
+# Liest rueben.json-Text. Unlesbares wird gemeldet und als leer behandelt -
+# das Programm soll daran nicht scheitern.
+function ConvertFrom-RkText {
+    param([string]$Text, [string]$Quelle = 'rueben.json')
+    $d = New-RkDaten
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $d }
+    try {
+        $j = ConvertTo-RkHashtable ($Text | ConvertFrom-Json)
+        if ($j -isnot [hashtable] -or -not $j.ContainsKey('wochen') -or $j.wochen -isnot [hashtable]) { throw 'kein Abschnitt "wochen"' }
+        foreach ($k in @($j.wochen.Keys)) {
+            if ($k -notmatch '^\d{4}-\d{2}-\d{2}$') { continue }
+            $w = $j.wochen[$k]
+            if ($w -isnot [hashtable]) { continue }
+            $neu = @{ sonntag = $null; vorwoche = $null; kauf = @{}; preise = @{} }
+            foreach ($f in 'sonntag', 'vorwoche') { if ($w[$f] -is [hashtable]) { $neu[$f] = $w[$f] } }
+            foreach ($f in 'kauf', 'preise') {
+                if ($w[$f] -isnot [hashtable]) { continue }
+                foreach ($n in @($w[$f].Keys)) { if ($w[$f][$n] -is [hashtable]) { $neu[$f][$n] = $w[$f][$n] } }
+            }
+            $d.wochen[$k] = $neu
+        }
+    }
+    catch {
+        Write-Log ("WARNUNG: {0} ist nicht lesbar - der Ruebenkurs daraus fehlt. ({1})" -f $Quelle, $_.Exception.Message)
+    }
+    return $d
+}
+
+# Schreibt die Daten mit fester Reihenfolge der Schluessel - so aendert sich
+# die Datei nur dort, wo sich wirklich etwas geaendert hat.
+function ConvertTo-RkText {
+    param($Daten)
+    $sortiert = {
+        param($h)
+        $o = [ordered]@{}
+        foreach ($k in ($h.Keys | Sort-Object { if ($_ -match '^\d+$') { '{0:D3}' -f [int]$_ } else { $_ } })) {
+            $v = $h[$k]
+            $o[$k] = if ($v -is [hashtable]) { & $sortiert $v } else { $v }
+        }
+        return $o
+    }
+    return ((& $sortiert $Daten) | ConvertTo-Json -Depth 8)
+}
+
+# Fuehrt zwei Staende zusammen: je Feld gewinnt der neuere Eintrag.
+function Merge-RkDaten {
+    param($A, $B)
+    $neuer = {
+        param($x, $y)
+        if ($null -eq $x) { return $y }
+        if ($null -eq $y) { return $x }
+        $c = [string]::CompareOrdinal([string]$x.zeit, [string]$y.zeit)
+        if ($c -eq 0) { $c = [string]::CompareOrdinal(("{0}|{1}" -f $x.von, $x.wert), ("{0}|{1}" -f $y.von, $y.wert)) }
+        if ($c -ge 0) { return $x } else { return $y }
+    }
+    $d = New-RkDaten
+    $alle = @($A.wochen.Keys) + @($B.wochen.Keys) | Sort-Object -Unique
+    foreach ($k in $alle) {
+        $wa = Get-RkWoche $A $k; $wb = Get-RkWoche $B $k
+        $w = @{ kauf = @{}; preise = @{} }
+        foreach ($f in 'sonntag', 'vorwoche') { $w[$f] = & $neuer $wa[$f] $wb[$f] }
+        foreach ($f in 'kauf', 'preise') {
+            foreach ($n in (@($wa[$f].Keys) + @($wb[$f].Keys) | Sort-Object -Unique)) {
+                $w[$f][$n] = & $neuer $wa[$f][$n] $wb[$f][$n]
+            }
+        }
+        $d.wochen[$k] = $w
+    }
+    return $d
+}
+
+function Read-RkLokal {
+    $p = Get-RkPfad
+    if (-not (Test-Path -LiteralPath $p)) { return (New-RkDaten) }
+    return (ConvertFrom-RkText (Get-Content -LiteralPath $p -Raw -Encoding UTF8) 'rueben.json')
+}
+
+function Read-RkOffen {
+    $p = Get-RkOffenPfad
+    if (-not (Test-Path -LiteralPath $p)) { return (New-RkDaten) }
+    return (ConvertFrom-RkText (Get-Content -LiteralPath $p -Raw -Encoding UTF8) 'rueben-offen.json')
+}
+
+# rueben.json aus einem Stand des Repos (z. B. "origin/main" oder "HEAD").
+function Read-RkAusGit {
+    param([string]$Stand)
+    $r = Invoke-Git @('show', "${Stand}:rueben.json")
+    if ($r.Code -ne 0) { return (New-RkDaten) }
+    return (ConvertFrom-RkText $r.Out "rueben.json ($Stand)")
+}
+
+# Alles, was bekannt ist: eigener Ordner, Server (zuletzt geholter Stand)
+# und noch nicht Hochgeladenes. Mit -Holen wird vorher der Server gefragt.
+function Get-RkDaten {
+    param([switch]$Holen)
+    if (-not (Test-Repo)) { return (Read-RkOffen) }
+    if ($Holen) {
+        $f = Invoke-Git @('fetch', 'origin')
+        if ($f.Code -ne 0) { Write-Log "Ruebenkurs: Server nicht erreichbar - es wird der Stand auf diesem PC gezeigt." }
+    }
+    $d = Merge-RkDaten (Read-RkLokal) (Read-RkAusGit "origin/$($script:cfg.Branch)")
+    return (Merge-RkDaten $d (Read-RkOffen))
+}
+
+# --- Abschnitt in der README des Repos ---------------------------------------
+# Er steht zwischen zwei unsichtbaren Markierungen, damit er sich spaeter
+# gezielt ersetzen laesst.
+function Get-RkReadmeMarken { return @('<!-- ruebenkurs -->', '<!-- /ruebenkurs -->') }
+
+# Zeilen des Abschnitts fuer die laufende Woche.
+function Format-RkReadme {
+    param($Daten, [datetime]$Jetzt = (Get-Date))
+    $key = Get-RkWochenKey $Jetzt
+    $w = Get-RkWoche $Daten $key
+    $sonntag = [datetime]::ParseExact($key, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $grund = Get-RkWert $w.sonntag
+    $preise = Get-RkPreise $w
+    $marken = Get-RkReadmeMarken
+    $z = @($marken[0], ("## {0}" -f (Get-RkName)), '')
+    $z += ("Woche vom {0:dd.MM.} bis {1:dd.MM.yyyy} - Sigrids Preis: {2}" -f $sonntag, $sonntag.AddDays(6),
+        $(if ($grund) { "$grund Sternis" } else { 'noch nicht eingetragen' }))
+    $z += ''
+    $z += '| | Mo | Di | Mi | Do | Fr | Sa |'
+    $z += '|---|---|---|---|---|---|---|'
+    foreach ($h in 0, 1) {
+        $zellen = for ($t = 0; $t -lt 6; $t++) { $v = $preise[$t * 2 + $h]; if ($null -eq $v) { '-' } else { "$v" } }
+        $z += ("| {0} | {1} |" -f $(if ($h) { 'nachmittags' } else { 'vormittags' }), ($zellen -join ' | '))
+    }
+    $kauf = @($w.kauf.Keys | Sort-Object | Where-Object { $v = Get-RkWert $w.kauf[$_]; $v -and [int]$v -gt 0 } |
+        ForEach-Object { "{0}: {1}" -f $_, (Get-RkWert $w.kauf[$_]) })
+    if ($kauf.Count) { $z += ''; $z += ("Gekaufte Rueben: {0}" -f ($kauf -join ', ')) }
+    if ($grund -or @($preise | Where-Object { $null -ne $_ }).Count) {
+        $a = Get-RkAuswertung -Grundpreis ([int]$grund) -Preise $preise -Vorher (Get-RkVorwissen $Daten $key).Werte
+        $z += ''
+        if (-not $a.Passt) { $z += 'Einschaetzung: passt zu keinem bekannten Muster.' }
+        else {
+            $namen = Get-RkMusterNamen
+            $teile = 0..3 | Sort-Object { - $a.Muster[$_] } | Where-Object { $a.Muster[$_] -ge 0.01 } |
+                ForEach-Object { "{0} {1:P0}" -f $namen[$_], $a.Muster[$_] }
+            $z += ("Einschaetzung: {0}" -f ($teile -join ', '))
+        }
+    }
+    $z += $marken[1]
+    return $z
+}
+
+# Setzt den Abschnitt in einen vorhandenen README-Text ein (ersetzt einen
+# alten, sonst vor die Fotos bzw. vor die letzte Zeile).
+function Update-RkReadmeText {
+    param([string]$Text, $Daten, [datetime]$Jetzt = (Get-Date))
+    $abschnitt = (Format-RkReadme $Daten $Jetzt) -join "`r`n"
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ("# Gemeinsamer Animal-Crossing-Spielstand`r`n`r`n" + $abschnitt + "`r`n")
+    }
+    $marken = Get-RkReadmeMarken
+    $i = $Text.IndexOf($marken[0])
+    $j = if ($i -ge 0) { $Text.IndexOf($marken[1], $i) } else { -1 }
+    if ($j -ge 0) { return $Text.Substring(0, $i) + $abschnitt + $Text.Substring($j + $marken[1].Length) }
+    foreach ($vor in "`r`n## Fotos", "`n## Fotos", "`r`n_Zuletzt aktualisiert", "`n_Zuletzt aktualisiert") {
+        $i = $Text.IndexOf($vor)
+        if ($i -ge 0) { return $Text.Substring(0, $i) + "`r`n" + $abschnitt + "`r`n" + $Text.Substring($i) }
+    }
+    return ($Text.TrimEnd() + "`r`n`r`n" + $abschnitt + "`r`n")
+}
+
+# --- Auf den Server bringen ---------------------------------------------------
+# Laedt Eintraege hoch, ohne die Sperre oder den eigenen Ordner anzufassen:
+# Der neue Commit entsteht direkt oben auf dem Server-Stand (ueber einen
+# eigenen, voruebergehenden Index) und enthaelt nur rueben.json und den
+# Abschnitt in der README. Klappt es nicht, bleiben die Eintraege in
+# rueben-offen.json und werden beim naechsten Mal mitgeschickt.
+# Rueckgabe: Ok (hochgeladen), Offen (liegt noch auf diesem PC), Text.
+function Save-RkDaten {
+    param($Aenderungen)
+    $offen = Merge-RkDaten (Read-RkOffen) $(if ($Aenderungen) { $Aenderungen } else { New-RkDaten })
+    if ($offen.wochen.Count -gt 0) { Write-TextDatei (Get-RkOffenPfad) (ConvertTo-RkText $offen) }
+    $ergebnis = { param($ok, $text) [pscustomobject]@{ Ok = $ok; Offen = (-not $ok); Text = $text } }
+    if ($offen.wochen.Count -eq 0) { return (& $ergebnis $true 'Nichts hochzuladen.') }
+    if (-not (Test-Repo)) { return (& $ergebnis $false 'Kein gemeinsamer Ordner - die Eintraege bleiben auf diesem PC.') }
+
+    $branch = $script:cfg.Branch
+    for ($versuch = 1; $versuch -le 3; $versuch++) {
+        $f = Invoke-Git @('fetch', 'origin')
+        if ($f.Code -ne 0) {
+            return (& $ergebnis $false 'Keine Verbindung zum Server - die Eintraege sind auf diesem PC gespeichert und werden beim naechsten Mal hochgeladen.')
+        }
+        $basis = (Invoke-Git @('rev-parse', '--verify', "origin/$branch")).Out
+        if (-not $basis) { return (& $ergebnis $false "Auf dem Server gibt es den Branch '$branch' noch nicht.") }
+
+        $server = Read-RkAusGit "origin/$branch"
+        $neu = Merge-RkDaten $server $offen
+        $neuText = ConvertTo-RkText $neu
+        if ($neuText -eq (ConvertTo-RkText $server)) {
+            Remove-Item -LiteralPath (Get-RkOffenPfad) -Force -ErrorAction SilentlyContinue
+            return (& $ergebnis $true 'Schon auf dem Server.')
+        }
+        $readme = Invoke-Git @('show', "origin/${branch}:README.md")
+        $readmeText = Update-RkReadmeText $(if ($readme.Code -eq 0) { $readme.Out } else { '' }) $neu
+
+        # Commit bauen, ohne Arbeitsordner und Index anzufassen
+        $tmp = Join-Path $script:AppDir ('rk-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $altIndex = $env:GIT_INDEX_FILE
+        $sha = $null
+        try {
+            Write-TextDatei (Join-Path $tmp 'rueben.json') ($neuText + "`n")
+            Write-TextDatei (Join-Path $tmp 'README.md') $readmeText
+            $b1 = (Invoke-Git @('hash-object', '-w', '--path=rueben.json', '--', (Join-Path $tmp 'rueben.json'))).Out
+            $b2 = (Invoke-Git @('hash-object', '-w', '--path=README.md', '--', (Join-Path $tmp 'README.md'))).Out
+            $env:GIT_INDEX_FILE = Join-Path $tmp 'index'
+            $ok = ((Invoke-Git @('read-tree', "origin/$branch")).Code -eq 0) -and $b1 -and $b2 -and
+            ((Invoke-Git @('update-index', '--add', '--cacheinfo', "100644,$b1,rueben.json")).Code -eq 0) -and
+            ((Invoke-Git @('update-index', '--add', '--cacheinfo', "100644,$b2,README.md")).Code -eq 0)
+            $baum = if ($ok) { (Invoke-Git @('write-tree')).Out } else { '' }
+            if ($baum) {
+                $c = Invoke-Git @('commit-tree', $baum, '-p', $basis, '-m', ("Ruebenkurs: {0}" -f $script:cfg.PlayerName))
+                if ($c.Code -eq 0) { $sha = $c.Out }
+                else { Write-GitProblem "Ruebenkurs: der Commit liess sich nicht anlegen." $c }
+            }
+        }
+        finally {
+            if ($altIndex) { $env:GIT_INDEX_FILE = $altIndex } else { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $sha) { return (& $ergebnis $false 'Die Eintraege liessen sich nicht speichern (siehe Protokoll). Sie bleiben auf diesem PC.') }
+
+        $p = Invoke-Git @('push', 'origin', "${sha}:refs/heads/$branch")
+        if ($p.Code -eq 0) {
+            Remove-Item -LiteralPath (Get-RkOffenPfad) -Force -ErrorAction SilentlyContinue
+            Update-RkEigenerOrdner
+            Write-Log ("{0}: Eintraege hochgeladen." -f (Get-RkName))
+            return (& $ergebnis $true 'Gespeichert und hochgeladen.')
+        }
+        # Abgelehnt, weil inzwischen etwas Neues auf dem Server liegt: noch einmal.
+        if ($p.Text -notmatch 'rejected|non-fast-forward|fetch first|stale info') {
+            Write-GitProblem "Ruebenkurs: hochladen hat nicht geklappt." $p
+            return (& $ergebnis $false 'Hochladen hat nicht geklappt - die Eintraege bleiben auf diesem PC und werden beim naechsten Mal mitgeschickt.')
+        }
+    }
+    return (& $ergebnis $false 'Der Server war dreimal schneller - die Eintraege bleiben auf diesem PC und werden beim naechsten Mal mitgeschickt.')
+}
+
+# Holt den eigenen Ordner nach, wenn das gefahrlos geht: ausserhalb einer
+# eigenen Sitzung, ohne eigene Aenderungen, nur vorspulen.
+function Update-RkEigenerOrdner {
+    if ($script:holdingLock) { return }
+    if ((Get-LokalerFortschritt).Etwas) { return }
+    [void](Invoke-Git @('merge', '--ff-only', '--quiet', "origin/$($script:cfg.Branch)"))
+}
+
+# Schickt Eintraege nach, die beim letzten Mal nicht hochgeladen wurden.
+function Send-RkOffen {
+    if (-not (Test-Path -LiteralPath (Get-RkOffenPfad))) { return }
+    $r = Save-RkDaten $null
+    if (-not $r.Ok) { Write-Log ("{0}: {1}" -f (Get-RkName), $r.Text) }
+}
+
+# Wird der eigene Push abgelehnt, weil der Mitspieler inzwischen etwas in den
+# Ruebenkurs eingetragen hat, wird dessen Stand hier eingemischt (siehe
+# Invoke-GitCommitPush). Nur wenn auf dem Server ausschliesslich rueben.json
+# und README.md neu sind - alles andere (etwa eine fremde Sperre) bleibt ein
+# echter Konflikt und wird wie bisher behandelt.
+# Rueckgabe: $true, wenn eingemischt wurde (dann lohnt ein neuer Push).
+function Merge-RkVomServer {
+    $branch = $script:cfg.Branch
+    if ((Invoke-Git @('fetch', 'origin')).Code -ne 0) { return $false }
+    $oben = (Invoke-Git @('rev-parse', '--verify', "origin/$branch")).Out
+    $basis = (Invoke-Git @('merge-base', 'HEAD', "origin/$branch")).Out
+    if (-not $oben -or -not $basis -or $oben -eq $basis) { return $false }
+    $neu = @(((Invoke-Git @('diff', '--name-only', $basis, "origin/$branch")).Out -split "`r?`n") | Where-Object { $_ })
+    if (-not $neu.Count -or @($neu | Where-Object { $_ -ne 'rueben.json' -and $_ -ne 'README.md' }).Count) { return $false }
+
+    $m = Invoke-Git @('merge', '--no-ff', '--no-commit', "origin/$branch")
+    if ($m.Code -ne 0 -and -not (Invoke-Git @('rev-parse', '-q', '--verify', 'MERGE_HEAD')).Out) { return $false }
+    $daten = Merge-RkDaten (Read-RkAusGit 'HEAD') (Read-RkAusGit "origin/$branch")
+    Write-TextDatei (Get-RkPfad) ((ConvertTo-RkText $daten) + "`n")
+    $unser = Invoke-Git @('show', 'HEAD:README.md')
+    Write-TextDatei (Join-Path $script:cfg.RepoPath 'README.md') (Update-RkReadmeText $(if ($unser.Code -eq 0) { $unser.Out } else { '' }) $daten)
+    Invoke-Git @('add', '--', 'rueben.json', 'README.md') | Out-Null
+    $c = Invoke-Git @('commit', '-m', ("{0} vom Server uebernommen" -f 'Ruebenkurs'))
+    if ($c.Code -ne 0) {
+        Invoke-Git @('merge', '--abort') | Out-Null
+        return $false
+    }
+    Write-Log ("{0}: Eintraege des Mitspielers uebernommen." -f (Get-RkName))
+    return $true
+}
+
+#endregion
+
+#region Ruebenkurs: Fenster
+
+# --------------------------------------------------------------------------
+# Fenster "Ruebenkurs": Preise eintragen, Einschaetzung, Empfehlung, Gewinn
+# --------------------------------------------------------------------------
+# Eingetragenes landet zuerst in $script:rkNeu (nur die eigenen, noch nicht
+# gespeicherten Aenderungen) und geht mit "Speichern" auf den Server.
+# Angezeigt wird immer der bekannte Stand ($script:rkDaten) mit den eigenen
+# Aenderungen darueber.
+
+function Get-RkAnsicht { return (Merge-RkDaten $script:rkDaten $script:rkNeu) }
+
+# Liest eine Zahl aus einem Eingabefeld. Leer ist erlaubt (= kein Wert).
+function Read-RkEingabe {
+    param([string]$Text, [int]$Min, [int]$Max)
+    $t = $Text.Trim() -replace '[.\s]', ''
+    if ($t -eq '') { return [pscustomobject]@{ Ok = $true; Wert = $null } }
+    $n = 0
+    if ([int]::TryParse($t, [ref]$n) -and $n -ge $Min -and $n -le $Max) { return [pscustomobject]@{ Ok = $true; Wert = $n } }
+    return [pscustomobject]@{ Ok = $false; Wert = $null }
+}
+
+function Format-RkSternis {
+    param([double]$Wert, [switch]$Vorzeichen)
+    $t = ([math]::Abs($Wert)).ToString('N0', [Globalization.CultureInfo]::GetCultureInfo('de-DE'))
+    if (-not $Vorzeichen) { return $t }
+    if ($Wert -gt 0) { return "+$t" } elseif ($Wert -lt 0) { return "-$t" } else { return '0' }
+}
+
+# "eingetragen von Anna am 21.09. um 10:02"
+function Format-RkHerkunft {
+    param($Eintrag)
+    if ($null -eq $Eintrag -or $null -eq $Eintrag.wert) { return '' }
+    $wann = ''
+    try {
+        $z = [datetime]::ParseExact(([string]$Eintrag.zeit -replace ' UTC$', ''), 'yyyy-MM-dd HH:mm:ss.fff',
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]'AssumeUniversal,AdjustToUniversal')
+        $wann = $z.ToLocalTime().ToString(' \a\m dd.MM. \u\m HH:mm')
+    }
+    catch { $wann = '' }   # unlesbare Zeit - dann eben ohne
+    return ("eingetragen von {0}{1}" -f $Eintrag.von, $wann)
+}
+
+# Uebertraegt die Woche in die Eingabefelder.
+function Update-RkFelder {
+    $script:rkLaden = $true
+    try {
+        $d = Get-RkAnsicht
+        $w = Get-RkWoche $d $script:rkWoche
+        $sonntag = [datetime]::ParseExact($script:rkWoche, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $de = [Globalization.CultureInfo]::GetCultureInfo('de-DE')
+        $script:rkWocheLabel.Text = ("Woche vom {0} bis {1}" -f $sonntag.ToString('ddd dd.MM.', $de), $sonntag.AddDays(6).ToString('ddd dd.MM.yyyy', $de))
+        $jetzt = Get-RkHalbtag (Get-Date) $script:rkWoche
+
+        $script:rkSonntag.Text = "$(Get-RkWert $w.sonntag)"
+        $script:rkTipps.SetToolTip($script:rkSonntag, (Format-RkHerkunft $w.sonntag))
+        $ich = $script:cfg.PlayerName
+        $script:rkKauf.Text = if ($ich -and $w.kauf.ContainsKey($ich)) { "$(Get-RkWert $w.kauf[$ich])" } else { '' }
+        $andere = @($w.kauf.Keys | Where-Object { $_ -ne $ich } | Sort-Object | Where-Object { $null -ne (Get-RkWert $w.kauf[$_]) } |
+            ForEach-Object { "{0} {1}" -f $_, (Format-RkSternis ([int](Get-RkWert $w.kauf[$_]))) })
+        $script:rkAndere.Text = if ($andere.Count) { "Mitspieler: " + ($andere -join ', ') + ' Rueben' } else { 'Mitspieler: noch nichts eingetragen' }
+
+        $wahl = "$(Get-RkWert $w.vorwoche)"
+        $script:rkVorwoche.SelectedIndex = switch ($wahl) { 'unbekannt' { 1 } '0' { 2 } '1' { 3 } '2' { 4 } '3' { 5 } default { 0 } }
+
+        $preise = Get-RkPreise $w
+        for ($i = 0; $i -lt 12; $i++) {
+            $tb = $script:rkFelder[$i]
+            $tb.Text = if ($null -ne $preise[$i]) { "$($preise[$i])" } else { '' }
+            $tb.BackColor = if ($i -eq $jetzt) { [Drawing.Color]::FromArgb(255, 246, 190) } else { [Drawing.SystemColors]::Window }
+            $script:rkTipps.SetToolTip($tb, (Format-RkHerkunft $w.preise["$i"]))
+        }
+        # Heutigen Tag hervorheben - ueber die Farbe, nicht die Schrift:
+        # Set-UiScale hat die Schriften schon vergroessert.
+        foreach ($t in 0..5) {
+            $script:rkTagLabels[$t].ForeColor = if ([math]::Floor($jetzt / 2) -eq $t) { [Drawing.Color]::FromArgb(0, 70, 160) } else { [Drawing.SystemColors]::ControlText }
+        }
+    }
+    finally { $script:rkLaden = $false }
+    Update-RkAnzeige
+}
+
+# Rechnet neu und zeigt Muster, Spannen, Empfehlung und Gewinn.
+function Update-RkAnzeige {
+    $d = Get-RkAnsicht
+    $w = Get-RkWoche $d $script:rkWoche
+    $grund = [int](Get-RkWert $w.sonntag)
+    $preise = Get-RkPreise $w
+    $vorwissen = Get-RkVorwissen $d $script:rkWoche
+    $a = Get-RkAuswertung -Grundpreis $grund -Preise $preise -Vorher $vorwissen.Werte
+    $jetzt = Get-RkHalbtag (Get-Date) $script:rkWoche
+    $namen = Get-RkMusterNamen
+
+    for ($i = 0; $i -lt 12; $i++) {
+        $script:rkSpannen[$i].Text = if ($null -ne $preise[$i] -or -not $a.Passt) { '' }
+        elseif ($a.Min[$i] -eq $a.Max[$i]) { "$($a.Min[$i])" }
+        else { "{0} - {1}" -f $a.Min[$i], $a.Max[$i] }
+    }
+    for ($m = 0; $m -lt 4; $m++) {
+        $p = if ($a.Passt) { $a.Muster[$m] } else { 0.0 }
+        $script:rkMusterBalken[$m].Text = Format-Balken $p 1.0 12
+        $script:rkMusterProzent[$m].Text = if ($a.Passt) { "{0:P0}" -f $p } else { '-' }
+        $script:rkMusterNamen[$m].Text = $namen[$m]
+    }
+    $script:rkVorwissenLabel.Text = $vorwissen.Text
+    if ($a.Passt -and $a.Toleranz -gt 0) {
+        $script:rkVorwissenLabel.Text += (" - passt nur mit {0} Sterni(s) Abweichung" -f $a.Toleranz)
+    }
+
+    $e = Get-RkEmpfehlung $a $preise $jetzt $grund
+    $script:rkTitel.Text = $e.Titel
+    $script:rkText.Text = $e.Text
+
+    # Gewinn beim Preis von jetzt - oder beim zuletzt eingetragenen
+    $bezug = -1
+    if ($jetzt -ge 0 -and $jetzt -lt 12 -and $null -ne $preise[$jetzt]) { $bezug = $jetzt }
+    else { for ($i = [math]::Min($jetzt, 11); $i -ge 0; $i--) { if ($null -ne $preise[$i]) { $bezug = $i; break } } }
+    $kaeufe = @($w.kauf.Keys | Sort-Object | Where-Object { $v = Get-RkWert $w.kauf[$_]; $null -ne $v -and [int]$v -gt 0 })
+    if (-not $kaeufe.Count) {
+        $script:rkGewinn.Text = 'Trag ein, wie viele Rueben du gekauft hast - dann steht hier der Gewinn.'
+    }
+    elseif (-not $grund) { $script:rkGewinn.Text = 'Fuer den Gewinn fehlt noch Sigrids Preis vom Sonntag.' }
+    elseif ($bezug -lt 0) { $script:rkGewinn.Text = 'Sobald ein Preis von Nook eingetragen ist, steht hier der Gewinn.' }
+    else {
+        $summe = 0.0
+        $teile = foreach ($n in $kaeufe) {
+            $g = ([int]$preise[$bezug] - $grund) * [int](Get-RkWert $w.kauf[$n])
+            $summe += $g
+            "{0} {1}" -f $n, (Format-RkSternis $g -Vorzeichen)
+        }
+        $script:rkGewinn.Text = ("Beim Preis von {0} ({1} Sternis): {2}" -f (Get-RkHalbtagName $bezug), $preise[$bezug], ($teile -join ', ')) +
+        $(if ($kaeufe.Count -gt 1) { " - zusammen {0} Sternis" -f (Format-RkSternis $summe -Vorzeichen) } else { ' Sternis' })
+    }
+}
+
+# Ein Eingabefeld wurde geaendert: Wert merken, Anzeige etwas spaeter neu.
+function Invoke-RkEingabe {
+    param($Feld, [string]$Art, [string]$Name, [int]$Min, [int]$Max)
+    if ($script:rkLaden) { return }
+    if ($Art -eq 'kauf' -and [string]::IsNullOrWhiteSpace($Name)) {
+        $script:rkStatus.Text = "Bitte erst im Hauptfenster unter 'Dein Name' deinen Namen eintragen."
+        return
+    }
+    $r = Read-RkEingabe $Feld.Text $Min $Max
+    if (-not $r.Ok) {
+        $Feld.BackColor = [Drawing.Color]::FromArgb(255, 205, 205)
+        $script:rkStatus.Text = ("Bitte eine Zahl von {0} bis {1} eintragen." -f $Min, $Max)
+        return
+    }
+    $jetzt = Get-RkHalbtag (Get-Date) $script:rkWoche
+    $Feld.BackColor = if ($Art -eq 'preise' -and [int]$Name -eq $jetzt) { [Drawing.Color]::FromArgb(255, 246, 190) } else { [Drawing.SystemColors]::Window }
+    $w = Get-RkWoche (Get-RkAnsicht) $script:rkWoche
+    $alt = if ($Art -eq 'preise' -or $Art -eq 'kauf') { Get-RkWert $w[$Art][$Name] } else { Get-RkWert $w[$Art] }
+    if ("$alt" -eq "$($r.Wert)") { return }
+    Set-RkWert $script:rkNeu $script:rkWoche $Art $Name $r.Wert
+    $script:rkGeaendert = $true
+    $script:rkStatus.Text = 'Noch nicht gespeichert.'
+    if ($Art -eq 'sonntag' -and $null -ne $r.Wert -and ($r.Wert -lt 90 -or $r.Wert -gt 110)) {
+        $script:rkStatus.Text = 'Hinweis: Sigrid verkauft sonst fuer 90 bis 110 Sternis. Noch nicht gespeichert.'
+    }
+    $script:rkUhr.Stop(); $script:rkUhr.Start()
+}
+
+function Invoke-RkVorwoche {
+    if ($script:rkLaden) { return }
+    $wert = @('auto', 'unbekannt', '0', '1', '2', '3')[$script:rkVorwoche.SelectedIndex]
+    $alt = "$(Get-RkWert (Get-RkWoche (Get-RkAnsicht) $script:rkWoche).vorwoche)"
+    if ($alt -eq $wert -or ($alt -eq '' -and $wert -eq 'auto')) { return }
+    Set-RkWert $script:rkNeu $script:rkWoche 'vorwoche' '' $wert
+    $script:rkGeaendert = $true
+    $script:rkStatus.Text = 'Noch nicht gespeichert.'
+    Update-RkAnzeige
+}
+
+function Invoke-RkWoche {
+    param([int]$Tage)
+    $d = [datetime]::ParseExact($script:rkWoche, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $script:rkWoche = $d.AddDays($Tage).ToString('yyyy-MM-dd')
+    Update-RkFelder
+}
+
+function Invoke-RkSpeichern {
+    if (-not $script:rkGeaendert) { $script:rkStatus.Text = 'Nichts Neues zu speichern.'; return $true }
+    $script:rkStatus.Text = 'Speichere und lade hoch ...'
+    [Windows.Forms.Application]::DoEvents()
+    $r = Save-RkDaten $script:rkNeu
+    $script:rkStatus.Text = $r.Text
+    # Auch wenn es noch nicht oben ist: gemerkt ist es (rueben-offen.json).
+    $script:rkNeu = New-RkDaten
+    $script:rkGeaendert = $false
+    $script:rkDaten = Get-RkDaten
+    Update-RkFelder
+    return $r.Ok
+}
+
+function Show-Ruebenkurs {
+    if (-not (Test-Repo)) { return }
+    $name = Get-RkName
+    Write-Log ("{0}: hole den aktuellen Stand..." -f $name)
+    Send-RkOffen
+    $script:rkDaten = Get-RkDaten -Holen
+    $script:rkNeu = New-RkDaten
+    $script:rkGeaendert = $false
+    $script:rkLaden = $false
+    $script:rkWoche = Get-RkWochenKey (Get-Date)
+    Initialize-RkRechner
+
+    $dlg = New-Object Windows.Forms.Form
+    $script:rkDlg = $dlg
+    $dlg.Text = $name
+    $dlg.Size = New-Object Drawing.Size(840, 610)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    if ($script:appIcon) { $dlg.Icon = $script:appIcon }
+    $script:rkTipps = New-Object Windows.Forms.ToolTip
+    $script:rkFettSchrift = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold)
+    $grau = [Drawing.Color]::FromArgb(90, 90, 90)
+    $neu = {
+        param($typ, $text, $x, $y, $b, $h)
+        $c = New-Object "Windows.Forms.$typ"
+        $c.Text = $text
+        $c.Location = New-Object Drawing.Point($x, $y)
+        $c.Size = New-Object Drawing.Size($b, $h)
+        $dlg.Controls.Add($c)
+        return $c
+    }
+
+    # Woche waehlen und Muster der Vorwoche
+    $zurueck = & $neu 'Button' '<' 12 12 32 26
+    $script:rkWocheLabel = & $neu 'Label' '' 50 12 300 26
+    $script:rkWocheLabel.TextAlign = 'MiddleCenter'
+    $script:rkWocheLabel.Font = New-Object Drawing.Font('Segoe UI', 10, [Drawing.FontStyle]::Bold)
+    $vor = & $neu 'Button' '>' 356 12 32 26
+    $zurueck.Add_Click({ Invoke-RkWoche -7 })
+    $vor.Add_Click({ Invoke-RkWoche 7 })
+    $script:rkTipps.SetToolTip($zurueck, 'Vorige Woche')
+    $script:rkTipps.SetToolTip($vor, 'Naechste Woche')
+    [void](& $neu 'Label' 'Muster der Vorwoche:' 420 16 135 20)
+    $script:rkVorwoche = & $neu 'ComboBox' '' 558 12 250 24
+    $script:rkVorwoche.DropDownStyle = 'DropDownList'
+    [void]$script:rkVorwoche.Items.AddRange(@('automatisch erkennen', 'unbekannt') + @(Get-RkMusterNamen))
+    $script:rkVorwoche.Add_SelectedIndexChanged({ Invoke-RkVorwoche })
+    $script:rkTipps.SetToolTip($script:rkVorwoche, ("Das Muster der Vorwoche beeinflusst, welches Muster jetzt kommt.`n" +
+            "'automatisch' erkennt es aus den Preisen der Vorwoche, falls eingetragen."))
+
+    # Sigrids Preis und gekaufte Rueben
+    [void](& $neu 'Label' 'Sigrids Preis (Sonntag):' 12 54 150 20)
+    $script:rkSonntag = & $neu 'TextBox' '' 165 51 60 24
+    $script:rkSonntag.AccessibleName = 'Sigrids Preis'
+    $script:rkSonntag.Add_TextChanged({ Invoke-RkEingabe $script:rkSonntag 'sonntag' '' 1 999 })
+    [void](& $neu 'Label' 'Deine Rueben:' 250 54 90 20)
+    $script:rkKauf = & $neu 'TextBox' '' 340 51 70 24
+    $script:rkKauf.AccessibleName = 'Deine Rueben'
+    $script:rkKauf.Add_TextChanged({ Invoke-RkEingabe $script:rkKauf 'kauf' $script:cfg.PlayerName 0 99999 })
+    $script:rkTipps.SetToolTip($script:rkKauf, 'Wie viele Rueben du bei Sigrid gekauft hast (fuer den Gewinn).')
+    $script:rkAndere = & $neu 'Label' '' 420 54 390 20
+    $script:rkAndere.ForeColor = $grau
+
+    # Tabelle Mo-Sa
+    $kopf1 = & $neu 'Label' 'vormittags' 105 88 175 20
+    $kopf2 = & $neu 'Label' 'nachmittags' 290 88 175 20
+    foreach ($k in $kopf1, $kopf2) { $k.Font = $script:rkFettSchrift }
+    $tage = @('Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag')
+    $script:rkFelder = @($null) * 12
+    $script:rkSpannen = @($null) * 12
+    $script:rkTagLabels = @($null) * 6
+    for ($t = 0; $t -lt 6; $t++) {
+        $y = 112 + $t * 30
+        $script:rkTagLabels[$t] = & $neu 'Label' $tage[$t] 12 ($y + 3) 90 20
+        foreach ($h in 0, 1) {
+            $i = $t * 2 + $h
+            $x = if ($h) { 290 } else { 105 }
+            $tb = & $neu 'TextBox' '' $x $y 60 24
+            $tb.AccessibleName = ("Preis {0}" -f (Get-RkHalbtagName $i))
+            $tb.Tag = $i
+            $tb.Add_TextChanged({ Invoke-RkEingabe $args[0] 'preise' ([string]$args[0].Tag) 1 999 })
+            $script:rkFelder[$i] = $tb
+            $sp = & $neu 'Label' '' ($x + 64) ($y + 3) 110 20
+            $sp.ForeColor = $grau
+            $script:rkSpannen[$i] = $sp
+        }
+    }
+    $script:rkTipps.SetToolTip($kopf1, "Grau neben leeren Feldern: welche Preise dort noch moeglich sind.")
+
+    # Einschaetzung
+    $ueber = & $neu 'Label' 'Einschaetzung' 490 88 300 20
+    $ueber.Font = $script:rkFettSchrift
+    $script:rkMusterNamen = @($null) * 4
+    $script:rkMusterBalken = @($null) * 4
+    $script:rkMusterProzent = @($null) * 4
+    for ($m = 0; $m -lt 4; $m++) {
+        $y = 115 + $m * 28
+        $script:rkMusterNamen[$m] = & $neu 'Label' '' 490 $y 110 20
+        $script:rkMusterBalken[$m] = & $neu 'Label' '' 602 $y 140 20
+        $script:rkMusterProzent[$m] = & $neu 'Label' '' 745 $y 60 20
+        $script:rkMusterProzent[$m].TextAlign = 'TopRight'
+    }
+    $script:rkVorwissenLabel = & $neu 'Label' '' 490 232 320 40
+    $script:rkVorwissenLabel.ForeColor = $grau
+
+    # Empfehlung und Gewinn
+    $script:rkTitel = & $neu 'Label' '' 12 300 796 28
+    $script:rkTitel.Font = New-Object Drawing.Font('Segoe UI', 12, [Drawing.FontStyle]::Bold)
+    $script:rkText = & $neu 'Label' '' 12 330 796 62
+    $script:rkGewinn = & $neu 'Label' '' 12 396 796 40
+    $script:rkGewinn.Font = $script:rkFettSchrift
+    $hinweis = & $neu 'Label' ("Einschaetzung nach den bekannten Regeln aus New Leaf und New Horizons - fuer Let's Go to the City " +
+        "nicht offiziell bestaetigt. Passen eure Preise zu keinem Muster, steht das oben.") 12 444 796 36
+    $hinweis.ForeColor = $grau
+
+    $script:rkStatus = & $neu 'Label' '' 12 524 520 20
+    $script:rkStatus.ForeColor = $grau
+    $speichern = & $neu 'Button' 'Speichern' 556 518 120 30
+    $zu = & $neu 'Button' 'Schliessen' 688 518 120 30
+    $speichern.Add_Click({ [void](Invoke-RkSpeichern) })
+    $zu.Add_Click({ $script:rkDlg.Close() })
+    $script:rkTipps.SetToolTip($speichern, "Speichert die Eintraege im gemeinsamen Ordner und laedt sie hoch -`nauch waehrend der andere spielt.")
+    $dlg.CancelButton = $zu
+
+    # Anzeige erst kurz nach dem Tippen neu berechnen
+    $script:rkUhr = New-Object Windows.Forms.Timer
+    $script:rkUhr.Interval = 400
+    $script:rkUhr.Add_Tick({ $script:rkUhr.Stop(); Update-RkAnzeige })
+
+    $dlg.Add_FormClosing({
+            $e = $args[1]
+            if (-not $script:rkGeaendert) { return }
+            $r = [Windows.Forms.MessageBox]::Show("Die neuen Eintraege sind noch nicht gespeichert.`n`nJetzt speichern und hochladen?",
+                (Get-RkName), 'YesNoCancel', 'Question')
+            if ($r -eq 'Cancel') { $e.Cancel = $true; return }
+            if ($r -eq 'Yes') { [void](Invoke-RkSpeichern) }
+        })
+
+    Update-RkFelder
+    Set-UiScale $dlg
+    [void]$dlg.ShowDialog()
+    $script:rkUhr.Stop()
+    $script:rkUhr.Dispose()
+    $script:rkTipps.Dispose()
 }
 
 #endregion
@@ -4894,18 +6064,22 @@ $script:btnStop = New-Button "Spielen beenden" 319 $y 289 34
 $script:btnStop.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
 $script:btnStop.Enabled = $false          # erst waehrend einer Sitzung nutzbar
 
-# zweite Reihe: alles, was man seltener braucht
+# zweite und dritte Reihe: alles, was man seltener braucht - vier Spalten,
+# der Notausgang "Sperre erzwingen freigeben" nimmt zwei davon ein
 $y += 42
-$btnRefresh = New-Button "Status pruefen" 15 $y 186 34
-$btnSelfTest = New-Button "Selbsttest" 209 $y 186 34
-$btnFotos = New-Button "Fotos ansehen" 403 $y 205 34
+$btnRefresh = New-Button "Status pruefen" 15 $y 142 34
+$btnSelfTest = New-Button "Selbsttest" 165 $y 142 34
+$btnFotos = New-Button "Fotos ansehen" 315 $y 142 34
+$btnZeit = New-Button "Spielzeit" 465 $y 143 34
 
-# dritte Reihe: was man seltener braucht
 $y += 42
-$btnZeit = New-Button "Spielzeit" 15 $y 186 34
-$btnStaende = New-Button "Frueherer Spielstand" 209 $y 186 34
-$btnUnlock = New-Button "Sperre erzwingen freigeben" 403 $y 205 34
+$btnRueben = New-Button (Get-RkName) 15 $y 142 34
+$btnStaende = New-Button "Frueherer Spielstand" 165 $y 142 34
+$btnUnlock = New-Button "Sperre erzwingen freigeben" 315 $y 293 34
 Set-Tip ("Wer hat wie lange gespielt, wie viele Sitzungen und wann zuletzt.") $btnZeit
+Set-Tip ("Rueben-Preise der Woche eintragen - gemeinsam mit deinem Mitspieler.`n" +
+    "Zeigt, welches Kursmuster wahrscheinlich laeuft, welche Preise noch`n" +
+    "moeglich sind, ob du verkaufen oder warten solltest und euren Gewinn.") $btnRueben
 Set-Tip ("Holt einen frueheren Spielstand zurueck - Git hat bei jedem`n" +
     "Herzschlag einen vollstaendigen Stand gespeichert.`n" +
     "Der jetzige Stand geht dabei nicht verloren.`n" +
@@ -5103,6 +6277,7 @@ $btnRefresh.Add_Click({ Update-Status })
 $btnSelfTest.Add_Click({ Show-SelfTest })
 $btnFotos.Add_Click({ Show-Fotos })
 $btnZeit.Add_Click({ Show-Spielzeit })
+$btnRueben.Add_Click({ Show-Ruebenkurs })
 $btnStaende.Add_Click({ Show-FruehereStaende })
 $btnUnlock.Add_Click({ Unlock-Session })
 $btnSetup.Add_Click({ Show-SetupDialog })

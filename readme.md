@@ -25,6 +25,7 @@ die Spielzeiten jedes Spielers in die Repo-README.
 - [Die Sperre (kein dauerhaftes Aussperren möglich)](#die-sperre)
 - [Spielstände: Was wird kopiert?](#spielstände-was-wird-kopiert)
 - [Spielzeit-Statistik](#spielzeit-statistik)
+- [Rübenkurs](#rübenkurs)
 - [Wo liegt die Konfiguration?](#wo-liegt-die-konfiguration)
 - [Fehlerbehebung](#fehlerbehebung)
 - [Grenzen & Hinweise](#grenzen--hinweise)
@@ -210,6 +211,7 @@ wird bewusst nicht beanstandet – bei GameCube-Spielen liegen dort die Memory-C
 | **Status prüfen**              | Aktualisiert die Anzeige: frei, du spielst, jemand anderes spielt, oder abgelaufene Sperre. Läuft beim Programmstart automatisch einmal. |
 | **Fotos ansehen**              | Zeigt die Bilder aus dem gemeinsamen Ordner direkt im Programm – neueste zuerst, mit Name und Aufnahmezeit. Blättern per Knopf oder Pfeiltasten, dazu Diashow, Speichern und Löschen. |
 | **Spielzeit**                  | Wer hat wie lange gespielt – gesamt, Woche für Woche und die Rekorde (längste Sitzung, Spieltage am Stück). Mehr dazu unter [Spielzeit-Statistik](#spielzeit-statistik). |
+| **Rübenkurs**                  | Rübenpreise der Woche gemeinsam eintragen. Zeigt, welches Kursmuster wahrscheinlich läuft, welche Preise noch möglich sind, ob ihr verkaufen oder warten solltet, und euren Gewinn. Mehr dazu unter [Rübenkurs](#rübenkurs). |
 | **Früherer Spielstand**        | Holt einen älteren Spielstand zurück. Der jetzige bleibt dabei erhalten. Die Rettung, wenn im Spiel etwas schiefgegangen ist. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
@@ -387,6 +389,51 @@ Sitzung lief (auch über Mitternacht hinweg).
 
 ---
 
+## Rübenkurs
+
+Sonntags bis 12 Uhr verkauft Sigrid Rüben für 90 bis 110 Sternis. Von Montag bis Samstag kauft
+Nook sie zurück – mit einem Preis vormittags und einem ab 12 Uhr. Am Sonntag darauf sind nicht
+verkaufte Rüben verfault. Der Knopf **„Rübenkurs“** hilft, den besten Moment zu erwischen.
+
+**Eintragen – jederzeit, auch während der andere spielt:**
+
+- Sigrids Preis vom Sonntag, wie viele Rüben du gekauft hast und die Preise, die Nook zahlt. Es
+  muss nicht alles ausgefüllt sein; jeder Preis macht die Einschätzung genauer.
+- Ihr spielt dieselbe Stadt, also gilt für euch beide derselbe Kurs. Was einer einträgt, sieht
+  der andere – auch Tippfehler des anderen dürfen korrigiert werden. Fährst du mit der Maus über
+  ein Feld, steht dort, wer den Wert eingetragen hat.
+- **„Speichern“** lädt die Einträge sofort hoch. Dabei landen nur die Rübenpreise auf dem
+  Server; Sperre und Spielstand bleiben unberührt. Tragt ihr gleichzeitig etwas ein, werden
+  beide Stände zusammengeführt – pro Feld zählt der neuere Eintrag.
+- Ohne Internet bleiben die Einträge auf deinem PC und werden beim nächsten Mal (Rübenkurs
+  öffnen oder „Status prüfen“) nachgeschickt.
+- Mit **„<“** und **„>“** blätterst du zu früheren Wochen.
+
+**Was das Fenster zeigt:**
+
+- **Einschätzung:** wie wahrscheinlich jedes der vier Kursmuster ist – *Schwankend*,
+  *Große Spitze* (bis zum Sechsfachen des Kaufpreises), *Fallend* und *Kleine Spitze*. Welches
+  Muster kommt, hängt auch vom Muster der Vorwoche ab. Das Programm erkennt es aus den Preisen
+  der Vorwoche; du kannst es aber auch von Hand wählen.
+- **Spannen:** grau neben jedem leeren Feld, welche Preise dort noch möglich sind.
+- **Empfehlung:** zum Beispiel „Jetzt verkaufen“, „Warten“ (mit der Wahrscheinlichkeit für
+  einen höheren Preis und bis zu welchem Betrag) oder den Hinweis, wann eine große Spitze
+  noch kommen kann.
+- **Gewinn:** beim aktuellen Preis für jeden Spieler, der seine Rüben eingetragen hat, und
+  zusammen.
+
+Die laufende Woche erscheint außerdem in der **README des Repos** – so seht ihr den Kurs
+auch auf GitHub.
+
+> **Wie sicher ist das?** Die Regeln der vier Muster stammen aus dem ausgelesenen Code von
+> *Animal Crossing: New Horizons*. Alles, was über *Let's Go to the City* bekannt ist, passt dazu
+> (Kaufpreis 90–110, zwei Preise am Tag, vier Muster, höchstens 660 Sternis), und für *New Leaf*,
+> das laut Community dieselbe Rübenlogik nutzt, passen aufgezeichnete Wochen. Offiziell
+> bestätigt ist das für *Let's Go to the City* aber nicht. Passen eure Preise zu keinem Muster,
+> sagt das Fenster das deutlich (meist ist es ein Tippfehler).
+
+---
+
 ## Wo liegt die Konfiguration?
 
 Deine Einstellungen werden in
@@ -457,10 +504,13 @@ powershell -ExecutionPolicy Bypass -File .\tests\Test-Oberflaeche.ps1   # echtes
   auf typische Fehler. Die Regeln stehen in `PSScriptAnalyzerSettings.psd1`; fehlt das Modul,
   wird es für den aktuellen Benutzer installiert.
 - **Start-Tests.ps1** prüft die Funktionen einzeln: Sperre, Spielstand, Ende-Erkennung, Pfade,
-  Umlaute, Hintergrund-Aufrufe, Spielzeit-Statistik, Update-Installation, Fotos und Selbsttest.
+  Umlaute, Hintergrund-Aufrufe, Spielzeit-Statistik, Rübenkurs, Update-Installation, Fotos und
+  Selbsttest. Für den Rübenkurs werden tausende Wochen nach den Regeln der vier Muster
+  ausgewürfelt; die Einschätzung muss dabei immer das wahre Muster enthalten und die echten
+  Preise immer in der angezeigten Spanne haben.
   Mit `-Filter Update` laufen nur die Tests aus `Update.Tests.ps1`.
 - **Test-Oberflaeche.ps1** startet das echte Programm, klickt „Spielen starten", spielt eine
-  Sitzung mit einem Ersatz-Dolphin durch und öffnet die Spielzeit. Der Test-Server ist dabei
+  Sitzung mit einem Ersatz-Dolphin durch, öffnet die Spielzeit und trägt im Rübenkurs Preise ein. Der Test-Server ist dabei
   absichtlich langsam, damit geprüft werden kann, dass das Fenster währenddessen reagiert. Von
   jedem Schritt entsteht ein Bildschirmfoto.
 
