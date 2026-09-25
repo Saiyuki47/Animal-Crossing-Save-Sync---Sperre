@@ -155,7 +155,7 @@ catch { Write-Verbose "Konsole laesst sich nicht auf UTF-8 umstellen - es bleibt
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.18'
+$script:Version = '1.19'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
