@@ -177,7 +177,7 @@ Unter **„Erweitert…"** liegen die selten gebrauchten Werte:
 | **Bilder-Ordner**     | Screenshots/Fotos, die nach dem Spielen ins Repo verschoben werden. Leer = aus.                |
 | **Branch**            | Git-Branch, meist `main`.                                                                      |
 | **Sperre gilt (Min)** | Nach so vielen Minuten ohne Herzschlag gilt eine Sperre als abgelaufen (Standard 5).           |
-| **Herzschlag (Sek)**  | Abstand, in dem während des Spielens gesichert und die Sperre aufgefrischt wird (Standard 60). |
+| **Herzschlag (Sek)**  | Abstand, in dem während des Spielens gesichert und die Sperre aufgefrischt wird (Standard 60). Höchstens ein Drittel von „Sperre gilt" – ein längerer Wert wird automatisch begrenzt. |
 
 **Zum Feld „Spiel":** Das Skript erkennt automatisch, was du angibst:
 - eine **Spiel-/Preset-Datei** (`.iso`, `.wbfs`, `.rvz`, `.gcm`, `.ciso`, `.json`) →
@@ -195,7 +195,10 @@ Spiels** enthält – bei Dolphin typischerweise:
 
 Am besten den Ordner **eine Ebene über `data`** wählen (also den, in dem `data` und `content`
 nebeneinander liegen), dann ist garantiert alles dabei. **Nicht** den kompletten Wii-NAND
-angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert.
+angeben – sonst würden auch die Spielstände anderer Spiele mitsynchronisiert. Sieht der
+eingetragene Ordner danach aus (z. B. `Wii`, `title`, `00010000` oder ein Ordner mit mehreren
+Spielen darin), warnt das Programm vor dem Hochladen und im **Selbsttest**. Der Ordner `GC`
+wird bewusst nicht beanstandet – bei GameCube-Spielen liegen dort die Memory-Card-Dateien.
 
 ### Knöpfe
 
@@ -308,7 +311,11 @@ deinem Namen und **zwei** Zeitstempeln:
 
 - **Automatischer Ablauf:** Der Zeitstempel wird während des Spielens per Herzschlag
   aufgefrischt. Stürzt der PC ab, stoppt der Herzschlag – und nach „Sperre gilt (Min)" gilt die
-  Sperre als tot und wird beim nächsten Start automatisch übernommen.
+  Sperre als tot. Wer danach auf „Spielen starten" klickt, wird gefragt, ob er sie übernehmen
+  will – „abgelaufen" kann auch nur ein kurzer Netzausfall beim anderen sein.
+- **Uhrzeit:** Ob eine Sperre abgelaufen ist, hängt an den Uhren beider PCs. Das Programm
+  vergleicht beim Start die eigene Uhr mit GitHub und warnt, wenn sie spürbar falsch geht
+  (ebenso im **Selbsttest**).
 - **Aufräumen beim Beenden:** Schließt sich Dolphin normal, wird die Sperre sofort freigegeben.
 - **Notausgang:** Der Knopf **„Sperre erzwingen freigeben"** entfernt sie von Hand.
 
@@ -401,7 +408,7 @@ speichere im Spiel und schau, in welchem Ordner sich die Dateien geändert haben
 - Das Tool ist für **abwechselndes** Spielen gedacht (einer nach dem anderen), nicht für
   gleichzeitiges Spielen im selben Stand.
 - Der Herzschlag erzeugt regelmäßig kleine Git-Commits. Stört dich das, stelle „Herzschlag"
-  höher (z. B. 120 Sek) und „Sperre gilt" entsprechend auf 5–6 Minuten.
+  höher (z. B. 120 Sek) und „Sperre gilt" auf mindestens das Dreifache (hier 6 Minuten).
 - Startet ihr Dolphin über einen Starter (`.bat`, Mod-Launcher, Verknüpfung darauf), der sich
   selbst gleich wieder beendet, beobachtet das Programm danach das laufende Dolphin. Die Sitzung
   endet erst, wenn einige Sekunden lang kein Dolphin mehr läuft. Nebenwirkung: Ist nebenher noch

@@ -576,6 +576,19 @@ function Import-Config {
     }
 }
 
+# Herzschlag, mit dem wirklich gearbeitet wird.
+# Der Herzschlag muss DEUTLICH kuerzer sein als "Sperre gilt": Sonst gilt die
+# Sperre zwischen zwei Herzschlaegen als abgelaufen, und der Mitspieler darf
+# sie uebernehmen, obwohl gespielt wird. Ein Drittel laesst Luft fuer einen
+# verpassten Herzschlag und langsames Hochladen.
+# Der eingetragene Wert bleibt dabei unangetastet - er wird nur nach oben
+# begrenzt, damit ein Tippfehler oder eine spaeter verkuerzte Sperrdauer
+# nicht unbemerkt die Sperre aushebelt.
+function Get-HerzschlagSek {
+    $grenze = [math]::Max(10, [math]::Floor([double]$script:cfg.LeaseMinutes * 60 / 3))
+    return [math]::Min([double]$script:cfg.HeartbeatSeconds, $grenze)
+}
+
 function Save-ConfigFromUI {
     $script:cfg.DolphinPath = $script:txtDolphin.Text
     $script:cfg.RepoPath = $script:txtRepo.Text
@@ -954,6 +967,50 @@ function Find-DolphinSaveFolder {
     return ""
 }
 
+# Zeigt der Save-Ordner auf einen Sammelordner, in dem die Spielstaende
+# MEHRERER Spiele liegen (oder gleich der ganze Wii-Speicher)? Dann wuerde
+# alles davon hochgeladen und beim Mitspieler ueberschrieben - auch Spiele,
+# die mit Animal Crossing nichts zu tun haben.
+# Rueckgabe: Begruendung als Text, oder "" wenn der Ordner passt.
+# Bewusst NICHT gemeldet wird der Ordner "GC": Bei GameCube-Spielen liegen dort
+# die Memory-Card-Dateien, und ihn zu synchronisieren kann gewollt sein.
+function Test-Sammelordner {
+    param([string]$Pfad)
+    if ([string]::IsNullOrWhiteSpace($Pfad) -or -not (Test-Path -LiteralPath $Pfad)) { return "" }
+    $name = Split-Path -Leaf $Pfad.TrimEnd('\', '/')
+    if (@('Wii', 'title', '00010000', '00010001', 'Dolphin Emulator', 'User') -contains $name) {
+        return "Der Ordner '$name' enthaelt die Spielstaende aller Spiele, nicht nur eines."
+    }
+    $unter = @(Get-ChildItem -LiteralPath $Pfad -Directory -Force -ErrorAction SilentlyContinue)
+    $namen = @($unter | ForEach-Object { $_.Name })
+    foreach ($n in @('title', 'shared2', 'Wii')) {
+        if ($namen -contains $n) { return "Darin liegt ein Ordner '$n' - das ist der Speicher fuer alle Spiele." }
+    }
+    $spiele = @($namen | Where-Object { $_ -match '^[0-9a-fA-F]{8}$' })
+    if ($spiele.Count -gt 1) {
+        return ("Darin liegen die Ordner von {0} Spielen ({1})." -f $spiele.Count, (($spiele | Select-Object -First 4) -join ', '))
+    }
+    return ""
+}
+
+# Fragt nach, bevor ein Sammelordner hochgeladen wird. Rueckgabe: $true =
+# weitermachen (Ordner passt oder Nutzer will es so).
+function Confirm-SaveOrdner {
+    param([string]$Anlass)
+    $grund = Test-Sammelordner $script:cfg.SaveFolder
+    if (-not $grund) { return $true }
+    Write-Log ("WARNUNG: Der Save-Ordner sieht nach einem Sammelordner aus: {0}" -f $grund)
+    $r = [Windows.Forms.MessageBox]::Show(
+        (("Der eingetragene Save-Ordner umfasst wahrscheinlich mehr als nur Animal Crossing:`n`n" +
+        "{0}`n`n{1}`n`n" +
+        "Dann wuerden die Spielstaende ALLER dieser Spiele hochgeladen - und beim Mitspieler " +
+        "ueberschrieben. Richtig ist der Ordner genau eines Spiels, bei Animal Crossing " +
+        "z. B. ...\Wii\title\00010000\52555550.`n`n" +
+        "{2} trotzdem fortsetzen?") -f $script:cfg.SaveFolder, $grund, $Anlass),
+        "Save-Ordner pruefen", 'YesNo', 'Warning', 'Button2')
+    return ($r -eq 'Yes')
+}
+
 # Fuellt leere oder ins Leere zeigende Pfade mit dem, was gefunden wurde.
 # Aendert NIE etwas, das der Nutzer selbst eingetragen hat und das existiert.
 function Set-AutoPaths {
@@ -968,7 +1025,12 @@ function Set-AutoPaths {
     if ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder) -or
         -not (Test-Path -LiteralPath $script:cfg.SaveFolder)) {
         $s = Find-DolphinSaveFolder $script:cfg.DolphinPath
-        if ($s) { $script:cfg.SaveFolder = $s; $gefunden += "Save-Ordner (Vorschlag): $s" }
+        if ($s) {
+            $script:cfg.SaveFolder = $s; $gefunden += "Save-Ordner (Vorschlag): $s"
+            if (Test-Sammelordner $s) {
+                $gefunden += "  ACHTUNG: Das ist ein Sammelordner fuer mehrere Spiele - bitte den Ordner genau dieses Spiels waehlen."
+            }
+        }
     }
 
     foreach ($g in $gefunden) { Write-Log ("Automatisch gefunden - {0}" -f $g) }
@@ -1416,8 +1478,8 @@ function Test-FremdeSperre {
     if (-not $lock) { $lock = Get-LockState }
     if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
         [void][Windows.Forms.MessageBox]::Show(
-            ("{0} spielt gerade.`n`nSolange darf nichts anderes hochgeladen werden - sonst kommt sein " +
-            "Spielstand nicht mehr beim Server an. Bitte warten, bis er fertig ist." -f $lock.Owner),
+            (("{0} spielt gerade.`n`nSolange darf nichts anderes hochgeladen werden - sonst kommt sein " +
+            "Spielstand nicht mehr beim Server an. Bitte warten, bis er fertig ist.") -f $lock.Owner),
             $Titel, 'OK', 'Warning')
         Write-Log ("Abgebrochen: {0} spielt gerade." -f $lock.Owner)
         return $true
@@ -1470,6 +1532,7 @@ function Start-Play {
         return
     }
     if (-not (Test-Repo)) { return }
+    if (-not (Confirm-SaveOrdner "Spielen")) { Write-Log "Nicht gestartet - bitte den Save-Ordner pruefen."; return }
 
     Write-Log "Synchronisiere mit dem Remote-Repo..."
     Sync-Remote
@@ -1481,8 +1544,25 @@ function Start-Play {
         return
     }
     if ($lock.State -eq 'locked' -and $lock.Stale) {
+        # Nicht still uebernehmen: "abgelaufen" heisst nur, dass eine Weile kein
+        # Herzschlag ankam. Das kann auch ein kurzer Netzausfall beim anderen
+        # sein - oder eine falsch gehende Uhr. Wer nachfragt, verhindert, dass
+        # zwei gleichzeitig spielen und einer seinen Fortschritt verliert.
+        $r = [Windows.Forms.MessageBox]::Show(
+            (("Die Sperre von {0} ist abgelaufen - seit {1} kam kein Lebenszeichen mehr.`n`n" +
+            "Meist ist das Spiel bei {0} abgestuerzt oder das Programm wurde geschlossen. " +
+            "Spielt {0} aber doch noch (z. B. ohne Internet), verliert einer von euch " +
+            "seinen Fortschritt.`n`n" +
+            "Sperre uebernehmen und spielen?") -f $lock.Owner, (Format-Minuten $lock.AgeMinutes)),
+            "Abgelaufene Sperre", 'YesNo', 'Question')
+        if ($r -ne 'Yes') { Write-Log "Nicht uebernommen."; return }
         Write-Log ("Alte Sperre von {0} ist abgelaufen -> ich uebernehme." -f $lock.Owner)
     }
+
+    # Stand VOR dem Sperr-Commit merken. Wird der Push abgelehnt, muss genau
+    # dieser Commit wieder weg - aber nichts, was schon vorher hier lag.
+    $basis = (Invoke-Git @('rev-parse', 'HEAD')).Text.Trim()
+    $vorher = Get-LokalerFortschritt
 
     # Sperre sichern (mit Wettlauf-Schutz: wer zuerst pusht, gewinnt)
     $acquired = $false
@@ -1502,7 +1582,27 @@ function Start-Play {
         }
 
         Write-Log "Push abgelehnt (Versuch $i) - jemand war evtl. schneller. Pruefe erneut..."
-        Sync-Remote
+        # Frueher kam hier die Frage "Fortschritt verwerfen?" - obwohl der
+        # einzige "Fortschritt" die eigene, gerade abgelehnte Sperre war.
+        if ($vorher.Etwas -or -not $basis) {
+            # Hier lag schon vorher Ungesichertes: nur den Sperr-Commit
+            # zuruecknehmen (Dateien bleiben) und wie gewohnt nachfragen.
+            if ($basis) { Invoke-Git @('reset', '--mixed', $basis) | Out-Null }
+            Sync-Remote
+        }
+        else {
+            # Sonst gehoert alles Lokale zur abgelehnten Sperre und darf ohne
+            # Rueckfrage dem Server-Stand weichen.
+            $f = Invoke-Git @('fetch', 'origin')
+            if ($f.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht geholt werden." $f }
+            $r = Invoke-Git @('reset', '--hard', "origin/$($script:cfg.Branch)")
+            if ($r.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht uebernommen werden." $r }
+        }
+        # Ausgangsstand fuer den naechsten Versuch neu bestimmen - der Abgleich
+        # kann HEAD verschoben haben (sonst ginge es beim naechsten Zuruecknehmen
+        # auf einen veralteten Stand zurueck).
+        $basis = (Invoke-Git @('rev-parse', 'HEAD')).Text.Trim()
+        $vorher = Get-LokalerFortschritt
         $lock = Get-LockState
         if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
             Update-StatusUI $lock
@@ -1745,7 +1845,7 @@ function Invoke-Tick {
     if ($null -ne $script:endeSeit) { return }
     # Nach verlorener Sperre gibt es nichts mehr hochzuladen.
     if ($script:sperreVerloren) { return }
-    if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge $script:cfg.HeartbeatSeconds) {
+    if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge (Get-HerzschlagSek)) {
         Set-LockFile
         # Scheitert das Sichern, setzt Backup-Saves save/ selbst zurueck - der
         # Herzschlag laeuft trotzdem weiter, damit die Sperre frisch bleibt.
@@ -2165,10 +2265,10 @@ function Invoke-StandZurueck {
     $s = $script:standDaten[$i]
 
     $r = [Windows.Forms.MessageBox]::Show(
-        ("Den Spielstand vom {0} zurueckholen?`n`n" +
+        (("Den Spielstand vom {0} zurueckholen?`n`n" +
         "Der jetzige Stand geht dabei NICHT verloren - er bleibt in der Liste " +
         "und laesst sich genauso zurueckholen.`n`n" +
-        "Achtung: Dein Mitspieler bekommt den alten Stand beim naechsten Mal ebenfalls." -f $s.Datum),
+        "Achtung: Dein Mitspieler bekommt den alten Stand beim naechsten Mal ebenfalls.") -f $s.Datum),
         "Frueheren Stand zurueckholen", 'YesNo', 'Warning')
     if ($r -ne 'Yes') { return }
 
@@ -2373,8 +2473,8 @@ function Invoke-FotoLoeschen {
     if ($script:fotoShow.Enabled) { Invoke-FotoDiashow }      # Diashow anhalten
     $d = $script:fotoListe[$script:fotoIndex]
     $r = [Windows.Forms.MessageBox]::Show(
-        ("Dieses Foto loeschen?`n`n{0}`n`nEs liegt im gemeinsamen Ordner - es verschwindet damit " +
-        "auch bei deinem Mitspieler." -f $d.Name),
+        (("Dieses Foto loeschen?`n`n{0}`n`nEs liegt im gemeinsamen Ordner - es verschwindet damit " +
+        "auch bei deinem Mitspieler.") -f $d.Name),
         "Foto loeschen", 'YesNo', 'Warning')
     if ($r -ne 'Yes') { return }
 
@@ -2606,6 +2706,11 @@ function Test-Setup {
     elseif (-not (Test-Path -LiteralPath $script:cfg.SaveFolder)) {
         $e += Neu "Save-Ordner" $false ("'" + $script:cfg.SaveFolder + "' gibt es nicht. Oben ueber '...' den Ordner auswaehlen, in dem Dolphin die Spielstaende ablegt.") ""
     }
+    elseif (Test-Sammelordner $script:cfg.SaveFolder) {
+        $e += Neu "Save-Ordner" $false ((Test-Sammelordner $script:cfg.SaveFolder) +
+            " Dann werden die Spielstaende ALLER Spiele darin ausgetauscht und beim Mitspieler ueberschrieben. " +
+            "Oben ueber '...' den Ordner genau dieses Spiels waehlen, bei Animal Crossing z. B. ...\Wii\title\00010000\52555550.") ""
+    }
     else {
         $e += Neu "Save-Ordner" $true $script:cfg.SaveFolder
     }
@@ -2650,6 +2755,19 @@ function Test-Setup {
     else {
         $e += Neu "Branch vorhanden" $false ("Auf dem Server gibt es keinen Branch '" + $script:cfg.Branch +
             "'. Pruefen, ob beide Spieler denselben Branch eingetragen haben (meist 'main').") $ls.Text
+    }
+
+    # 9) Uhrzeit - davon haengt ab, ob Sperren richtig als abgelaufen gelten
+    $abw = Get-UhrAbweichung
+    if ($null -eq $abw) {
+        $e += Neu "Uhrzeit" $true "Konnte nicht verglichen werden (GitHub nicht erreichbar) - uebersprungen."
+    }
+    elseif ([math]::Abs($abw) -ge 60) {
+        $e += Neu "Uhrzeit" $false (("Die Uhr dieses PCs geht etwa {0} {1}. Dann werden Sperren falsch als abgelaufen " +
+            "erkannt. Windows-Einstellungen > Zeit und Sprache > 'Jetzt synchronisieren'.") -f (Format-Minuten ([math]::Abs($abw) / 60)), $(if ($abw -gt 0) { "vor" } else { "nach" })) ""
+    }
+    else {
+        $e += Neu "Uhrzeit" $true ("Stimmt (Abweichung {0:N0} s)." -f $abw)
     }
 
     return $e
@@ -2877,6 +2995,18 @@ function Show-AdvancedDialog {
         $script:txtHeart.Text = $tHeart.Text
         Save-ConfigFromUI
         Write-Log "Erweiterte Einstellungen uebernommen."
+        $wirksam = Get-HerzschlagSek
+        if ($wirksam -lt $script:cfg.HeartbeatSeconds) {
+            Write-Log ("Hinweis: Herzschlag {0} s ist zu lang fuer 'Sperre gilt' {1} Min - es wird alle {2} s gesendet." -f
+                $script:cfg.HeartbeatSeconds, $script:cfg.LeaseMinutes, $wirksam)
+            [void][Windows.Forms.MessageBox]::Show(
+                (("Der Herzschlag ({0} s) ist zu lang fuer 'Sperre gilt' ({1} Min).`n`n" +
+                "Die Sperre wuerde zwischen zwei Herzschlaegen ablaufen, und dein Mitspieler " +
+                "koennte sie uebernehmen, waehrend du spielst.`n`n" +
+                "Es wird deshalb alle {2} s gesendet (hoechstens ein Drittel der Sperrdauer). " +
+                "Fuer seltenere Herzschlaege 'Sperre gilt' erhoehen.") -f $script:cfg.HeartbeatSeconds, $script:cfg.LeaseMinutes, $wirksam),
+                "Herzschlag begrenzt", 'OK', 'Information')
+        }
     }
 }
 
@@ -2895,6 +3025,53 @@ function Show-AdvancedDialog {
 # Fragt GitHub nach dem neuesten Release. Rueckgabe: Objekt mit Version,
 # Beschreibung und Dateiliste - oder $null, wenn es nicht klappt (kein
 # Internet, GitHub gerade nicht erreichbar, Zaehlgrenze erreicht).
+# Wie weit geht die Uhr dieses PCs falsch? Ob eine Sperre abgelaufen ist,
+# wird aus dem Zeitstempel des Spielenden und der EIGENEN Uhr berechnet.
+# Geht eine der beiden Uhren um Minuten falsch, gilt eine frische Sperre als
+# abgelaufen (dann kann der andere mitten in eine Sitzung hinein starten) -
+# oder eine tote als frisch. Verglichen wird mit der Uhr von GitHub.
+# Rueckgabe: Abweichung in Sekunden (positiv = PC geht vor), oder $null.
+function Get-UhrAbweichung {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $vorher = [datetime]::UtcNow
+        # Bewusst GET statt HEAD: manche Proxys lehnen HEAD ab. Die Antwort ist klein.
+        $r = Invoke-WebRequest -Uri 'https://api.github.com' -UseBasicParsing -TimeoutSec 10 `
+            -Headers @{ 'User-Agent' = 'AC-SaveSync' }
+        $nachher = [datetime]::UtcNow
+        $d = [datetimeoffset]::MinValue
+        $ok = [datetimeoffset]::TryParse("$($r.Headers['Date'])",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$d)
+        if (-not $ok) { return $null }
+        # Mitte zwischen Anfrage und Antwort - gleicht die Laufzeit aus.
+        $mitte = $vorher.AddTicks([long](($nachher - $vorher).Ticks / 2))
+        return ($mitte - $d.UtcDateTime).TotalSeconds
+    }
+    catch { return $null }
+}
+
+# Beim Start: warnen, wenn die Uhr spuerbar falsch geht.
+function Test-UhrBeimStart {
+    $abw = Get-UhrAbweichung
+    if ($null -eq $abw) { return }
+    $betrag = [math]::Abs($abw)
+    if ($betrag -lt 30) { return }
+    $richtung = if ($abw -gt 0) { "vor" } else { "nach" }
+    Write-Log ("WARNUNG: Die Uhr dieses PCs geht etwa {0} {1}." -f (Format-Minuten ($betrag / 60)), $richtung)
+    Write-Log "  Dann stimmt die Anzeige 'spielt seit' nicht, und abgelaufene Sperren werden falsch erkannt."
+    if ($betrag -ge 120) {
+        [void][Windows.Forms.MessageBox]::Show(
+            (("Die Uhr dieses PCs geht etwa {0} {1}.`n`n" +
+            "Das Programm erkennt daran, ob eine Sperre abgelaufen ist. Mit falscher Uhr " +
+            "kann dein Mitspieler als abgemeldet gelten, obwohl er spielt (oder umgekehrt).`n`n" +
+            "Abhilfe: Windows-Einstellungen > Zeit und Sprache > 'Jetzt synchronisieren', " +
+            "und 'Uhrzeit automatisch festlegen' einschalten.") -f (Format-Minuten ($betrag / 60)), $richtung),
+            "Uhrzeit pruefen", 'OK', 'Warning')
+    }
+}
+
 function Get-NeuesteVersion {
     try {
         # Aeltere Windows-Fassungen sprechen von sich aus noch kein TLS 1.2,
@@ -3145,6 +3322,10 @@ pics/** -text -diff
     elseif ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder)) {
         Write-Log "WARNUNG: Kein Save-Ordner eingetragen - es wird noch kein Spielstand hochgeladen."
         Write-Log "  Bitte den Save-Ordner eintragen, bevor dein Mitspieler zum ersten Mal spielt."
+    }
+    elseif (-not (Confirm-SaveOrdner "Hochladen")) {
+        Write-Log "Spielstand wird noch nicht hochgeladen - bitte zuerst den Save-Ordner korrigieren."
+        Write-Log "  Danach reicht einmal 'Spielen starten' und wieder beenden."
     }
     elseif (Backup-Saves) {
         if (Test-Path -LiteralPath $repoSave) { Write-Log "Dein Spielstand wird als gemeinsamer Ausgangsstand hochgeladen." }
@@ -4098,6 +4279,7 @@ $script:startTimer.Add_Tick({
         # wenn alles aktuell ist oder gerade kein Internet da ist. Bewusst nach
         # der Statuspruefung, damit der Blick aufs Wesentliche nicht wartet.
         if (-not $script:istErststart) { Invoke-UpdatePruefung -Still }
+        Test-UhrBeimStart
     })
 
 # Ereignisse verdrahten
