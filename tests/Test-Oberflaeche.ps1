@@ -96,11 +96,13 @@ function Get-Element {
     $bed = New-Object System.Windows.Automation.PropertyCondition($UIA::NameProperty, $Name)
     return $f.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $bed)
 }
+# Hinweis: UI Automation meldet die Elemente dieses Programms als "Pane"
+# (nicht als Text/Button) - deshalb wird nach Fensterklasse und Text gesucht.
 function Get-StatusText {
     $f = Get-Hauptfenster
     if (-not $f) { return '' }
-    $bed = New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
-    foreach ($e in $f.FindAll([System.Windows.Automation.TreeScope]::Descendants, $bed)) {
+    foreach ($e in $f.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+        if ($e.Current.ClassName -notlike '*STATIC*') { continue }
         $n = $e.Current.Name
         if ($n -match '^(FREI|DU spielst|GESPERRT|ABGELAUFENE|Status unbekannt|Wird geprueft|Noch nicht geprueft|Noch kein Repo|ACHTUNG|SPERRE VERLOREN)') { return $n }
     }
@@ -118,11 +120,21 @@ function Write-Elementbaum {
     }
 }
 
+# Klickt per BM_CLICK-Nachricht an das Knopf-Fenster. Geht bei jedem
+# Win32-Knopf (auch wenn UI Automation kein Invoke anbietet) und wird nur
+# eingereiht - oeffnet das Programm dabei ein Meldungsfenster, haengt der
+# Test nicht fest, sondern bemerkt es in Wait-Protokoll.
+Add-Type -Namespace AcssUi -Name Win -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+'@
 function Invoke-Knopf {
     param([string]$Name)
     $k = Get-Element $Name
     if (-not $k) { Stop-MitFehler "Knopf '$Name' nicht gefunden" }
-    $k.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    if (-not $k.Current.IsEnabled) { Stop-MitFehler "Knopf '$Name' ist gesperrt" }
+    $hwnd = [IntPtr]$k.Current.NativeWindowHandle
+    if ($hwnd -eq [IntPtr]::Zero) { Stop-MitFehler "Knopf '$Name' hat kein Fenster-Handle" }
+    [void][AcssUi.Win]::PostMessage($hwnd, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)   # BM_CLICK
     Write-Host "   geklickt: $Name"
 }
 
