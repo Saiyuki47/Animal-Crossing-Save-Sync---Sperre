@@ -9,11 +9,16 @@
   Ablauf:
     1. Programm starten, warten bis der Status geprueft ist
     2. per UI Automation auf "Spielen starten" klicken
+       - der Test-Server ist absichtlich langsam (jedes Hochladen dauert
+         8 s): waehrenddessen muss das Fenster reagieren und die
+         Fortschrittsanzeige "Lade auf den Server hoch" zeigen
        - als "Spiel" dient ein Starter, der Dolphin startet und sich sofort
          selbst beendet (die Sitzung muss trotzdem offen bleiben)
     3. Spielstand aendern ("im Spiel speichern"), Ersatz-Dolphin schliessen
     4. pruefen: Sperre frei, neuer Spielstand und Spielzeit auf dem Server
-    5. Programm schliessen, pruefen: keine Fehler auf stderr
+    5. Spielzeit-Dialog oeffnen, alle drei Reiter fotografieren
+       (der Verlauf enthaelt dafuer vorbereitete Sitzungen von Anna und Max)
+    6. Programm schliessen, pruefen: keine Fehler auf stderr
 
   Nach jedem Schritt entsteht ein Bildschirmfoto in -Ausgabe, dazu das
   Protokoll des Programms. Exitcode 0 = alles gut.
@@ -126,7 +131,79 @@ function Write-Elementbaum {
 # Test nicht fest, sondern bemerkt es in Wait-Protokoll.
 Add-Type -Namespace AcssUi -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+[DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
 '@
+
+# Reagiert das Fenster? Schickt eine leere Nachricht und wartet hoechstens
+# $Millisekunden auf die Antwort. Ein eingefrorenes Fenster antwortet nicht.
+function Test-FensterReagiert {
+    param([IntPtr]$Hwnd, [int]$Millisekunden = 1500)
+    $ergebnis = [IntPtr]::Zero
+    $r = [AcssUi.Win]::SendMessageTimeout($Hwnd, 0, [IntPtr]::Zero, [IntPtr]::Zero, 2, $Millisekunden, [ref]$ergebnis)   # WM_NULL, SMTO_ABORTIFHUNG
+    return ($r -ne [IntPtr]::Zero)
+}
+
+# Sucht ein Element in einem beliebigen Fenster (z. B. einem Dialog).
+function Find-InFenster {
+    param($Fenster, [string]$Name, [string]$Klasse = '')
+    foreach ($e in $Fenster.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+        if ($Name -and $e.Current.Name -ne $Name) { continue }
+        if ($Klasse -and $e.Current.ClassName -notlike "*$Klasse*") { continue }
+        return $e
+    }
+    return $null
+}
+
+# Text der Fortschrittsanzeige unten im Hauptfenster (leer, wenn nichts laeuft).
+# Bewusst ohne UI Automation: deren Abfragen muss das Programm selbst
+# beantworten, und waehrend es beschaeftigt ist, dauert das pro Element etwas.
+# Hier genuegt eine Nachricht: Die (einzige) Fortschrittsleiste wird ueber
+# ihre Fensterklasse gefunden - ob sie sichtbar ist, weiss Windows selbst -,
+# dann wird nur der Text des Labels daneben abgefragt.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace AcssUi {
+    public static class Fortschritt {
+        delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, StringBuilder l, uint flags, uint timeout, out IntPtr result);
+
+        public static string Text(IntPtr haupt) {
+            IntPtr balken = IntPtr.Zero;
+            EnumChildWindows(haupt, (h, l) => {
+                var k = new StringBuilder(256);
+                GetClassName(h, k, k.Capacity);
+                if (k.ToString().IndexOf("progress", StringComparison.OrdinalIgnoreCase) < 0) return true;
+                balken = h;
+                return false;
+            }, IntPtr.Zero);
+            if (balken == IntPtr.Zero || !IsWindowVisible(balken)) return "";
+            string text = "";
+            EnumChildWindows(GetParent(balken), (h, l) => {
+                if (h == balken) return true;
+                var sb = new StringBuilder(512);
+                IntPtr r;
+                // WM_GETTEXT, SMTO_ABORTIFHUNG, hoechstens 1 s
+                if (SendMessageTimeout(h, 0x000D, (IntPtr)sb.Capacity, sb, 2, 1000, out r) == IntPtr.Zero) return true;
+                if (sb.Length == 0) return true;
+                text = sb.ToString();
+                return false;
+            }, IntPtr.Zero);
+            return text;
+        }
+    }
+}
+'@
+function Get-FortschrittText {
+    param([IntPtr]$Hwnd)
+    return [AcssUi.Fortschritt]::Text($Hwnd)
+}
 function Invoke-Knopf {
     param([string]$Name)
     $k = Get-Element $Name
@@ -180,7 +257,29 @@ New-Item -ItemType Directory -Path (Join-Path $repo 'save\data'), (Join-Path $sa
 Set-Content -LiteralPath (Join-Path $repo 'save\data\stadt.bin') -Value 'Server-Stand'
 G -C $repo add -A | Out-Null
 G -C $repo commit -qm 'Startstand' | Out-Null
+# Vorbereiteter Verlauf fuer die Spielzeit-Statistik: zwei Wochen lang
+# Sitzungen von Anna und Max, so wie das Programm sie selbst schreibt.
+function Add-VerlaufsCommit {
+    param([datetime]$Zeit, [string]$Betreff)
+    $iso = $Zeit.ToString('yyyy-MM-ddTHH:mm:ss') + 'Z'
+    $env:GIT_COMMITTER_DATE = $iso; $env:GIT_AUTHOR_DATE = $iso
+    try { G -C $repo commit -q --allow-empty -m $Betreff | Out-Null }
+    finally { Remove-Item Env:GIT_COMMITTER_DATE, Env:GIT_AUTHOR_DATE -ErrorAction SilentlyContinue }
+}
+$heute = [datetime]::UtcNow.Date
+for ($i = 14; $i -ge 1; $i--) {
+    if ($i -in 5, 9) { continue }                        # Luecken fuer die Serie
+    $wer = if ($i % 3 -eq 0) { 'Max' } else { 'Anna' }
+    $beginn = $heute.AddDays(-$i).AddHours(16)
+    $dauer = 40 + (($i * 17) % 80)                       # 40 bis 119 Minuten
+    Add-VerlaufsCommit $beginn "lock: $wer"
+    Add-VerlaufsCommit $beginn.AddMinutes([math]::Floor($dauer / 2)) "heartbeat: $wer"
+    Add-VerlaufsCommit $beginn.AddMinutes($dauer) "Session beendet + Spielstand ($wer)"
+}
 G -C $repo push -q origin main | Out-Null
+# Langsamer Server: jedes Hochladen dauert 8 s. Ein eingefrorenes Fenster
+# fiele dabei sofort auf.
+[IO.File]::WriteAllText((Join-Path $server 'hooks\pre-receive'), "#!/bin/sh`nsleep 8`n")
 Set-Content -LiteralPath (Join-Path $save 'data\stadt.bin') -Value 'alter Stand auf diesem PC'
 
 $dolphin = Join-Path $fake 'Dolphin.exe'
@@ -221,9 +320,28 @@ try {
     Write-Host "   Status: $status"
     if ($status -notmatch '^FREI') { Stop-MitFehler "Status sollte FREI sein, ist: $status" }
 
-    Schritt "Spielen starten"
+    Schritt "Spielen starten - langsamer Server, Fenster muss reagieren"
+    $hwnd = [IntPtr](Get-Hauptfenster).Current.NativeWindowHandle
     Invoke-Knopf 'Spielen starten'
-    Wait-Protokoll 'Viel Spass' 90
+    $proben = 0; $haenger = 0; $fortschritt = ''; $bildGemacht = $false
+    $ende = (Get-Date).AddSeconds(90)
+    while (-not ((Get-AppProtokoll) -match 'Viel Spass') -and (Get-Date) -lt $ende) {
+        if ($script:app.HasExited) { Stop-MitFehler "Das Programm hat sich unerwartet beendet" }
+        $proben++
+        if (-not (Test-FensterReagiert $hwnd)) { $haenger++ }
+        $t = Get-FortschrittText $hwnd
+        if ($t) {
+            $fortschritt = $t
+            if (-not $bildGemacht -and $t -match 'Lade auf den Server hoch') { Save-Bild 'hochladen'; $bildGemacht = $true }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    Wait-Protokoll 'Viel Spass' 5
+    Write-Host ("   {0} Proben, davon {1} ohne Antwort; Fortschrittsanzeige: '{2}'" -f $proben, $haenger, $fortschritt)
+    if ($proben -lt 10) { Stop-MitFehler "Zu wenige Proben ($proben) - das Hochladen war nicht langsam genug zum Pruefen" }
+    if ($haenger -gt 0) { Stop-MitFehler "Das Fenster hat $haenger-mal nicht reagiert, waehrend hochgeladen wurde" }
+    if (-not $bildGemacht) { Stop-MitFehler "Die Fortschrittsanzeige 'Lade auf den Server hoch' war nie zu sehen (zuletzt: '$fortschritt')" }
+    Write-Host "   Fenster reagiert, Fortschrittsanzeige sichtbar: ok"
     Save-Bild 'spielt'
     $status = Get-StatusText
     Write-Host "   Status: $status"
@@ -261,6 +379,34 @@ try {
     if ($zeit -notmatch 'Tester') { Stop-MitFehler "Spielzeit fehlt: $zeit" }
     Write-Host "   Sperre frei, neuer Spielstand und Spielzeit auf dem Server: ok"
     Write-Host ("   Commits: " + ((G --git-dir $server log --format=%s main) -replace "`n", ' | '))
+
+    Schritt "Spielzeit-Dialog mit Wochen und Rekorden"
+    Invoke-Knopf 'Spielzeit'
+    $dlg = $null
+    $ende = (Get-Date).AddSeconds(30)
+    while (-not $dlg -and (Get-Date) -lt $ende) {
+        $dlg = Get-ProgrammFenster | Where-Object { $_.Current.Name -eq 'Spielzeit' } | Select-Object -First 1
+        Start-Sleep -Milliseconds 300
+    }
+    if (-not $dlg) { Stop-MitFehler "Der Spielzeit-Dialog geht nicht auf" }
+    Start-Sleep -Seconds 1
+    Save-Bild 'spielzeit-gesamt'
+    $reiter = Find-InFenster $dlg -Klasse 'SysTabControl32'
+    if (-not $reiter) { Stop-MitFehler "Reiter im Spielzeit-Dialog nicht gefunden" }
+    $hReiter = [IntPtr]$reiter.Current.NativeWindowHandle
+    foreach ($nr in 1, 2) {
+        [void][AcssUi.Win]::PostMessage($hReiter, 0x1330, [IntPtr]$nr, [IntPtr]::Zero)   # TCM_SETCURFOCUS
+        Start-Sleep -Seconds 1
+        if ($script:app.HasExited) { Stop-MitFehler "Programm beim Wechsel des Reiters beendet" }
+        Save-Bild $(if ($nr -eq 1) { 'spielzeit-wochen' } else { 'spielzeit-rekorde' })
+    }
+    $zu = Find-InFenster $dlg -Name 'Schliessen'
+    if (-not $zu) { Stop-MitFehler "Knopf 'Schliessen' im Spielzeit-Dialog nicht gefunden" }
+    [void][AcssUi.Win]::PostMessage([IntPtr]$zu.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+    $ende = (Get-Date).AddSeconds(10)
+    while ((Get-ProgrammFenster | Where-Object { $_.Current.Name -eq 'Spielzeit' }) -and (Get-Date) -lt $ende) { Start-Sleep -Milliseconds 300 }
+    if (Get-ProgrammFenster | Where-Object { $_.Current.Name -eq 'Spielzeit' }) { Stop-MitFehler "Spielzeit-Dialog schliesst sich nicht" }
+    Write-Host "   Dialog geoeffnet, drei Reiter, geschlossen: ok"
 
     Schritt "Programm schliessen"
     [void]$script:app.CloseMainWindow()
