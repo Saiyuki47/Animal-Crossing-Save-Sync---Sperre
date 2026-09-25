@@ -87,9 +87,18 @@ function Save-Bild {
 
 # --- Fenster finden und bedienen (UI Automation) -----------------------------
 $UIA = [System.Windows.Automation.AutomationElement]
+# Alle Fenster des Programms. Dialoge und Meldungen, die einem Fenster
+# gehoeren, haengt UI Automation unter dieses Fenster - nicht unter den
+# Desktop. Deshalb werden auch die direkten Unterfenster mitgesucht.
 function Get-ProgrammFenster {
     $bed = New-Object System.Windows.Automation.PropertyCondition($UIA::ProcessIdProperty, $script:app.Id)
-    return @($UIA::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $bed))
+    $istFenster = New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)
+    $alle = New-Object System.Collections.ArrayList
+    foreach ($f in $UIA::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $bed)) {
+        [void]$alle.Add($f)
+        foreach ($k in $f.FindAll([System.Windows.Automation.TreeScope]::Children, $istFenster)) { [void]$alle.Add($k) }
+    }
+    return @($alle)
 }
 function Get-Hauptfenster {
     return (Get-ProgrammFenster | Where-Object { $_.Current.Name -like '*Save-Sync*' } | Select-Object -First 1)
