@@ -1963,6 +1963,17 @@ function Stop-Play {
         return
     }
 
+    # Beendet war womoeglich nur ein Starter (z. B. das cmd einer .bat), und
+    # Dolphin selbst laeuft weiter - dann uebernimmt Test-DolphinBeendet es,
+    # und die Sitzung darf noch nicht abgeschlossen werden.
+    if (-not (Test-DolphinBeendet -Sofort)) {
+        Write-Log "  Dolphin selbst laeuft noch - die Sitzung bleibt offen."
+        Write-Log "  Dolphin schliessen oder noch einmal auf 'Spielen beenden' klicken."
+        $script:btnStop.Enabled = $true
+        $script:timer.Start()
+        return
+    }
+
     Complete-Session
 }
 
