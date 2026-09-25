@@ -432,15 +432,15 @@ try {
     if (-not $dlg) { Stop-MitFehler "Der Ruebenkurs geht nicht auf" }
     Start-Sleep -Seconds 1
     # Eintragen per WM_SETTEXT - das Programm bekommt dabei dieselbe
-    # Aenderungsmeldung wie beim Tippen.
-    $eintraege = [ordered]@{
-        'Sigrids Preis' = '100'; 'Deine Rueben' = '400'
-        'Preis Mo vormittags' = '88'; 'Preis Mo nachmittags' = '85'; 'Preis Di vormittags' = '120'; 'Preis Di nachmittags' = '180'
-    }
-    foreach ($k in $eintraege.Keys) {
-        $feld = Find-InFenster $dlg -Name $k
-        if (-not $feld) { Stop-MitFehler "Eingabefeld '$k' nicht gefunden" }
-        [void][AcssUi.Win]::SendMessage([IntPtr]$feld.Current.NativeWindowHandle, 0x000C, [IntPtr]::Zero, $eintraege[$k])   # WM_SETTEXT
+    # Aenderungsmeldung wie beim Tippen. UI Automation meldet die Textfelder
+    # ohne Namen; sie kommen aber in der Reihenfolge, in der das Fenster sie
+    # anlegt: Sigrids Preis, Deine Rueben, dann Mo vorm., Mo nachm., Di ...
+    $felder = @($dlg.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+        Where-Object { $_.Current.ClassName -like '*EDIT*' })
+    if ($felder.Count -ne 14) { Stop-MitFehler "14 Eingabefelder erwartet, gefunden: $($felder.Count)" }
+    $eintraege = @('100', '400', '88', '85', '120', '180')
+    for ($i = 0; $i -lt $eintraege.Count; $i++) {
+        [void][AcssUi.Win]::SendMessage([IntPtr]$felder[$i].Current.NativeWindowHandle, 0x000C, [IntPtr]::Zero, $eintraege[$i])   # WM_SETTEXT
     }
     Start-Sleep -Seconds 2
     Save-Bild 'ruebenkurs'
