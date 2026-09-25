@@ -18,6 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Ganzer Verlauf: "Aenderung ermitteln" sucht darin den letzten
+          # Commit, der AC-SaveSync.ps1 geaendert hat.
+          fetch-depth: 0
 
       # Das Programm zeigt seine Version an und vergleicht sie beim Update mit
       # dem neuesten Release. Laufen Tag und Nummer im Skript auseinander,
@@ -35,12 +39,20 @@ jobs:
           }
           Write-Host "Version passt: $imSkript"
 
-      # Betreff des getaggten Commits als Aenderungsnotiz merken. Das Programm
-      # zeigt sie im Update-Dialog an, damit man weiss, wofuer man aktualisiert.
+      # Betreff des letzten Commits, der AC-SaveSync.ps1 geaendert hat, als
+      # Aenderungsnotiz merken. Das Programm zeigt sie im Update-Dialog an,
+      # damit man weiss, wofuer man aktualisiert.
+      # Bewusst NICHT der getaggte Commit: Sitzt der Tag auf einem spaeteren
+      # Commit, der nur Tests oder die README aendert, stuende dessen Betreff
+      # im Update-Dialog (so geschehen bei v1.17).
       - name: Aenderung ermitteln
         id: aenderung
         shell: bash
-        run: echo "text=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+        run: |
+          text="$(git log -1 --pretty=%s -- AC-SaveSync.ps1)"
+          if [ -z "$text" ]; then text="$(git log -1 --pretty=%s)"; fi
+          echo "Aenderungsnotiz: $text"
+          echo "text=$text" >> "$GITHUB_OUTPUT"
 
       - name: AC-SaveSync.cmd bauen
         shell: pwsh
@@ -71,15 +83,13 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
+          # Als Umgebungsvariable statt direkt ins Skript eingesetzt: so kann
+          # ein Commit-Betreff mit Sonderzeichen das Skript nicht veraendern.
+          AENDERUNG: ${{ steps.aenderung.outputs.text }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file - \
-            AC-SaveSync.cmd AC-SaveSync.ps1 assets/ac-savesync.ico <<'EOF'
-          ## Was ist neu
-
-          ${{ steps.aenderung.outputs.text }}
-
+          {
+            printf '## Was ist neu\n\n%s\n\n' "$AENDERUNG"
+            cat <<'EOF'
           ## Installation
 
           1. **AC-SaveSync.cmd** herunterladen (unten unter *Assets*).
@@ -102,6 +112,12 @@ jobs:
 
           **Voraussetzung bleibt:** Git muss installiert und im PATH sein.
           EOF
+          } > notes.md
+          cat notes.md
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            AC-SaveSync.cmd AC-SaveSync.ps1 assets/ac-savesync.ico
 
       - name: Datei auch ohne Tag zum Download anbieten
         if: "!startsWith(github.ref, 'refs/tags/')"
