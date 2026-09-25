@@ -14,7 +14,16 @@ permissions:
   contents: write             # noetig, damit das Release angelegt werden darf
 
 jobs:
+  # Erst alle Tests unter Windows (Lint, Tests, Oberflaeche) - derselbe
+  # Workflow wie bei jedem Push. Ist dort etwas rot, wird nichts gebaut und
+  # nichts veroeffentlicht; die Spieler bekommen kein kaputtes Update.
+  tests:
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
   build:
+    needs: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

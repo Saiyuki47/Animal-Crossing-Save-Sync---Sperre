@@ -1,6 +1,8 @@
 name: Tests
 
-# Laeuft bei jedem Push auf main, bei Pull Requests und von Hand.
+# Laeuft bei jedem Push auf main, bei Pull Requests und von Hand - und vor
+# jedem Release (release.yml ruft diesen Workflow auf und veroeffentlicht nur,
+# wenn hier alles gruen ist).
 # Getestet wird unter Windows PowerShell 5.1 - genau der Umgebung, in der das
 # Programm bei den Spielern laeuft (nicht PowerShell 7).
 on:
@@ -8,6 +10,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -28,6 +31,11 @@ jobs:
           git config --global init.defaultBranch main
           git --version
           $PSVersionTable.PSVersion.ToString()
+
+      # Statische Pruefung aller Skripte, Regeln in PSScriptAnalyzerSettings.psd1.
+      - name: Lint (PSScriptAnalyzer)
+        shell: powershell
+        run: .\tests\Start-Lint.ps1
 
       - name: Tests (Windows PowerShell 5.1)
         shell: powershell

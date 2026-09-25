@@ -209,7 +209,7 @@ wird bewusst nicht beanstandet – bei GameCube-Spielen liegen dort die Memory-C
 | **Spielen beenden**            | Beendet Dolphin aus dem Programm heraus und schließt die Sitzung ab: sichern, hochladen, Sperre freigeben. **Vorher im Spiel speichern!** Nur während einer laufenden Sitzung anklickbar. |
 | **Status prüfen**              | Aktualisiert die Anzeige: frei, du spielst, jemand anderes spielt, oder abgelaufene Sperre. Läuft beim Programmstart automatisch einmal. |
 | **Fotos ansehen**              | Zeigt die Bilder aus dem gemeinsamen Ordner direkt im Programm – neueste zuerst, mit Name und Aufnahmezeit. Blättern per Knopf oder Pfeiltasten, dazu Diashow, Speichern und Löschen. |
-| **Spielzeit**                  | Wer hat wie lange gespielt, wie viele Sitzungen, wann zuletzt.                                   |
+| **Spielzeit**                  | Wer hat wie lange gespielt – gesamt, Woche für Woche und die Rekorde (längste Sitzung, Spieltage am Stück). Mehr dazu unter [Spielzeit-Statistik](#spielzeit-statistik). |
 | **Früherer Spielstand**        | Holt einen älteren Spielstand zurück. Der jetzige bleibt dabei erhalten. Die Rettung, wenn im Spiel etwas schiefgegangen ist. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
@@ -221,6 +221,12 @@ Knopf, dann steht dort, **was** fehlt.
 
 ### Wenn etwas schiefgeht
 
+- **Das Fenster friert nicht ein.** Hochladen, Abgleichen und Kopieren laufen im Hintergrund.
+  Dauert etwas länger als einen Augenblick, erscheint unter dem Protokoll eine Leiste, die sagt,
+  was gerade passiert (z. B. „Lade auf den Server hoch … (12 s)"). Solange sie läuft, nimmt das
+  Programm keine Klicks an, damit nichts doppelt ausgelöst wird. Schließt du das Fenster in dieser
+  Zeit, wartet es, bis der Vorgang fertig ist, und schließt sich dann selbst. Antwortet der
+  Server gar nicht mehr, bricht das Programm nach einigen Minuten ab und sagt, woran es liegt.
 - **Die Anzeige hält sich selbst aktuell.** Solange ihr nicht spielt, sieht das Programm alle
   drei Minuten nach, ob der andere angefangen oder aufgehört hat.
 - **Reißt beim Spielen die Verbindung ab**, meldet sich das Programm deutlich: Es kann dann
@@ -359,6 +365,21 @@ zuletzt gespielt wurde:
 Die Zeit wird auch bei jedem Herzschlag mitgerechnet, geht bei einem Absturz also fast nicht
 verloren. Der Sitzungszähler erhöht sich nur beim sauberen Beenden.
 
+Mehr zeigt der Knopf **„Spielzeit"** im Programm, auf drei Reitern:
+
+- **Gesamt** – je Spieler Gesamtzeit, Sitzungen, Durchschnitt, längste Sitzung, Spieltage am
+  Stück und wann zuletzt gespielt.
+- **Wochen** – die letzten acht Wochen (Kalenderwochen, Montag bis Sonntag), je Spieler mit
+  einem Balken. Alle Balken haben denselben Maßstab und sind so direkt vergleichbar.
+- **Rekorde** – längste Sitzung, meiste Spielzeit an einem Tag, längste Serie an Spieltagen am
+  Stück und die Serie, die gerade läuft.
+
+Diese Werte rechnet das Programm aus dem Git-Verlauf des gemeinsamen Ordners nach – aus den
+Einträgen, die es beim Spielen ohnehin schreibt (Sperre, Herzschlag, Sitzungsende). Sie sind
+also auch für ältere Sitzungen da, ohne dass etwas zusätzlich gespeichert wird. Bei einem
+Absturz zählt die Sitzung bis zum letzten Herzschlag; ein Spieltag ist jeder Tag, an dem eine
+Sitzung lief (auch über Mitternacht hinweg).
+
 > Diese README (die du gerade liest) ist die Anleitung für das Tool. Die **README im Repo** ist
 > etwas anderes: Sie wird vom Skript automatisch mit der Spielzeit-Tabelle erzeugt.
 
@@ -425,14 +446,28 @@ Unter `tests/` liegen automatische Tests. Sie laufen bei jedem Push auf GitHub u
 **Windows PowerShell 5.1** (siehe *Actions* → *Tests*) und lassen sich auch selbst starten:
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\Start-Lint.ps1         # Prüfung des Codes
 powershell -ExecutionPolicy Bypass -File .\tests\Start-Tests.ps1        # Funktionen
 powershell -ExecutionPolicy Bypass -File .\tests\Test-Oberflaeche.ps1   # echtes Programm
 ```
 
+- **Start-Lint.ps1** prüft alle Skripte mit [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer)
+  auf typische Fehler. Die Regeln stehen in `PSScriptAnalyzerSettings.psd1`; fehlt das Modul,
+  wird es für den aktuellen Benutzer installiert.
+- **Start-Tests.ps1** prüft die Funktionen einzeln: Sperre, Spielstand, Ende-Erkennung, Pfade,
+  Umlaute, Hintergrund-Aufrufe, Spielzeit-Statistik, Update-Installation, Fotos und Selbsttest.
+  Mit `-Filter Update` laufen nur die Tests aus `Update.Tests.ps1`.
+- **Test-Oberflaeche.ps1** startet das echte Programm, klickt „Spielen starten", spielt eine
+  Sitzung mit einem Ersatz-Dolphin durch und öffnet die Spielzeit. Der Test-Server ist dabei
+  absichtlich langsam, damit geprüft werden kann, dass das Fenster währenddessen reagiert. Von
+  jedem Schritt entsteht ein Bildschirmfoto.
+
 Alles läuft in einem eigenen Temp-Ordner mit einem lokalen Test-Server – euer Repo, eure
-Einstellungen und euer Spielstand werden nicht angefasst. Der Oberflächentest startet das
-Programm, klickt „Spielen starten", spielt eine Sitzung mit einem Ersatz-Dolphin durch und
-legt Bildschirmfotos ab. Gebraucht wird nur Git.
+Einstellungen und euer Spielstand werden nicht angefasst. Gebraucht wird nur Git.
+
+**Releases nur mit grünen Tests:** Wird ein Versions-Tag gepusht, laufen zuerst alle drei
+Prüfungen unter Windows. Erst wenn sie grün sind, wird die `AC-SaveSync.cmd` gebaut und
+veröffentlicht – schlägt etwas fehl, gibt es kein Release und damit auch kein kaputtes Update.
 
 ---
 
