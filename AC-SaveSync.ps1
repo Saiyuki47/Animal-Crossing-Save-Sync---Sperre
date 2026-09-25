@@ -3388,49 +3388,9 @@ function Test-Setup {
         $e += Neu "Save-Ordner" $true $script:cfg.SaveFolder
     }
 
-    # 6) Repo-Ordner
-    $istRepo = (-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
-    (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))
-    if (-not $istRepo) {
-        $e += Neu "Gemeinsamer Ordner" $false ("Unter '" + $script:cfg.RepoPath + "' liegt kein Git-Repo. " +
-            "Unten auf 'Repo einrichten...' klicken - oder den Ordner korrigieren.") ""
-        $e += Neu "Verbindung zum Server" $false "Uebersprungen, weil noch kein Repo da ist." ""
-        return $e
-    }
-    $e += Neu "Gemeinsamer Ordner" $true $script:cfg.RepoPath
-
-    # 6) Ist eine Adresse im Internet hinterlegt?
-    $o = Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath
-    if ($o.Code -ne 0 -or [string]::IsNullOrWhiteSpace($o.Out)) {
-        $e += Neu "Adresse des Repos" $false ("Es ist keine Adresse ('origin') hinterlegt - der Austausch mit dem " +
-            "anderen Spieler kann so nicht funktionieren. Ueber 'Repo einrichten...', Schritt 2.") $o.Text
-        return $e
-    }
-    $e += Neu "Adresse des Repos" $true $o.Out
-
-    # 7) Server erreichbar + Zugangsdaten in Ordnung?
-    $ls = Invoke-GitRaw @('ls-remote', '--heads', 'origin') $script:cfg.RepoPath
-    if ($ls.Code -ne 0) {
-        $klar = "Der Server antwortet nicht wie erwartet."
-        foreach ($k in $script:GitKlartext) {
-            if ("$($ls.Text)" -match $k.Muster) { $klar = $k.Text + " " + $k.Tipp; break }
-        }
-        $e += Neu "Verbindung zum Server" $false $klar $ls.Text
-        return $e
-    }
-    $e += Neu "Verbindung zum Server" $true "Server erreichbar, Zugang funktioniert."
-
-    # 8) Gibt es den eingetragenen Branch dort?
-    if ($ls.Out -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '\s*$') -or
-        $ls.Out -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '[\r\n]')) {
-        $e += Neu "Branch vorhanden" $true $script:cfg.Branch
-    }
-    else {
-        $e += Neu "Branch vorhanden" $false ("Auf dem Server gibt es keinen Branch '" + $script:cfg.Branch +
-            "'. Pruefen, ob beide Spieler denselben Branch eingetragen haben (meist 'main').") $ls.Text
-    }
-
-    # 9) Uhrzeit - davon haengt ab, ob Sperren richtig als abgelaufen gelten
+    # 6) Uhrzeit - davon haengt ab, ob Sperren richtig als abgelaufen gelten.
+    # Bewusst vor den Repo-Pruefungen: die koennen abbrechen, die Uhr hat mit
+    # dem Repo aber nichts zu tun.
     $abw = Get-UhrAbweichung
     if ($null -eq $abw) {
         $e += Neu "Uhrzeit" $true "Konnte nicht verglichen werden (GitHub nicht erreichbar) - uebersprungen."
@@ -3443,7 +3403,60 @@ function Test-Setup {
         $e += Neu "Uhrzeit" $true ("Stimmt (Abweichung {0:N0} s)." -f $abw)
     }
 
+    # 7) Repo-Ordner
+    $istRepo = (-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
+    (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))
+    if (-not $istRepo) {
+        $e += Neu "Gemeinsamer Ordner" $false ("Unter '" + $script:cfg.RepoPath + "' liegt kein Git-Repo. " +
+            "Unten auf 'Repo einrichten...' klicken - oder den Ordner korrigieren.") ""
+        $e += Neu "Verbindung zum Server" $false "Uebersprungen, weil noch kein Repo da ist." ""
+        return $e
+    }
+    $e += Neu "Gemeinsamer Ordner" $true $script:cfg.RepoPath
+
+    # 8) Ist eine Adresse im Internet hinterlegt?
+    $o = Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath
+    if ($o.Code -ne 0 -or [string]::IsNullOrWhiteSpace($o.Out)) {
+        $e += Neu "Adresse des Repos" $false ("Es ist keine Adresse ('origin') hinterlegt - der Austausch mit dem " +
+            "anderen Spieler kann so nicht funktionieren. Ueber 'Repo einrichten...', Schritt 2.") $o.Text
+        return $e
+    }
+    $e += Neu "Adresse des Repos" $true $o.Out
+
+    # 9) Server erreichbar + Zugangsdaten in Ordnung?
+    $ls = Invoke-GitRaw @('ls-remote', '--heads', 'origin') $script:cfg.RepoPath
+    if ($ls.Code -ne 0) {
+        $klar = "Der Server antwortet nicht wie erwartet."
+        foreach ($k in $script:GitKlartext) {
+            if ("$($ls.Text)" -match $k.Muster) { $klar = $k.Text + " " + $k.Tipp; break }
+        }
+        $e += Neu "Verbindung zum Server" $false $klar $ls.Text
+        return $e
+    }
+    $e += Neu "Verbindung zum Server" $true "Server erreichbar, Zugang funktioniert."
+
+    # 10) Gibt es den eingetragenen Branch dort?
+    if ($ls.Out -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '\s*$') -or
+        $ls.Out -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '[\r\n]')) {
+        $e += Neu "Branch vorhanden" $true $script:cfg.Branch
+    }
+    else {
+        $e += Neu "Branch vorhanden" $false ("Auf dem Server gibt es keinen Branch '" + $script:cfg.Branch +
+            "'. Pruefen, ob beide Spieler denselben Branch eingetragen haben (meist 'main').") $ls.Text
+    }
+
+
     return $e
+}
+
+# Das Ergebnis als Text - fuer den Knopf "Bericht kopieren", wenn man
+# jemanden um Hilfe bittet. Zu Fehlern steht die Originalmeldung von Git dabei.
+function Format-SelbsttestBericht {
+    param([object[]]$Ergebnis)
+    return (@($Ergebnis) | ForEach-Object {
+            $k = if ($_.Ok) { "OK   " } else { "FEHLT" }
+            "[$k] $($_.Name)`r`n       $($_.Hinweis)" + $(if ($_.Roh -and -not $_.Ok) { "`r`n       git: " + ($_.Roh -replace "`r?`n", "`r`n            ") } else { "" })
+        }) -join "`r`n"
 }
 
 # Zeigt das Ergebnis als Ampel-Liste. Zu jedem Punkt der Klartext-Hinweis und,
@@ -3526,10 +3539,7 @@ function Show-SelfTest {
     $btnKopieren.Location = New-Object Drawing.Point(15, 484)
     $btnKopieren.Size = New-Object Drawing.Size(150, 30)
     $btnKopieren.Anchor = 'Bottom,Left'
-    $script:selfTestBericht = ($erg | ForEach-Object {
-            $k = if ($_.Ok) { "OK   " } else { "FEHLT" }
-            "[$k] $($_.Name)`r`n       $($_.Hinweis)" + $(if ($_.Roh -and -not $_.Ok) { "`r`n       git: " + ($_.Roh -replace "`r?`n", "`r`n            ") } else { "" })
-        }) -join "`r`n"
+    $script:selfTestBericht = Format-SelbsttestBericht $erg
     $btnKopieren.Add_Click({
             try { [Windows.Forms.Clipboard]::SetText($script:selfTestBericht) }
             catch { Write-Log "Zwischenablage gerade nicht verfuegbar: $($_.Exception.Message)" }
@@ -3907,6 +3917,19 @@ function Get-UpdateNeuigkeiten {
     return @($zeilen | Select-Object -First 5)
 }
 
+# Startet die (gerade aktualisierte) eigene Datei neu. Eine .ps1 laeuft ueber
+# powershell.exe - ein Doppelklick wuerde sie nur im Editor oeffnen.
+function Restart-Programm {
+    $selbst = $script:SelfPath
+    if ([IO.Path]::GetExtension($selbst).ToLowerInvariant() -eq '.ps1') {
+        Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta', '-File', "`"$selbst`""
+    }
+    else {
+        Start-Process -FilePath $selbst
+    }
+}
+
 # Der ganze Ablauf mit Rueckfragen. -Still: keine Meldung, wenn schon aktuell
 # (fuer die Pruefung beim Start).
 function Invoke-UpdatePruefung {
@@ -3956,16 +3979,7 @@ function Invoke-UpdatePruefung {
         [void][Windows.Forms.MessageBox]::Show(
             ("Fertig - Version {0} ist installiert.`n`nDas Programm startet jetzt neu." -f $info.Version),
             "Update abgeschlossen", 'OK', 'Information')
-        try {
-            $selbst = $script:SelfPath
-            if ([IO.Path]::GetExtension($selbst).ToLowerInvariant() -eq '.ps1') {
-                Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-                    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta', '-File', "`"$selbst`""
-            }
-            else {
-                Start-Process -FilePath $selbst
-            }
-        }
+        try { Restart-Programm }
         catch { Write-Log "Neustart fehlgeschlagen - bitte von Hand starten." }
         $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
         $script:mainForm.Close()
