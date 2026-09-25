@@ -227,6 +227,11 @@ Knopf, dann steht dort, **was** fehlt.
   Dolphin-Ordner schreiben, startet Dolphin gar nicht erst. Lässt er sich nach dem Spielen nicht
   sichern (z. B. weil Dolphin die Dateien noch festhält), fragt das Programm nach; die Sperre
   bleibt so lange bei dir, bis der Stand wirklich oben ist.
+- **Verlorene Sperre wird sofort gemeldet.** Übernimmt dein Mitspieler die Sperre, weil eine
+  Weile nichts von dir ankam, oder wird sie von Hand freigegeben, merkt das Programm es beim
+  nächsten Herzschlag und sagt es dir deutlich. Ab dann lädt es nichts mehr hoch; beim Beenden
+  landet eine Kopie deines Spielstands in `%APPDATA%\AC-SaveSync\gerettet\`. Sprecht euch
+  dann ab, wessen Stand weitergilt.
 - **Während der andere spielt,** lassen sich weder ein früherer Spielstand zurückholen noch
   Fotos löschen – beides würde sonst seine Sitzung vom Server abschneiden.
 - **Ein Protokoll jedes Programmlaufs** liegt unter `%APPDATA%\AC-SaveSync\logs\`. Die letzten
@@ -397,9 +402,10 @@ speichere im Spiel und schau, in welchem Ordner sich die Dateien geändert haben
   gleichzeitiges Spielen im selben Stand.
 - Der Herzschlag erzeugt regelmäßig kleine Git-Commits. Stört dich das, stelle „Herzschlag"
   höher (z. B. 120 Sek) und „Sperre gilt" entsprechend auf 5–6 Minuten.
-- Manche Dolphin-Installer starten die App über einen Zwischenstarter; in seltenen Fällen wird
-  das Beenden dann nicht sofort erkannt. Als Sicherheitsnetz greift die automatisch ablaufende
-  Sperre.
+- Startet ihr Dolphin über einen Starter (`.bat`, Mod-Launcher, Verknüpfung darauf), der sich
+  selbst gleich wieder beendet, beobachtet das Programm danach das laufende Dolphin. Die Sitzung
+  endet erst, wenn einige Sekunden lang kein Dolphin mehr läuft. Nebenwirkung: Ist nebenher noch
+  ein zweites Dolphin offen, bleibt die Sitzung offen, bis auch das geschlossen ist.
 - Für Online-Besuche in Echtzeit (sich gegenseitig in der Stadt sehen) ist dieses Tool **nicht**
   gedacht – dafür bräuchtet ihr die Online-Funktion des Spiels (z. B. über Wiimmfi).
 

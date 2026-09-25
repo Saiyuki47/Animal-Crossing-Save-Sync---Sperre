@@ -184,6 +184,13 @@ $script:updateLaeuft = $false
 # Fehlgeschlagene Herzschlaege in Folge und wann zuletzt etwas ankam
 $script:hbFehler = 0
 $script:hbLetzterErfolg = Get-Date
+# Hat jemand anderes waehrend der eigenen Sitzung die Sperre uebernommen?
+# (siehe Invoke-SperreVerloren)
+$script:sperreVerloren = $false
+# Namen, unter denen Dolphin als Prozess laufen kann, und seit wann weder der
+# gestartete Prozess noch ein Dolphin laeuft (siehe Test-DolphinBeendet)
+$script:dolphinNamen = @()
+$script:endeSeit = $null
 # Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
 $script:configSaved = $false
 
@@ -1511,6 +1518,8 @@ function Start-Play {
 
     Write-Log "Sperre gesichert."
     $script:holdingLock = $true
+    $script:sperreVerloren = $false
+    $script:endeSeit = $null
 
     # Klappt das Zurueckschreiben nicht, spielt man mit dem ALTEN Stand auf
     # diesem PC - und der erste Herzschlag wuerde genau diesen Stand ins Repo
@@ -1530,6 +1539,11 @@ function Start-Play {
         return
     }
     Write-Log "Starte Dolphin..."
+
+    # Unter diesen Namen kann Dolphin laufen - gebraucht, wenn ein Starter
+    # sich beendet und Dolphin weiterlaeuft (siehe Test-DolphinBeendet).
+    $namen = @('Dolphin')
+    if ($script:cfg.DolphinPath) { $namen += [IO.Path]::GetFileNameWithoutExtension($script:cfg.DolphinPath) }
 
     try {
         $gp = $script:cfg.GamePath
@@ -1555,6 +1569,9 @@ function Start-Play {
                 }
                 else {
                     Write-Log ("Starte via Verknuepfung: `"{0}`" {1}" -f $tgt, $ar)
+                    if ([IO.Path]::GetExtension($tgt).ToLowerInvariant() -eq '.exe') {
+                        $namen += [IO.Path]::GetFileNameWithoutExtension($tgt)
+                    }
                     if ([string]::IsNullOrWhiteSpace($ar)) {
                         $script:proc = Start-Process -FilePath $tgt -PassThru
                     }
@@ -1589,6 +1606,7 @@ function Start-Play {
     $script:lastAccounted = Get-Date
     $script:hbFehler = 0
     $script:hbLetzterErfolg = Get-Date
+    $script:dolphinNamen = @($namen | Where-Object { $_ } | Select-Object -Unique)
     $script:btnPlay.Enabled = $false
     $script:btnStop.Enabled = $true
     Update-StatusUI (Get-LockState)
@@ -1597,13 +1615,136 @@ function Start-Play {
 }
 
 # --------------------------------------------------------------------------
+# Ende-Erkennung: Laeuft Dolphin noch?
+# --------------------------------------------------------------------------
+# Ist ein Prozess beendet? HasExited kann bei fremden Prozessen (z. B. als
+# Administrator gestartet) "Zugriff verweigert" melden - dann nachsehen, ob
+# es die Prozessnummer noch gibt.
+function Test-ProzessWeg {
+    param($Prozess)
+    try { return [bool]$Prozess.HasExited }
+    catch { return -not (Get-Process -Id $Prozess.Id -ErrorAction SilentlyContinue) }
+}
+
+# Sucht ein laufendes Dolphin (ausser dem Prozess mit der angegebenen Nummer).
+function Find-DolphinProzess {
+    param([int]$AusserId = -1)
+    if ($script:dolphinNamen.Count -eq 0) { return $null }
+    $treffer = @(Get-Process -Name $script:dolphinNamen -ErrorAction SilentlyContinue |
+        Where-Object { $_.Id -ne $AusserId -and -not (Test-ProzessWeg $_) })
+    if ($treffer.Count -gt 0) { return $treffer[0] }
+    return $null
+}
+
+# Ist die Sitzung wirklich vorbei?
+# Beendet sich der gestartete Prozess, heisst das noch nicht, dass Dolphin zu
+# ist: Ein Starter (.bat mit "start", ein Mod-Launcher, eine .lnk auf so
+# etwas) startet Dolphin und beendet sich sofort selbst. Frueher wurde dann
+# gleich gesichert und die Sperre freigegeben - waehrend noch gespielt wurde.
+# Deshalb: laeuft noch ein Dolphin, wird das ab jetzt beobachtet. Und erst
+# wenn einige Sekunden lang gar keins mehr laeuft, gilt die Sitzung als
+# beendet (manche Starter brauchen einen Moment, bis Dolphin erscheint).
+# Mit -Sofort entfaellt die Wartezeit.
+function Test-DolphinBeendet {
+    param([switch]$Sofort)
+    if ($null -eq $script:proc) { return $true }
+    if (-not (Test-ProzessWeg $script:proc)) { $script:endeSeit = $null; return $false }
+
+    $weiter = Find-DolphinProzess $script:proc.Id
+    if ($weiter) {
+        Write-Log ("Das gestartete Programm hat sich beendet, Dolphin laeuft aber weiter ({0}, PID {1})." -f
+            $weiter.ProcessName, $weiter.Id)
+        Write-Log "  Die Sitzung bleibt offen, bis auch Dolphin geschlossen wird."
+        $script:proc = $weiter
+        $script:endeSeit = $null
+        return $false
+    }
+    if ($Sofort) { return $true }
+    if ($null -eq $script:endeSeit) { $script:endeSeit = Get-Date; return $false }
+    return (((Get-Date) - $script:endeSeit).TotalSeconds -ge 6)
+}
+
+# --------------------------------------------------------------------------
+# Sperre waehrend der Sitzung verloren
+# --------------------------------------------------------------------------
+# Kopiert den Save-Ordner nach %APPDATA%\AC-SaveSync\gerettet\<Zeit>.
+# Rueckgabe: Pfad der Kopie oder "" bei Fehler.
+function Save-Sicherheitskopie {
+    $src = $script:cfg.SaveFolder
+    if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) { return "" }
+    try {
+        $ziel = Join-Path (Join-Path $script:AppDir 'gerettet') (Get-Date).ToString('yyyyMMdd-HHmmss')
+        New-Item -ItemType Directory -Path $ziel -Force | Out-Null
+        $null = robocopy $src $ziel /E /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
+        if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER bei der Sicherheitskopie (robocopy-Code $LASTEXITCODE)."; return "" }
+        return $ziel
+    }
+    catch {
+        Write-Log "FEHLER bei der Sicherheitskopie: $($_.Exception.Message)"
+        return ""
+    }
+}
+
+# Nach einem abgelehnten Herzschlag: Liegt die Sperre auf dem Server noch bei
+# uns? Waren wir laenger nicht erreichbar, darf der Mitspieler sie nach
+# "Sperre gilt (Min)" uebernehmen - oder jemand hat sie von Hand freigegeben.
+# Dann kommt ab jetzt nichts mehr von uns beim Server an (er lehnt jeden
+# Herzschlag ab), und der Spielende muss das SOFORT erfahren, nicht erst,
+# wenn er stundenlang weitergespielt hat.
+function Test-SperreNochMeine {
+    $remote = Get-LockStateRemote
+    if (-not $remote) { return }          # Server nicht erreichbar - keine Aussage
+    if ($remote.State -eq 'locked' -and $remote.Mine) { return }
+    Invoke-SperreVerloren $remote
+}
+
+function Invoke-SperreVerloren {
+    param($Remote)
+    $script:sperreVerloren = $true
+    $wer = if ($Remote.State -eq 'locked') { "$($Remote.Owner)" } else { "" }
+
+    if ($wer) {
+        $script:lblStatus.Text = ("SPERRE VERLOREN  -  {0} hat uebernommen. Im Spiel speichern und beenden!" -f $wer)
+        Write-Log ("WARNUNG: {0} hat deine Sperre uebernommen - vermutlich kam eine Weile nichts von dir beim Server an." -f $wer)
+    }
+    else {
+        $script:lblStatus.Text = "SPERRE VERLOREN  -  sie wurde freigegeben. Im Spiel speichern und beenden!"
+        Write-Log "WARNUNG: Deine Sperre wurde auf dem Server freigegeben (z. B. mit 'Sperre erzwingen freigeben')."
+    }
+    $script:lblStatus.BackColor = [Drawing.Color]::FromArgb(255, 150, 150)
+    Write-Log "  Ab jetzt wird nichts mehr hochgeladen - dein Stand wuerde sonst den des anderen ueberschreiben."
+
+    # Der Timer liefe waehrend der Meldung weiter und riefe sie erneut auf.
+    $script:timer.Stop()
+    [void][Windows.Forms.MessageBox]::Show(
+        ($(if ($wer) { "$wer hat deine Sperre uebernommen." } else { "Deine Sperre wurde freigegeben." }) +
+        "`n`nMeist, weil eine Weile nichts von dir beim Server ankam (Internet weg?). " +
+        "Dein Spielstand kann ab jetzt NICHT mehr hochgeladen werden.`n`n" +
+        "Was jetzt:`n" +
+        "1. Im Spiel speichern und Dolphin beenden.`n" +
+        "2. Das Programm legt dann eine Kopie deines Spielstands in`n" +
+        "    %APPDATA%\AC-SaveSync\gerettet ab.`n" +
+        "3. Sprecht euch ab, wessen Stand weitergilt. Beim naechsten 'Spielen starten' " +
+        "wird der Stand vom Server geholt - deiner steckt dann nur noch in der Kopie."),
+        "Sperre verloren", 'OK', 'Warning')
+    $script:timer.Start()
+}
+
+# --------------------------------------------------------------------------
 # Herzschlag + Ende-Erkennung (laeuft im Timer-Tick)
 # --------------------------------------------------------------------------
 function Invoke-Tick {
-    if ($null -ne $script:proc -and $script:proc.HasExited) {
+    # Ohne Prozess wartet die Sitzung nur noch aufs Sichern (Complete-Session
+    # hat sie offen gelassen) - dann nur den Herzschlag weiterlaufen lassen.
+    if ($null -ne $script:proc -and (Test-DolphinBeendet)) {
         Complete-Session
         return
     }
+    # Kurz nach dem Ende des gestarteten Prozesses (Wartezeit oben) keinen
+    # Herzschlag - das Ende wird gleich festgestellt.
+    if ($null -ne $script:endeSeit) { return }
+    # Nach verlorener Sperre gibt es nichts mehr hochzuladen.
+    if ($script:sperreVerloren) { return }
     if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge $script:cfg.HeartbeatSeconds) {
         Set-LockFile
         # Scheitert das Sichern, setzt Backup-Saves save/ selbst zurueck - der
@@ -1621,6 +1762,13 @@ function Invoke-Tick {
         if ($p.Code -ne 0) {
             $script:hbFehler++
             Write-GitProblem "Zwischenspeichern waehrend des Spielens hat nicht geklappt." $p
+
+            # Lehnt der Server ab, obwohl er erreichbar ist, kann die Sperre weg sein.
+            if ($p.Stage -eq 'push') { Test-SperreNochMeine }
+            if ($script:sperreVerloren) {
+                $script:lastHeartbeat = Get-Date
+                return
+            }
             Write-Log "  Das Spiel laeuft normal weiter - es wird beim naechsten Herzschlag erneut versucht."
 
             # Wichtig: Kommt nichts mehr beim Server an, altert dort DEINE Sperre.
@@ -1661,6 +1809,32 @@ function Complete-Session {
     if (-not $script:holdingLock) {
         $script:btnPlay.Enabled = $true
         $script:btnStop.Enabled = $false
+        return
+    }
+
+    # Sperre verloren: nichts ins Repo schreiben und nichts hochladen - der
+    # Stand des anderen gilt. Der eigene wird nur ausserhalb des Repos gesichert,
+    # denn beim naechsten Abgleich wird er aus dem Save-Ordner verdraengt.
+    if ($script:sperreVerloren) {
+        Write-Log "Dolphin beendet. Deine Sperre war weg - es wird NICHT hochgeladen."
+        $kopie = Save-Sicherheitskopie
+        if ($kopie) {
+            Write-Log ("  Eine Kopie deines Spielstands liegt hier: {0}" -f $kopie)
+            Write-Log "  Sie wird nicht automatisch verwendet. Sprecht euch ab, wessen Stand gilt."
+        }
+        else {
+            Write-Log "  ACHTUNG: Die Kopie hat nicht geklappt - dein Stand liegt nur noch im Save-Ordner."
+            Write-Log "  Diesen Ordner von Hand sichern, BEVOR du wieder 'Spielen starten' klickst!"
+        }
+        # Bilder bleiben im Bilder-Ordner (Move-Pics wuerde sie ins Repo
+        # verschieben, und der naechste Abgleich wuerde sie dort verwerfen).
+        $script:holdingLock = $false
+        $script:proc = $null
+        $script:btnPlay.Enabled = $true
+        $script:btnStop.Enabled = $false
+        [void](Update-ReadyState)
+        $s = Get-LockStateRemote
+        if ($s) { Update-StatusUI $s }
         return
     }
 
@@ -1725,7 +1899,9 @@ function Stop-Play {
     }
     # Ohne Prozess: Dolphin ist schon zu, und die Sitzung wartet nur noch
     # darauf, dass der Spielstand gesichert werden kann (siehe Complete-Session).
-    if ($null -eq $script:proc -or $script:proc.HasExited) { Complete-Session; return }
+    # Hat sich nur ein Starter beendet, uebernimmt Test-DolphinBeendet das
+    # weiterlaufende Dolphin - dann wird DAS beendet.
+    if (Test-DolphinBeendet -Sofort) { Complete-Session; return }
 
     $r = [Windows.Forms.MessageBox]::Show(
         ("Dolphin jetzt beenden?`n`n" +
