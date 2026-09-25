@@ -222,7 +222,7 @@ Knopf, dann steht dort, **was** fehlt.
 ### Wenn etwas schiefgeht
 
 - **Das Fenster friert nicht ein.** Hochladen, Abgleichen und Kopieren laufen im Hintergrund.
-  Dauert etwas länger als einen Augenblick, erscheint unter dem Protokoll eine Leiste, die sagt,
+  Dauert etwas länger als einen Augenblick, erscheint neben „Protokoll:" eine Leiste, die sagt,
   was gerade passiert (z. B. „Lade auf den Server hoch … (12 s)"). Solange sie läuft, nimmt das
   Programm keine Klicks an, damit nichts doppelt ausgelöst wird. Schließt du das Fenster in dieser
   Zeit, wartet es, bis der Vorgang fertig ist, und schließt sich dann selbst. Antwortet der

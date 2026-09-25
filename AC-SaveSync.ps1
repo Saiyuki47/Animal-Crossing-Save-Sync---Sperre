@@ -4916,6 +4916,7 @@ Set-Tip ("Notausgang: loescht die Sperre, obwohl niemand Dolphin`n" +
 # Log
 $y += 46
 $lblLog = New-Label "Protokoll:" 15 $y 100
+$yProtokoll = $y
 $y += 24
 $script:txtLog = New-Object Windows.Forms.TextBox
 $script:txtLog.Location = New-Object Drawing.Point(15, $y)
@@ -4930,24 +4931,25 @@ Set-Tip ("Protokoll dieser Sitzung: was das Skript gerade tut.`n" +
     "Wenn etwas nicht klappt, steht hier die Meldung von Git im Klartext -`n" +
     "diesen Text am besten mitkopieren, wenn du nachfragst.") $lblLog $script:txtLog
 
-# Fortschrittsanzeige unter dem Protokoll: erscheint nur, waehrend im
-# Hintergrund etwas laeuft (Holen, Hochladen, Kopieren, Download).
-# Siehe Update-Fortschritt und Invoke-FortschrittTick.
-$y += 228
+# Fortschrittsanzeige in der Zeile "Protokoll:", rechts neben der
+# Beschriftung: erscheint nur, waehrend im Hintergrund etwas laeuft (Holen,
+# Hochladen, Kopieren, Download). Bewusst nicht unter dem Protokoll - dort
+# verschwaende sie auf Bildschirmen mit 768 Pixeln Hoehe hinter der
+# Taskleiste. Siehe Update-Fortschritt und Invoke-FortschrittTick.
 $script:fortschrittPanel = New-Object Windows.Forms.Panel
-$script:fortschrittPanel.Location = New-Object Drawing.Point(15, $y)
-$script:fortschrittPanel.Size = New-Object Drawing.Size(593, 24)
-$script:fortschrittPanel.Anchor = 'Bottom,Left,Right'
+$script:fortschrittPanel.Location = New-Object Drawing.Point(120, $yProtokoll)
+$script:fortschrittPanel.Size = New-Object Drawing.Size(488, 22)
+$script:fortschrittPanel.Anchor = 'Top,Left,Right'
 $script:fortschrittPanel.Visible = $false
 $fortschrittBalken = New-Object Windows.Forms.ProgressBar
 $fortschrittBalken.Style = 'Marquee'
 $fortschrittBalken.MarqueeAnimationSpeed = 30
-$fortschrittBalken.Location = New-Object Drawing.Point(0, 4)
-$fortschrittBalken.Size = New-Object Drawing.Size(120, 16)
+$fortschrittBalken.Location = New-Object Drawing.Point(0, 3)
+$fortschrittBalken.Size = New-Object Drawing.Size(110, 16)
 $script:fortschrittPanel.Controls.Add($fortschrittBalken)
 $script:fortschrittText = New-Object Windows.Forms.Label
-$script:fortschrittText.Location = New-Object Drawing.Point(130, 2)
-$script:fortschrittText.Size = New-Object Drawing.Size(460, 20)
+$script:fortschrittText.Location = New-Object Drawing.Point(118, 1)
+$script:fortschrittText.Size = New-Object Drawing.Size(370, 20)
 $script:fortschrittText.Anchor = 'Top,Left,Right'
 $script:fortschrittText.TextAlign = 'MiddleLeft'
 $script:fortschrittPanel.Controls.Add($script:fortschrittText)
