@@ -163,7 +163,7 @@ function Wait-Protokoll {
 function Stop-MitFehler {
     param([string]$Text)
     Save-Bild 'fehler'
-    try { Write-Elementbaum } catch { }
+    try { Write-Elementbaum } catch { Write-Host "   (Elementbaum nicht lesbar: $($_.Exception.Message))" }
     throw $Text
 }
 
@@ -243,7 +243,9 @@ try {
     Schritt "Im Spiel speichern und Dolphin schliessen"
     Set-Content -LiteralPath (Join-Path $save 'data\stadt.bin') -Value 'neuer Stand aus der Sitzung'
     Get-Process -Name 'Dolphin' -ErrorAction SilentlyContinue | Where-Object {
-        $p = $null; try { $p = $_.Path } catch { }; $p -and $p -like "$fake*"
+        $p = $null
+        try { $p = $_.Path } catch { Write-Verbose "Pfad nicht lesbar: $($_.Exception.Message)" }
+        $p -and $p -like "$fake*"
     } | Stop-Process -Force
     Wait-Protokoll 'Fertig\. Spielstand hochgeladen, Sperre freigegeben\.' 90
     Start-Sleep -Seconds 2
@@ -270,9 +272,13 @@ try {
     $erfolg = $true
 }
 finally {
-    if ($script:app -and -not $script:app.HasExited) { try { $script:app.Kill() } catch { } }
+    if ($script:app -and -not $script:app.HasExited) {
+        try { $script:app.Kill() } catch { Write-Verbose "Programm schon beendet: $($_.Exception.Message)" }
+    }
     Get-Process -Name 'Dolphin' -ErrorAction SilentlyContinue | Where-Object {
-        $p = $null; try { $p = $_.Path } catch { }; $p -and $p -like "$fake*"
+        $p = $null
+        try { $p = $_.Path } catch { Write-Verbose "Pfad nicht lesbar: $($_.Exception.Message)" }
+        $p -and $p -like "$fake*"
     } | Stop-Process -Force -ErrorAction SilentlyContinue
     $log = Get-AppProtokoll
     if ($log) { [IO.File]::WriteAllText((Join-Path $Ausgabe 'programm-protokoll.log'), $log, [Text.UTF8Encoding]::new($false)) }

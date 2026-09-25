@@ -53,7 +53,7 @@ Test "Sammelordner werden erkannt, der Ordner eines Spiels nicht" {
 Test "Automatische Anzeige startet, sobald es ein Repo gibt" {
     $r = New-TestRepos
     $script:statusAufrufe = 0
-    function Update-Status { param([switch]$SkipSave) $script:statusAufrufe++ }
+    function Update-Status { $script:statusAufrufe++ }   # Ersatz; -SkipSave landet in $args
     $script:cfg.RepoPath = Join-Path $r.Wurzel 'gibtsnicht'
     Start-AutoAuffrischen -MitStatus
     Soll (-not $script:autoTimer.Enabled -and $script:statusAufrufe -eq 0) "ohne Repo: nichts"

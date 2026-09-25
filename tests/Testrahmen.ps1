@@ -290,9 +290,14 @@ function Start-FakeStarter {
 # Raeumt alle Ersatz-Dolphins und Starter nach jedem Test weg. Der Name ist
 # pro Test eindeutig - ein echtes Dolphin wird so nie angefasst.
 function Stop-TestProzesse {
-    foreach ($p in @($script:TestProzesse)) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+    foreach ($p in @($script:TestProzesse)) {
+        try { if (-not $p.HasExited) { $p.Kill() } }
+        catch { Write-Verbose "Prozess schon weg: $($_.Exception.Message)" }
+    }
     $script:TestProzesse.Clear()
-    Get-Process -Name $script:FakeName -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch { } }
+    Get-Process -Name $script:FakeName -ErrorAction SilentlyContinue | ForEach-Object {
+        try { $_.Kill() } catch { Write-Verbose "Prozess schon weg: $($_.Exception.Message)" }
+    }
 }
 
 # Wartet, bis eine Bedingung eintritt (Prozesse brauchen einen Moment).

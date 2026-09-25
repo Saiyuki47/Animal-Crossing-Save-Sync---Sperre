@@ -81,7 +81,8 @@ try {
     }
 }
 catch {
-    try { [void][ACSS.Dpi]::SetProcessDPIAware() } catch { }
+    try { [void][ACSS.Dpi]::SetProcessDPIAware() }
+    catch { Write-Verbose "DPI-Anmeldung nicht moeglich - Windows skaliert das Fenster dann selbst." }
 }
 
 # Wie stark muss das Layout wachsen? 96 dpi = 100 %, 144 dpi = 150 %.
@@ -119,7 +120,8 @@ $env:GIT_TERMINAL_PROMPT = '0'
 # und Commit-Texten kaemen verstuemmelt an, und eine Datei mit BOM, die per
 # "git show" gelesen wird, faengt mit Zeichensalat an und ist kein gueltiges
 # JSON mehr. Ohne Konsole kann das Setzen scheitern - dann bleibt es beim alten.
-try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }
+catch { Write-Verbose "Konsole laesst sich nicht auf UTF-8 umstellen - es bleibt bei der alten Codepage." }
 
 # --------------------------------------------------------------------------
 # Version und Update-Quelle
@@ -500,7 +502,8 @@ function Write-Log {
 
     # Immer auch in die Datei - nach einem Absturz ist das Fenster ja weg.
     if ($script:LogPfad) {
-        try { [IO.File]::AppendAllText($script:LogPfad, $line, [Text.UTF8Encoding]::new($false)) } catch { }
+        try { [IO.File]::AppendAllText($script:LogPfad, $line, [Text.UTF8Encoding]::new($false)) }
+        catch { Write-Verbose "Protokolldatei nicht beschreibbar: $($_.Exception.Message)" }
     }
 
     if ($script:txtLog) {
@@ -673,51 +676,51 @@ function Invoke-GitRaw {
 $script:GitKlartext = @(
     @{ Muster = 'could not read Username|could not read Password|Authentication failed|Invalid username or password|terminal prompts disabled|Permission denied \(publickey\)'
         Text  = 'Git kommt nicht auf den Server - die Zugangsdaten fehlen oder stimmen nicht.'
-        Tipp  = 'Eingabeaufforderung im Repo-Ordner oeffnen und einmal "git push" ausfuehren, dann die Anmeldung abschliessen. Bei GitHub per Browser-Login oder mit einem Token als Passwort.' 
+        Tipp  = 'Eingabeaufforderung im Repo-Ordner oeffnen und einmal "git push" ausfuehren, dann die Anmeldung abschliessen. Bei GitHub per Browser-Login oder mit einem Token als Passwort.'
     }
     @{ Muster = 'Could not resolve host|Failed to connect|Connection timed out|unable to access.*(Could not|Failed)|network is unreachable'
         Text  = 'Der Server ist nicht erreichbar - meist fehlt gerade die Internetverbindung.'
-        Tipp  = 'Internetverbindung pruefen und es danach erneut versuchen. Der Spielstand bleibt solange lokal erhalten.' 
+        Tipp  = 'Internetverbindung pruefen und es danach erneut versuchen. Der Spielstand bleibt solange lokal erhalten.'
     }
     @{ Muster = 'Repository not found|repository .* not found|remote: Not Found'
         Text  = 'Das Repo gibt es unter dieser Adresse nicht - oder dein Konto hat keinen Zugriff darauf.'
-        Tipp  = 'Adresse auf Tippfehler pruefen. Bei einem privaten Repo muss dein Konto als Mitarbeiter eingetragen sein.' 
+        Tipp  = 'Adresse auf Tippfehler pruefen. Bei einem privaten Repo muss dein Konto als Mitarbeiter eingetragen sein.'
     }
     @{ Muster = 'non-fast-forward|fetch first|Updates were rejected|behind its remote'
         Text  = 'Auf dem Server liegt ein neuerer Stand - jemand anderes war schneller.'
-        Tipp  = 'Auf "Status pruefen" klicken, damit der neue Stand geholt wird, und es dann noch einmal versuchen.' 
+        Tipp  = 'Auf "Status pruefen" klicken, damit der neue Stand geholt wird, und es dann noch einmal versuchen.'
     }
     @{ Muster = 'Please tell me who you are|user\.email|user\.name|empty ident|unable to auto-detect email'
         Text  = 'Git weiss noch nicht, wer du bist - ohne Namen und E-Mail kann es nichts speichern.'
-        Tipp  = 'Einmalig in einer Eingabeaufforderung ausfuehren:  git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"' 
+        Tipp  = 'Einmalig in einer Eingabeaufforderung ausfuehren:  git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"'
     }
     @{ Muster = 'not a git repository|does not appear to be a git repository'
         Text  = 'Der eingetragene Ordner ist kein Git-Repo.'
-        Tipp  = 'Pfad beim Repo-Ordner pruefen, oder unten auf "Repo einrichten..." klicken.' 
+        Tipp  = 'Pfad beim Repo-Ordner pruefen, oder unten auf "Repo einrichten..." klicken.'
     }
     @{ Muster = "'origin' does not appear|No such remote|remote origin already exists"
         Text  = 'Die Verbindung zum gemeinsamen Repo im Internet ("origin") ist nicht richtig eingerichtet.'
-        Tipp  = 'Ueber "Repo einrichten..." Schritt 2 die Adresse des gemeinsamen Repos eintragen.' 
+        Tipp  = 'Ueber "Repo einrichten..." Schritt 2 die Adresse des gemeinsamen Repos eintragen.'
     }
     @{ Muster = 'src refspec .* does not match any|couldn.t find remote ref'
         Text  = 'Den eingetragenen Branch gibt es noch nicht.'
-        Tipp  = 'Pruefen, ob beide Spieler denselben Branch eingetragen haben (normalerweise "main").' 
+        Tipp  = 'Pruefen, ob beide Spieler denselben Branch eingetragen haben (normalerweise "main").'
     }
     @{ Muster = 'index\.lock|Unable to create .*index\.lock'
         Text  = 'Git blockiert sich selbst - vermutlich laeuft noch ein anderer Git-Vorgang oder einer ist abgestuerzt.'
-        Tipp  = 'Kurz warten und erneut versuchen. Hilft das nicht, die Datei .git\index.lock im Repo-Ordner loeschen.' 
+        Tipp  = 'Kurz warten und erneut versuchen. Hilft das nicht, die Datei .git\index.lock im Repo-Ordner loeschen.'
     }
     @{ Muster = 'would be overwritten by merge|local changes.*would be overwritten|CONFLICT|Automatic merge failed'
         Text  = 'Lokale Aenderungen stehen dem Stand vom Server im Weg.'
-        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Liegt dabei noch Ungesichertes auf diesem PC, fragt das Programm vorher nach.' 
+        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Liegt dabei noch Ungesichertes auf diesem PC, fragt das Programm vorher nach.'
     }
     @{ Muster = 'Filename too long|unable to write file.*too long|path too long'
         Text  = 'Ein Dateiname wird zu lang - Windows steigt bei sehr langen Pfaden aus.'
-        Tipp  = 'Einmalig ausfuehren:  git config --global core.longpaths true  - oder den Repo-Ordner naeher an die Laufwerkswurzel legen, z. B. C:\ACSave.' 
+        Tipp  = 'Einmalig ausfuehren:  git config --global core.longpaths true  - oder den Repo-Ordner naeher an die Laufwerkswurzel legen, z. B. C:\ACSave.'
     }
     @{ Muster = 'detected dubious ownership|safe\.directory'
         Text  = 'Git traut dem Ordner nicht, weil er einem anderen Benutzerkonto gehoert.'
-        Tipp  = 'Einmalig ausfuehren:  git config --global --add safe.directory "<Pfad zum Repo-Ordner>"' 
+        Tipp  = 'Einmalig ausfuehren:  git config --global --add safe.directory "<Pfad zum Repo-Ordner>"'
     }
 )
 
@@ -889,7 +892,7 @@ function Find-DolphinExe {
                 if (Test-Path -LiteralPath $exe) { return $exe }
             }
         }
-        catch { }
+        catch { Write-Verbose "Suche in '$p' uebersprungen: $($_.Exception.Message)" }
     }
 
     # Ueber die Deinstallations-Eintraege der Registry (deckt eigene Pfade ab)
@@ -914,7 +917,7 @@ function Find-DolphinExe {
                 }
             }
         }
-        catch { }
+        catch { Write-Verbose "Registry-Zweig '$w' uebersprungen: $($_.Exception.Message)" }
     }
 
     $c = Get-Command 'Dolphin.exe' -ErrorAction SilentlyContinue
@@ -2653,7 +2656,7 @@ function Show-Fotos {
 
     # Blaettern per Pfeiltasten - bequemer als Klicken
     $dlg.Add_KeyDown({
-            param($s, $e)
+            $e = $args[1]
             if ($e.KeyCode -eq 'Right' -or $e.KeyCode -eq 'PageDown') { Invoke-FotoWeiter; $e.Handled = $true }
             elseif ($e.KeyCode -eq 'Left' -or $e.KeyCode -eq 'PageUp') { Invoke-FotoZurueck; $e.Handled = $true }
             elseif ($e.KeyCode -eq 'Escape') { $script:fotoDlg.Close() }
@@ -2881,7 +2884,8 @@ function Show-SelfTest {
             "[$k] $($_.Name)`r`n       $($_.Hinweis)" + $(if ($_.Roh -and -not $_.Ok) { "`r`n       git: " + ($_.Roh -replace "`r?`n", "`r`n            ") } else { "" })
         }) -join "`r`n"
     $btnKopieren.Add_Click({
-            try { [Windows.Forms.Clipboard]::SetText($script:selfTestBericht) } catch { }
+            try { [Windows.Forms.Clipboard]::SetText($script:selfTestBericht) }
+            catch { Write-Log "Zwischenablage gerade nicht verfuegbar: $($_.Exception.Message)" }
         })
     $dlg.Controls.Add($btnKopieren)
     Set-Tip ("Kopiert das ganze Ergebnis als Text - praktisch, wenn du`n" +
@@ -3201,7 +3205,8 @@ function Install-Update {
 
     # Sicherheitskopie daneben legen - falls doch etwas schiefgeht, ist der
     # alte Stand einen Handgriff entfernt.
-    try { Copy-Item -LiteralPath $selbst -Destination (Join-Path $ordner ("vorher" + $endung)) -Force } catch { }
+    try { Copy-Item -LiteralPath $selbst -Destination (Join-Path $ordner ("vorher" + $endung)) -Force }
+    catch { Write-Log "Hinweis: Sicherheitskopie der alten Fassung nicht moeglich: $($_.Exception.Message)" }
 
     try {
         Copy-Item -LiteralPath $neu -Destination $selbst -Force
@@ -3977,7 +3982,8 @@ function Show-SetupDialog {
     $script:setupKopierA.Size = New-Object Drawing.Size(160, 34)
     $script:setupKopierA.Enabled = $false
     $script:setupKopierA.Add_Click({
-            try { [Windows.Forms.Clipboard]::SetText($script:setupUrlA.Text.Trim()) } catch { }
+            try { [Windows.Forms.Clipboard]::SetText($script:setupUrlA.Text.Trim()) }
+            catch { Write-Log "Zwischenablage gerade nicht verfuegbar: $($_.Exception.Message)" }
         })
     $s1.Controls.Add($script:setupKopierA)
     Set-Tip ("Kopiert die Adresse in die Zwischenablage - schick sie deinem`n" +
@@ -4356,7 +4362,7 @@ $btnSetup.Add_Click({ Show-SetupDialog })
 $btnAdvanced.Add_Click({ Show-AdvancedDialog })
 
 $form.Add_FormClosing({
-        param($s, $e)
+        $e = $args[1]
         # Noch nicht geschriebene Aenderungen sichern (der Wartetimer koennte
         # gerade noch laufen).
         if ($script:saveTimer) { $script:saveTimer.Stop() }

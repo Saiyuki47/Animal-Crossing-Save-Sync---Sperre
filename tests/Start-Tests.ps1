@@ -44,7 +44,8 @@ foreach ($d in $dateien) {
 }
 
 Stop-TestProzesse
-try { Remove-Item -LiteralPath $script:TestWurzel -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+try { Remove-Item -LiteralPath $script:TestWurzel -Recurse -Force -ErrorAction SilentlyContinue }
+catch { Write-Verbose "Temp-Ordner bleibt liegen: $($_.Exception.Message)" }
 
 $ok = @($script:Ergebnisse | Where-Object Status -eq 'ok').Count
 $fehl = @($script:Ergebnisse | Where-Object Status -eq 'FEHLER')
