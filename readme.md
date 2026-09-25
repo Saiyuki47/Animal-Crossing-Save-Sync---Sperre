@@ -369,8 +369,10 @@ Mehr zeigt der Knopf **„Spielzeit"** im Programm, auf drei Reitern:
 
 - **Gesamt** – je Spieler Gesamtzeit, Sitzungen, Durchschnitt, längste Sitzung, Spieltage am
   Stück und wann zuletzt gespielt.
-- **Wochen** – die letzten acht Wochen (Kalenderwochen, Montag bis Sonntag), je Spieler mit
-  einem Balken. Alle Balken haben denselben Maßstab und sind so direkt vergleichbar.
+- **Wochen** – die letzten acht Wochen (Kalenderwochen, Montag bis Sonntag) mit der Zeit je
+  Spieler und einem Balken für die ganze Woche. Alle Balken haben denselben Maßstab und sind so
+  direkt vergleichbar. Darunter steht der Schnitt pro Woche – gerechnet ab der Woche der ersten
+  Sitzung und ohne die laufende Woche, damit er nicht zu niedrig ausfällt.
 - **Rekorde** – längste Sitzung, meiste Spielzeit an einem Tag, längste Serie an Spieltagen am
   Stück und die Serie, die gerade läuft.
 

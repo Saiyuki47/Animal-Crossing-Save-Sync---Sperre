@@ -114,6 +114,26 @@ Test "Auswertung: Wochen, laengste Sitzung, bester Tag, je Spieler" {
     Soll ($anna.Letzte.Start.Day -eq 22) "Anna: letzte Sitzung am 22."
     Soll ($a.Serie.Laengste -eq 2) "zusammen: 2 Tage am Stueck (21./22.)"
     Soll ($a.Erste.Spieler -eq 'Anna' -and $a.Erste.Start.Month -eq 7) "erste Sitzung im Juli (zaehlt, auch ausserhalb der 8 Wochen)"
+    $sw = @($a.SchnittWochen)
+    Soll ($sw.Count -eq 7 -and $sw[0].Woche -eq 38 -and $sw[-1].Woche -eq 32) "Schnitt ueber KW 32 bis 38: ohne die laufende KW 39 (waren $($sw.Count))"
+    Soll ([math]::Abs($a.SchnittWoche - 200 * 60 / 7) -lt 0.01) "Schnitt: 200 min auf 7 Wochen verteilt"
+}
+
+Test "Schnitt pro Woche: erst ab der Woche der ersten Sitzung, ohne die laufende" {
+    $heute = Tag '2026-09-25'   # Freitag in KW 39
+    $a = Get-SpielzeitAuswertung -Heute $heute -Sitzungen @(
+        (Sitzung 'Anna' '2026-09-11 12:00:00' 60),    # KW 37 (Freitag) - erste Sitzung
+        (Sitzung 'Max' '2026-09-16 12:00:00' 120),    # KW 38
+        (Sitzung 'Anna' '2026-09-24 12:00:00' 600)    # KW 39 - laeuft noch, zaehlt nicht
+    )
+    $sw = @($a.SchnittWochen)
+    Soll ($sw.Count -eq 2 -and $sw[0].Woche -eq 38 -and $sw[1].Woche -eq 37) "KW 37 und 38 (nicht die leeren Wochen davor)"
+    Soll ($a.SchnittWoche -eq 90 * 60) "Schnitt 90 min (war $($a.SchnittWoche / 60) min)"
+
+    $nurDieseWoche = Get-SpielzeitAuswertung -Heute $heute -Sitzungen @((Sitzung 'Anna' '2026-09-22 12:00:00' 60))
+    Soll (@($nurDieseWoche.SchnittWochen).Count -eq 0 -and $null -eq $nurDieseWoche.SchnittWoche) "erst in dieser Woche angefangen: noch kein Schnitt"
+    $leer = Get-SpielzeitAuswertung -Heute $heute -Sitzungen @()
+    Soll ($null -eq $leer.SchnittWoche) "ohne Sitzungen: kein Schnitt"
 }
 
 Test "Auswertung ohne Sitzungen bricht nicht ab" {
@@ -136,6 +156,7 @@ Test "Balken: eine Skala, beginnt bei null, kurze Wochen bleiben sichtbar" {
     Soll ((Format-Balken 1 1000) -eq $voll) "winziger Wert: mindestens ein Block"
     Soll ((Format-Balken 0 100) -eq '') "nichts gespielt: kein Balken"
     Soll ((Format-Balken 5 0) -eq '') "ohne Hoechstwert: kein Balken"
+    Soll ((Format-Balken 100 100 12) -eq ($voll * 12) -and (Format-Balken 50 100 12) -eq ($voll * 6)) "Breite waehlbar (passend zur Spalte)"
 }
 
 Test "Sitzungen aus einem echten Git-Verlauf (eigener und Server-Stand)" {

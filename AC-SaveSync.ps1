@@ -2693,6 +2693,17 @@ function Get-SpielzeitAuswertung {
         }
     }
 
+    # Schnitt pro Woche: nur ueber abgeschlossene Wochen ab der Woche der
+    # ersten Sitzung. Die Wochen davor und die laufende Woche wuerden ihn
+    # kleinrechnen.
+    $erste = $alle | Sort-Object Start | Select-Object -First 1
+    $schnittWochen = @()
+    if ($erste) {
+        $abWoche = Get-Wochenbeginn $erste.Start.ToLocalTime()
+        $schnittWochen = @($wochenListe | Where-Object { $_.Von -ge $abWoche -and $_.Von -lt $montag })
+    }
+    $schnittWoche = if ($schnittWochen.Count) { [double]($schnittWochen | Measure-Object -Property Sekunden -Average).Average } else { $null }
+
     $jeSpieler = @(foreach ($n in $spieler) {
             $eigene = @($alle | Where-Object { $_.Spieler -eq $n })
             $summe = ($eigene | Measure-Object -Property Sekunden -Sum).Sum
@@ -2708,14 +2719,16 @@ function Get-SpielzeitAuswertung {
         })
 
     return [pscustomobject]@{
-        Spieler   = $spieler
-        Anzahl    = $alle.Count
-        Erste     = ($alle | Sort-Object Start | Select-Object -First 1)
-        Wochen    = $wochenListe
-        Laengste  = ($alle | Sort-Object Sekunden -Descending | Select-Object -First 1)
-        BesterTag = $besterTag
-        Serie     = (Get-Serie -Tage (Get-Spieltage $alle) -Heute $Heute)
-        JeSpieler = $jeSpieler
+        Spieler       = $spieler
+        Anzahl        = $alle.Count
+        Erste         = $erste
+        Wochen        = $wochenListe
+        SchnittWoche  = $schnittWoche      # Sekunden, $null ohne abgeschlossene Woche
+        SchnittWochen = $schnittWochen     # die Wochen dazu, neueste zuerst
+        Laengste      = ($alle | Sort-Object Sekunden -Descending | Select-Object -First 1)
+        BesterTag     = $besterTag
+        Serie         = (Get-Serie -Tage (Get-Spieltage $alle) -Heute $Heute)
+        JeSpieler     = $jeSpieler
     }
 }
 
@@ -2856,23 +2869,33 @@ function Show-Spielzeit {
     Add-Spalte $wochen.Liste 'Zeitraum' 115
     foreach ($n in $a.Spieler) { Add-Spalte $wochen.Liste $n 85 'Right' }
     Add-Spalte $wochen.Liste 'Zusammen' 85 'Right'
-    Add-Spalte $wochen.Liste 'Verlauf' 150
+    $breiteVerlauf = 150
+    Add-Spalte $wochen.Liste 'Verlauf' $breiteVerlauf
     if ($a.Anzahl -eq 0) {
         [void]$wochen.Liste.Items.Add((New-Zeile @('-', 'Noch keine Sitzungen im Verlauf.')))
     }
     else {
         $hoechst = ($a.Wochen | Measure-Object -Property Sekunden -Maximum).Maximum
+        # Nur so viele Bloecke, wie in die Spalte passen - sonst kuerzt die
+        # Liste den Balken mit "..." und lange Wochen saehen gleich lang aus.
+        # Gerechnet wird mit Spaltenbreite und Schrift bei 100 %: Add-Spalte
+        # und Set-UiScale vergroessern beide im selben Verhaeltnis.
+        $block = [Windows.Forms.TextRenderer]::MeasureText(([string][char]0x2588) * 10, $wochen.Liste.Font).Width / 10.0
+        $bloecke = [math]::Max(4, [int][math]::Floor(($breiteVerlauf - 16) / [math]::Max(1.0, $block)))
         foreach ($w in $a.Wochen) {
             $zeitraum = "{0:dd.MM.} - {1:dd.MM.}" -f $w.Von, $w.Bis
             if ($w.Von -eq (Get-Wochenbeginn (Get-Date))) { $zeitraum += ' (jetzt)' }
             $werte = @("KW $($w.Woche)", $zeitraum)
             foreach ($n in $a.Spieler) { $werte += $(if ($w.JeSpieler[$n] -gt 0) { Format-Duration $w.JeSpieler[$n] } else { '-' }) }
             $werte += $(if ($w.Sekunden -gt 0) { Format-Duration $w.Sekunden } else { '-' })
-            $werte += (Format-Balken $w.Sekunden $hoechst)
+            $werte += (Format-Balken $w.Sekunden $hoechst $bloecke)
             [void]$wochen.Liste.Items.Add((New-Zeile $werte))
         }
-        $schnitt = ($a.Wochen | Measure-Object -Property Sekunden -Average).Average
-        $wochen.Fuss.Text = ("Im Schnitt {0} pro Woche (letzte {1} Wochen). {2}" -f (Format-Duration $schnitt), $a.Wochen.Count, $hinweis)
+        $sw = @($a.SchnittWochen)
+        if ($sw.Count) {
+            $spanne = if ($sw.Count -eq 1) { "KW $($sw[0].Woche)" } else { "KW $($sw[-1].Woche) bis $($sw[0].Woche)" }
+            $wochen.Fuss.Text = ("Im Schnitt {0} pro Woche ({1}). {2}" -f (Format-Duration $a.SchnittWoche), $spanne, $hinweis)
+        }
     }
 
     # ---- Reiter 3: Rekorde -------------------------------------------------
