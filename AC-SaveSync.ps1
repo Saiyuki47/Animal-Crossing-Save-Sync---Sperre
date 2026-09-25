@@ -2506,68 +2506,405 @@ function Update-Status {
 #region Dialoge: Spielzeit, Spielstaende, Fotos, Selbsttest, Erweitert
 
 # --------------------------------------------------------------------------
+# Spielzeit-Auswertung aus dem Git-Verlauf
+# --------------------------------------------------------------------------
+# Jede Sitzung hinterlaesst im gemeinsamen Repo eine Spur aus Commits, deren
+# Betreff das Programm selbst schreibt - und zwar seit der ersten Fassung:
+#   "lock: NAME"                            Sitzung beginnt
+#   "heartbeat: NAME"                       Lebenszeichen, etwa jede Minute
+#   "Session beendet + Spielstand (NAME)"   Sitzung endet sauber
+#   "unlock (Start abgebrochen): NAME"      Start abgebrochen - keine Sitzung
+#   "force-unlock durch NAME"               Sperre von Hand geloescht
+# Daraus lassen sich alle Sitzungen rueckwirkend ablesen, auch die, die mit
+# aelteren Fassungen gespielt wurden. Eine eigene Datei dafuer braucht es
+# nicht - und aeltere Fassungen koennen nichts davon ueberschreiben.
+
+# Liest den Verlauf (eigener Stand und zuletzt geholter Server-Stand).
+# Rueckgabe: Sitzungen, aelteste zuerst.
+function Get-Sitzungen {
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { return @() }
+    $refs = @('HEAD')
+    if ((Invoke-Git @('rev-parse', '--verify', '--quiet', "origin/$($script:cfg.Branch)")).Code -eq 0) {
+        $refs += "origin/$($script:cfg.Branch)"
+    }
+    $r = Invoke-Git (@('log', '--reverse', '--format=%ct%x09%s') + $refs)
+    if ($r.Code -ne 0) { return @() }
+    # Das Auswerten dauert bei langem Verlauf einen Moment - dabei soll das
+    # Fenster bedienbar bleiben wie beim Warten auf git.
+    Start-Beschaeftigt 'Werte den Verlauf aus'
+    try { return @(ConvertFrom-GitVerlauf -Zeilen ($r.Out -split "`r?`n")) }
+    finally { Stop-Beschaeftigt }
+}
+
+# Haengt eine Sitzung an - aber nur, wenn sie mindestens eine Minute dauerte
+# (ein gescheiterter Start ist keine Sitzung).
+function Add-Sitzung {
+    param($Liste, $Offen, [datetime]$Ende, [bool]$Laeuft = $false)
+    $sekunden = ($Ende - $Offen.Start).TotalSeconds
+    if ($sekunden -lt 60) { return }
+    [void]$Liste.Add([pscustomobject]@{
+            Spieler  = $Offen.Spieler
+            Start    = $Offen.Start
+            Ende     = $Ende
+            Sekunden = $sekunden
+            Laeuft   = $Laeuft
+        })
+}
+
+# Macht aus Zeilen "Zeitstempel<TAB>Betreff" (aelteste zuerst) Sitzungen.
+# Endet eine Sitzung ohne sauberes Ende (Absturz, uebernommene Sperre), gilt
+# das letzte Lebenszeichen als Ende. Eine noch offene Sitzung am Schluss
+# "laeuft", wenn ihr letztes Lebenszeichen weniger als 10 Minuten her ist.
+function ConvertFrom-GitVerlauf {
+    param([string[]]$Zeilen, [datetime]$Jetzt = [datetime]::UtcNow)
+    $epoche = New-Object DateTime(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    $ord = [StringComparison]::Ordinal
+    $liste = New-Object System.Collections.ArrayList
+    $offen = $null
+    $nr = 0
+    foreach ($z in $Zeilen) {
+        $nr++
+        if (($nr -band 4095) -eq 0) { Invoke-Nachrichten }   # Fenster bedienbar halten
+        if (-not $z) { continue }
+        $tab = $z.IndexOf("`t")
+        if ($tab -lt 1) { continue }
+        $sek = 0L
+        if (-not [long]::TryParse($z.Substring(0, $tab), [ref]$sek)) { continue }
+        $t = $epoche.AddSeconds($sek)
+        $betreff = $z.Substring($tab + 1)
+
+        # Einfache Anfangs-Vergleiche statt regulaerer Ausdruecke: nach einem
+        # Jahr stehen im Verlauf leicht 50 000 Herzschlaege.
+        if ($betreff.StartsWith('heartbeat: ', $ord)) {
+            $name = $betreff.Substring(11)
+            if ($offen -and $offen.Spieler -eq $name) { $offen.Zuletzt = $t }
+            else {
+                # Lebenszeichen ohne passenden Beginn im Verlauf: ab hier zaehlen.
+                if ($offen) { Add-Sitzung $liste $offen $offen.Zuletzt }
+                $offen = @{ Spieler = $name; Start = $t; Zuletzt = $t }
+            }
+        }
+        elseif ($betreff.StartsWith('lock: ', $ord)) {
+            # Neue Sitzung. War noch eine offen, endete sie mit ihrem letzten
+            # Lebenszeichen (abgestuerzt oder Sperre abgelaufen und uebernommen).
+            if ($offen) { Add-Sitzung $liste $offen $offen.Zuletzt }
+            $offen = @{ Spieler = $betreff.Substring(6); Start = $t; Zuletzt = $t }
+        }
+        elseif ($betreff.StartsWith('Session beendet + Spielstand (', $ord)) {
+            if ($offen) { Add-Sitzung $liste $offen $t; $offen = $null }
+        }
+        elseif ($betreff.StartsWith('unlock (Start abgebrochen)', $ord)) {
+            $offen = $null
+        }
+        elseif ($betreff.StartsWith('force-unlock durch ', $ord)) {
+            if ($offen) { Add-Sitzung $liste $offen $offen.Zuletzt; $offen = $null }
+        }
+    }
+    if ($offen) {
+        Add-Sitzung $liste $offen $offen.Zuletzt ((($Jetzt - $offen.Zuletzt).TotalMinutes) -lt 10)
+    }
+    return @($liste)
+}
+
+# Montag der Woche, in der der Tag liegt (Wochen laufen Montag bis Sonntag).
+function Get-Wochenbeginn {
+    param([datetime]$Tag)
+    $t = $Tag.Date
+    return $t.AddDays(-(([int]$t.DayOfWeek + 6) % 7))
+}
+
+# Kalenderwoche nach ISO 8601, wie in Deutschland ueblich: Woche 1 ist die
+# mit dem ersten Donnerstag des Jahres. (Calendar.GetWeekOfYear rechnet das
+# fuer einige Tage Ende Dezember falsch.)
+function Get-IsoWoche {
+    param([datetime]$Tag)
+    $t = $Tag.Date
+    $donnerstag = $t.AddDays(3 - (([int]$t.DayOfWeek + 6) % 7))
+    return [int][math]::Floor(($donnerstag.DayOfYear - 1) / 7) + 1
+}
+
+# Alle Tage (Ortszeit), an denen gespielt wurde. Eine Sitzung ueber
+# Mitternacht zaehlt fuer beide Tage.
+function Get-Spieltage {
+    param([object[]]$Sitzungen)
+    $tage = New-Object 'System.Collections.Generic.HashSet[datetime]'
+    foreach ($s in @($Sitzungen)) {
+        $d = $s.Start.ToLocalTime().Date
+        $bis = $s.Ende.ToLocalTime().Date
+        if (($bis - $d).TotalDays -gt 2) { $bis = $d.AddDays(2) }   # Unsinn (falsche Uhr) begrenzen
+        while ($d -le $bis) { [void]$tage.Add($d); $d = $d.AddDays(1) }
+    }
+    return @($tage | Sort-Object)
+}
+
+# Laengste und aktuelle Reihe aufeinanderfolgender Spieltage.
+# "Aktuell" zaehlt bis heute - oder bis gestern, wenn heute noch nicht
+# gespielt wurde: die Reihe ist dann ja noch nicht gerissen.
+function Get-Serie {
+    param([datetime[]]$Tage, [datetime]$Heute)
+    # Ohne Spieltage kommt hier $null an (PowerShell macht aus einer leeren
+    # Rueckgabe nichts) - das darf nicht zu einem Fehler fuehren.
+    $liste = @(@($Tage) | Where-Object { $null -ne $_ } | ForEach-Object { $_.Date } | Sort-Object -Unique)
+    $beste = 0; $besteVon = $null; $besteBis = $null
+    $laenge = 0; $von = $null; $vorher = $null
+    foreach ($d in $liste) {
+        if ($null -ne $vorher -and ($d - $vorher).TotalDays -eq 1) { $laenge++ }
+        else { $laenge = 1; $von = $d }
+        if ($laenge -gt $beste) { $beste = $laenge; $besteVon = $von; $besteBis = $d }
+        $vorher = $d
+    }
+    $aktuell = 0
+    $tag = $Heute.Date
+    if ($liste -notcontains $tag) { $tag = $tag.AddDays(-1) }
+    while ($liste -contains $tag) { $aktuell++; $tag = $tag.AddDays(-1) }
+    return [pscustomobject]@{ Aktuell = $aktuell; Laengste = $beste; Von = $besteVon; Bis = $besteBis }
+}
+
+# Wertet die Sitzungen aus: Wochenuebersicht, Rekorde und Serien - gesamt und
+# je Spieler. Tage und Wochen richten sich nach der Ortszeit dieses PCs.
+function Get-SpielzeitAuswertung {
+    param([object[]]$Sitzungen, [datetime]$Heute = (Get-Date).Date, [int]$Wochen = 8)
+    $alle = @($Sitzungen | Where-Object { $_ })
+    $spieler = @($alle | ForEach-Object { $_.Spieler } | Sort-Object -Unique)
+
+    # Wochen, die neueste zuerst. Eine Sitzung zaehlt fuer die Woche, in der
+    # sie begonnen hat.
+    $montag = Get-Wochenbeginn $Heute
+    $wochenListe = @(for ($i = 0; $i -lt $Wochen; $i++) {
+            $von = $montag.AddDays(-7 * $i)
+            $bis = $von.AddDays(7)
+            $je = @{}
+            foreach ($n in $spieler) { $je[$n] = 0.0 }
+            $summe = 0.0
+            foreach ($s in $alle) {
+                $start = $s.Start.ToLocalTime()
+                if ($start -ge $von -and $start -lt $bis) { $je[$s.Spieler] += $s.Sekunden; $summe += $s.Sekunden }
+            }
+            [pscustomobject]@{ Von = $von; Bis = $bis.AddDays(-1); Woche = (Get-IsoWoche $von); JeSpieler = $je; Sekunden = $summe }
+        })
+
+    # Spielzeit je Tag (nach Beginn der Sitzung)
+    $jeTag = @{}
+    foreach ($s in $alle) { $jeTag[$s.Start.ToLocalTime().Date] += $s.Sekunden }
+    $besterTag = $null
+    foreach ($k in $jeTag.Keys) {
+        if (-not $besterTag -or $jeTag[$k] -gt $besterTag.Sekunden) {
+            $besterTag = [pscustomobject]@{ Tag = $k; Sekunden = $jeTag[$k] }
+        }
+    }
+
+    $jeSpieler = @(foreach ($n in $spieler) {
+            $eigene = @($alle | Where-Object { $_.Spieler -eq $n })
+            $summe = ($eigene | Measure-Object -Property Sekunden -Sum).Sum
+            [pscustomobject]@{
+                Spieler   = $n
+                Sitzungen = $eigene.Count
+                Sekunden  = [double]$summe
+                Laengste  = ($eigene | Sort-Object Sekunden -Descending | Select-Object -First 1)
+                Letzte    = ($eigene | Sort-Object Start -Descending | Select-Object -First 1)
+                Schnitt   = $(if ($eigene.Count) { [double]$summe / $eigene.Count } else { 0.0 })
+                Serie     = (Get-Serie -Tage (Get-Spieltage $eigene) -Heute $Heute)
+            }
+        })
+
+    return [pscustomobject]@{
+        Spieler   = $spieler
+        Anzahl    = $alle.Count
+        Erste     = ($alle | Sort-Object Start | Select-Object -First 1)
+        Wochen    = $wochenListe
+        Laengste  = ($alle | Sort-Object Sekunden -Descending | Select-Object -First 1)
+        BesterTag = $besterTag
+        Serie     = (Get-Serie -Tage (Get-Spieltage $alle) -Heute $Heute)
+        JeSpieler = $jeSpieler
+    }
+}
+
+# Kurze, gut lesbare Angaben fuer die Tabellen.
+function Format-Tag {
+    param([datetime]$Tag)
+    return $Tag.ToString('ddd dd.MM.yyyy', [Globalization.CultureInfo]::GetCultureInfo('de-DE'))
+}
+function Format-Serie {
+    param($Serie)
+    if (-not $Serie -or $Serie.Laengste -eq 0) { return '-' }
+    $tage = if ($Serie.Laengste -eq 1) { '1 Tag' } else { "$($Serie.Laengste) Tage" }
+    $text = if ($Serie.Laengste -gt 1) {
+        "Rekord {0} ({1:dd.MM.} - {2:dd.MM.yyyy})" -f $tage, $Serie.Von, $Serie.Bis
+    }
+    else { "Rekord {0} ({1:dd.MM.yyyy})" -f $tage, $Serie.Von }
+    return ("{0}  -  aktuell {1}" -f $text, $Serie.Aktuell)
+}
+
+# Balken aus Blockzeichen fuer die Wochenuebersicht - eine gemeinsame Skala
+# fuer alle Zeilen, beginnend bei null. Wer ueberhaupt gespielt hat, bekommt
+# mindestens einen Block, damit auch kurze Wochen sichtbar sind.
+function Format-Balken {
+    param([double]$Wert, [double]$Hoechstwert, [int]$Breite = 16)
+    if ($Wert -le 0 -or $Hoechstwert -le 0) { return '' }
+    $n = [math]::Max(1, [int][math]::Round($Wert / $Hoechstwert * $Breite))
+    return ([string][char]0x2588) * $n
+}
+
+# Spaltenbreiten wachsen mit der Bildschirmskalierung (Form.Scale laesst
+# sie sonst aus - bei 150 % waeren die Spalten zu schmal).
+function Add-Spalte {
+    param($Liste, [string]$Titel, [int]$Breite, [string]$Ausrichtung = 'Left')
+    $spalte = $Liste.Columns.Add($Titel, [int]($Breite * $script:uiScale))
+    $spalte.TextAlign = $Ausrichtung
+}
+
+function New-Zeile {
+    param([string[]]$Werte)
+    $zeile = New-Object Windows.Forms.ListViewItem($Werte[0])
+    foreach ($w in ($Werte | Select-Object -Skip 1)) { [void]$zeile.SubItems.Add($w) }
+    return $zeile
+}
+
+# Ein Reiter mit Tabelle und einer Zeile Text darunter.
+function New-Reiter {
+    param($Reiter, [string]$Titel, [string]$Fusszeile)
+    $seite = New-Object Windows.Forms.TabPage
+    $seite.Text = $Titel
+    $seite.Padding = New-Object Windows.Forms.Padding(8)
+    $lst = New-Object Windows.Forms.ListView
+    $lst.View = 'Details'
+    $lst.FullRowSelect = $true
+    $lst.GridLines = $true
+    $lst.HeaderStyle = 'Nonclickable'
+    $lst.Dock = 'Fill'
+    $unten = New-Object Windows.Forms.Label
+    $unten.Text = $Fusszeile
+    $unten.Dock = 'Bottom'
+    $unten.Height = 40
+    $unten.TextAlign = 'MiddleLeft'
+    $unten.ForeColor = [Drawing.Color]::FromArgb(70, 70, 70)
+    # Reihenfolge wichtig: das mit Dock=Fill zuerst hinzufuegen, sonst ueberdeckt es die Fusszeile.
+    $seite.Controls.Add($lst)
+    $seite.Controls.Add($unten)
+    [void]$Reiter.TabPages.Add($seite)
+    return [pscustomobject]@{ Liste = $lst; Fuss = $unten }
+}
+
+# --------------------------------------------------------------------------
 # Spielzeit ansehen
 # --------------------------------------------------------------------------
 function Show-Spielzeit {
     if (-not (Test-Repo)) { return }
     $h = Get-Playtime
-    if (-not $h -or $h.Keys.Count -eq 0) {
+    $sitzungen = @(Get-Sitzungen)
+    if ((-not $h -or $h.Keys.Count -eq 0) -and $sitzungen.Count -eq 0) {
         [void][Windows.Forms.MessageBox]::Show(
             "Noch keine Spielzeit aufgezeichnet.`n`nSie wird waehrend des Spielens mitgezaehlt.",
             "Spielzeit", 'OK', 'Information')
         return
     }
+    $a = Get-SpielzeitAuswertung -Sitzungen $sitzungen
 
     $dlg = New-Object Windows.Forms.Form
     $script:zeitDlg = $dlg
     $dlg.Text = "Spielzeit"
-    $dlg.Size = New-Object Drawing.Size(560, 380)
+    $dlg.Size = New-Object Drawing.Size(680, 470)
     $dlg.StartPosition = "CenterParent"
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     if ($script:appIcon) { $dlg.Icon = $script:appIcon }
 
-    $lst = New-Object Windows.Forms.ListView
-    $lst.Location = New-Object Drawing.Point(15, 15)
-    $lst.Size = New-Object Drawing.Size(514, 250)
-    $lst.View = 'Details'
-    $lst.FullRowSelect = $true
-    $lst.GridLines = $true
-    [void]$lst.Columns.Add("Spieler", 150)
-    [void]$lst.Columns.Add("Gesamt", 110)
-    [void]$lst.Columns.Add("Sitzungen", 80)
-    [void]$lst.Columns.Add("Zuletzt gespielt", 160)
-    $dlg.Controls.Add($lst)
+    $reiter = New-Object Windows.Forms.TabControl
+    $reiter.Location = New-Object Drawing.Point(12, 12)
+    $reiter.Size = New-Object Drawing.Size(640, 360)
+    $dlg.Controls.Add($reiter)
 
-    $gesamt = 0.0
-    foreach ($name in ($h.Keys | Sort-Object { - [double]$h[$_].TotalSeconds })) {
-        $e = $h[$name]
-        $gesamt += [double]$e.TotalSeconds
-        $zuletzt = "-"
-        if ($e.LastPlayedUtc) {
+    # ---- Reiter 1: Gesamt --------------------------------------------------
+    # Gesamtzeit, Sitzungen und "zuletzt" aus playtime.json (das zaehlt jede
+    # Sekunde mit); laengste Sitzung und Schnitt aus dem Verlauf.
+    $gesamt = New-Reiter $reiter 'Gesamt' ''
+    Add-Spalte $gesamt.Liste 'Spieler' 130
+    Add-Spalte $gesamt.Liste 'Gesamt' 85 'Right'
+    Add-Spalte $gesamt.Liste 'Sitzungen' 75 'Right'
+    Add-Spalte $gesamt.Liste 'Laengste Sitzung' 110 'Right'
+    Add-Spalte $gesamt.Liste 'Schnitt' 80 'Right'
+    Add-Spalte $gesamt.Liste 'Zuletzt gespielt' 125
+    $namen = @(@($h.Keys) + @($a.Spieler) | Sort-Object -Unique)
+    $summe = 0.0
+    $zeilen = foreach ($n in $namen) {
+        $e = if ($h.ContainsKey($n)) { $h[$n] } else { $null }
+        $v = $a.JeSpieler | Where-Object { $_.Spieler -eq $n } | Select-Object -First 1
+        $sek = if ($e) { [double]$e.TotalSeconds } elseif ($v) { $v.Sekunden } else { 0.0 }
+        $anzahl = if ($e) { [int]$e.Sessions } elseif ($v) { $v.Sitzungen } else { 0 }
+        $zuletzt = '-'
+        if ($e -and $e.LastPlayedUtc) {
             $d = ConvertTo-UtcZeit $e.LastPlayedUtc
             if ($d) { $zuletzt = $d.ToLocalTime().ToString("dd.MM.yyyy HH:mm") }
         }
-        $i = New-Object Windows.Forms.ListViewItem($name)
-        [void]$i.SubItems.Add((Format-Duration $e.TotalSeconds))
-        [void]$i.SubItems.Add("$($e.Sessions)")
-        [void]$i.SubItems.Add($zuletzt)
-        [void]$lst.Items.Add($i)
+        elseif ($v -and $v.Letzte) { $zuletzt = $v.Letzte.Ende.ToLocalTime().ToString("dd.MM.yyyy HH:mm") }
+        $summe += $sek
+        [pscustomobject]@{
+            Sek   = $sek
+            Werte = @($n, (Format-Duration $sek), "$anzahl",
+                $(if ($v -and $v.Laengste) { Format-Duration $v.Laengste.Sekunden } else { '-' }),
+                $(if ($v -and $v.Sitzungen) { Format-Duration $v.Schnitt } else { '-' }), $zuletzt)
+        }
+    }
+    foreach ($z in ($zeilen | Sort-Object Sek -Descending)) { [void]$gesamt.Liste.Items.Add((New-Zeile $z.Werte)) }
+    $gesamt.Fuss.Text = ("Zusammen: {0}" -f (Format-Duration $summe))
+    $gesamt.Fuss.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
+
+    $hinweis = "Berechnet aus dem Verlauf des gemeinsamen Ordners (Sitzungen ab einer Minute)."
+    # ---- Reiter 2: Wochen --------------------------------------------------
+    $wochen = New-Reiter $reiter 'Wochen' $hinweis
+    Add-Spalte $wochen.Liste 'Woche' 70
+    Add-Spalte $wochen.Liste 'Zeitraum' 115
+    foreach ($n in $a.Spieler) { Add-Spalte $wochen.Liste $n 85 'Right' }
+    Add-Spalte $wochen.Liste 'Zusammen' 85 'Right'
+    Add-Spalte $wochen.Liste 'Verlauf' 150
+    if ($a.Anzahl -eq 0) {
+        [void]$wochen.Liste.Items.Add((New-Zeile @('-', 'Noch keine Sitzungen im Verlauf.')))
+    }
+    else {
+        $hoechst = ($a.Wochen | Measure-Object -Property Sekunden -Maximum).Maximum
+        foreach ($w in $a.Wochen) {
+            $zeitraum = "{0:dd.MM.} - {1:dd.MM.}" -f $w.Von, $w.Bis
+            if ($w.Von -eq (Get-Wochenbeginn (Get-Date))) { $zeitraum += ' (jetzt)' }
+            $werte = @("KW $($w.Woche)", $zeitraum)
+            foreach ($n in $a.Spieler) { $werte += $(if ($w.JeSpieler[$n] -gt 0) { Format-Duration $w.JeSpieler[$n] } else { '-' }) }
+            $werte += $(if ($w.Sekunden -gt 0) { Format-Duration $w.Sekunden } else { '-' })
+            $werte += (Format-Balken $w.Sekunden $hoechst)
+            [void]$wochen.Liste.Items.Add((New-Zeile $werte))
+        }
+        $schnitt = ($a.Wochen | Measure-Object -Property Sekunden -Average).Average
+        $wochen.Fuss.Text = ("Im Schnitt {0} pro Woche (letzte {1} Wochen). {2}" -f (Format-Duration $schnitt), $a.Wochen.Count, $hinweis)
     }
 
-    $lg = New-Object Windows.Forms.Label
-    $lg.Text = ("Zusammen: {0}" -f (Format-Duration $gesamt))
-    $lg.Location = New-Object Drawing.Point(15, 275)
-    $lg.Size = New-Object Drawing.Size(300, 22)
-    $lg.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
-    $dlg.Controls.Add($lg)
+    # ---- Reiter 3: Rekorde -------------------------------------------------
+    $rekorde = New-Reiter $reiter 'Rekorde' $hinweis
+    Add-Spalte $rekorde.Liste 'Rekord' 220
+    Add-Spalte $rekorde.Liste 'Wert' 390
+    if ($a.Anzahl -eq 0) {
+        [void]$rekorde.Liste.Items.Add((New-Zeile @('-', 'Noch keine Sitzungen im Verlauf.')))
+    }
+    else {
+        $l = $a.Laengste
+        [void]$rekorde.Liste.Items.Add((New-Zeile @('Laengste Sitzung',
+                    ("{0}  -  {1}, {2}" -f (Format-Duration $l.Sekunden), $l.Spieler, (Format-Tag $l.Start.ToLocalTime())))))
+        if ($a.BesterTag) {
+            [void]$rekorde.Liste.Items.Add((New-Zeile @('Meiste Spielzeit an einem Tag',
+                        ("{0}  -  {1}" -f (Format-Duration $a.BesterTag.Sekunden), (Format-Tag $a.BesterTag.Tag)))))
+        }
+        [void]$rekorde.Liste.Items.Add((New-Zeile @('Spieltage am Stueck (zusammen)', (Format-Serie $a.Serie))))
+        foreach ($v in $a.JeSpieler) {
+            [void]$rekorde.Liste.Items.Add((New-Zeile @("Spieltage am Stueck ($($v.Spieler))", (Format-Serie $v.Serie))))
+        }
+        [void]$rekorde.Liste.Items.Add((New-Zeile @('Sitzungen im Verlauf',
+                    ("{0}, seit {1}" -f $a.Anzahl, (Format-Tag $a.Erste.Start.ToLocalTime())))))
+    }
 
     $bZu = New-Object Windows.Forms.Button
     $bZu.Text = "Schliessen"
-    $bZu.Location = New-Object Drawing.Point(409, 300)
+    $bZu.Location = New-Object Drawing.Point(532, 384)
     $bZu.Size = New-Object Drawing.Size(120, 30)
     $bZu.Add_Click({ $script:zeitDlg.Close() })
     $dlg.Controls.Add($bZu)
+    $dlg.CancelButton = $bZu
 
     Set-UiScale $dlg
     [void]$dlg.ShowDialog()
