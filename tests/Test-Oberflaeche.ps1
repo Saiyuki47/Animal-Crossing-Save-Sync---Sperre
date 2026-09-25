@@ -60,8 +60,22 @@ function Save-Bild {
         $g = [System.Drawing.Graphics]::FromImage($bmp)
         $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
         $bmp.Save($datei, [System.Drawing.Imaging.ImageFormat]::Png)
-        $g.Dispose(); $bmp.Dispose()
         Write-Host "   Bildschirmfoto: $datei"
+        # Mit ACSS_BILD_INS_LOG=1 zusaetzlich verkleinert als Text ins Log -
+        # fuer alle, die an die hochgeladenen Dateien nicht herankommen.
+        if ($env:ACSS_BILD_INS_LOG -eq '1') {
+            $breite = [math]::Min(800, $bmp.Width)
+            $hoehe = [int]($bmp.Height * $breite / $bmp.Width)
+            $klein = New-Object System.Drawing.Bitmap($bmp, $breite, $hoehe)
+            $ms = New-Object IO.MemoryStream
+            $klein.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $b64 = [Convert]::ToBase64String($ms.ToArray())
+            Write-Host ("BILD-ANFANG {0}" -f $Name)
+            for ($i = 0; $i -lt $b64.Length; $i += 2000) { Write-Host ("BILD " + $b64.Substring($i, [math]::Min(2000, $b64.Length - $i))) }
+            Write-Host "BILD-ENDE"
+            $klein.Dispose(); $ms.Dispose()
+        }
+        $g.Dispose(); $bmp.Dispose()
     }
     catch { Write-Host "   (Bildschirmfoto nicht moeglich: $($_.Exception.Message))" -ForegroundColor DarkYellow }
 }
@@ -92,6 +106,18 @@ function Get-StatusText {
     }
     return ''
 }
+# Schreibt alle Elemente des Hauptfensters ins Log - zur Fehlersuche, wenn
+# ein Element nicht gefunden wird.
+function Write-Elementbaum {
+    $f = Get-Hauptfenster
+    if (-not $f) { Write-Host "   (kein Hauptfenster)"; return }
+    Write-Host "   Elemente im Hauptfenster:"
+    foreach ($e in $f.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+        $c = $e.Current
+        Write-Host ("     {0,-22} name='{1}' id='{2}' klasse='{3}'" -f $c.ControlType.ProgrammaticName, $c.Name, $c.AutomationId, $c.ClassName)
+    }
+}
+
 function Invoke-Knopf {
     param([string]$Name)
     $k = Get-Element $Name
@@ -125,6 +151,7 @@ function Wait-Protokoll {
 function Stop-MitFehler {
     param([string]$Text)
     Save-Bild 'fehler'
+    try { Write-Elementbaum } catch { }
     throw $Text
 }
 

@@ -37,6 +37,8 @@ jobs:
       # Sitzung gegen einen lokalen Test-Server durch.
       - name: Oberflaeche (Ende-zu-Ende)
         shell: powershell
+        env:
+          ACSS_BILD_INS_LOG: '1'
         run: .\tests\Test-Oberflaeche.ps1 -Ausgabe "$env:RUNNER_TEMP\oberflaeche"
 
       - name: Bildschirmfotos und Protokoll hochladen
