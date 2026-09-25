@@ -46,6 +46,9 @@ foreach ($d in $dateien) {
 Stop-TestProzesse
 try { Remove-Item -LiteralPath $script:TestWurzel -Recurse -Force -ErrorAction SilentlyContinue }
 catch { Write-Verbose "Temp-Ordner bleibt liegen: $($_.Exception.Message)" }
+if ($script:AufWindows -and (Test-Path -LiteralPath $script:TestSchluessel)) {
+    Remove-Item -LiteralPath $script:TestSchluessel -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $ok = @($script:Ergebnisse | Where-Object Status -eq 'ok').Count
 $fehl = @($script:Ergebnisse | Where-Object Status -eq 'FEHLER')

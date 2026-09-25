@@ -41,7 +41,9 @@
 
   Starten:
   --------
-    Rechtsklick auf die Datei -> "Mit PowerShell ausfuehren"
+    Die AC-SaveSync.cmd aus den Releases doppelklicken - sie installiert sich
+    beim ersten Start selbst (siehe Abschnitt "Fest installieren").
+    Diese .ps1 direkt: Rechtsklick auf die Datei -> "Mit PowerShell ausfuehren"
     Oder in PowerShell:   powershell -ExecutionPolicy Bypass -File .\AC-SaveSync.ps1
 ================================================================================
 #>
@@ -156,7 +158,7 @@ catch { Write-Verbose "Konsole laesst sich nicht auf UTF-8 umstellen - es bleibt
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.20'
+$script:Version = '1.21'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
@@ -176,6 +178,30 @@ $script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
 # Eigener Pfad - fuer die Desktop-Verknuepfung. Beim Start ueber die .cmd
 # setzt deren Kopf $PSCommandPath auf die .cmd, sonst ist es diese .ps1.
 $script:SelfPath = $PSCommandPath
+# Fester Ort fuer das Programm (siehe "Fest installieren"): der Ordner, den
+# Windows fuer Programme eines einzelnen Benutzers vorsieht - dort landen auch
+# VS Code oder Python, wenn man sie ohne Adminrechte installiert. Das Programm
+# darf sich dort beim Update selbst ersetzen, OneDrive synchronisiert ihn
+# nicht, und beim Aufraeumen von Downloads oder Desktop geht es nicht verloren.
+# Einstellungen und Sicherheitskopien bleiben davon getrennt in AppDir.
+$script:InstallDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs\AC-SaveSync' } else { $null }
+$script:DesktopDir = [Environment]::GetFolderPath('Desktop')
+$script:StartmenueDir = [Environment]::GetFolderPath('Programs')
+$script:VerknuepfungsName = 'Animal Crossing Save-Sync.lnk'
+# Eintrag unter "Apps" - nur fuer diesen Benutzer, dafuer reichen normale Rechte.
+$script:UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AC-SaveSync'
+# Auftrag an diesen Start, vom Starter aus dem ersten Argument uebernommen
+# (siehe tools/Build-Cmd.ps1). Bisher nur "/deinstallieren" von "Apps".
+$script:Auftrag = ("$env:ACSS_AUFTRAG".Trim() -replace '^[/-]+', '').ToLowerInvariant()
+# Hat eine andere Datei dieses Programm gestartet, nachdem sie es installiert
+# hat? Dann steht hier ihr Pfad (siehe Start-Installiertes).
+$script:UebergabeVon = "$env:ACSS_UEBERGABE"
+# Beides gilt nur fuer diesen einen Start - nicht an spaeter gestartete
+# Programme weitervererben (Neustart nach einem Update, Dolphin, git).
+Remove-Item -Path Env:\ACSS_AUFTRAG, Env:\ACSS_UEBERGABE -ErrorAction SilentlyContinue
+# Nach dem Start einmal fragen, ob fest installiert werden soll?
+# (siehe Invoke-InstallBeimStart)
+$script:installFrage = $false
 # Pfad der Protokolldatei dieses Laufs (siehe Initialize-LogDatei)
 $script:LogPfad = $null
 # Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
@@ -192,6 +218,8 @@ $script:defaults = @{
     Branch           = "main"
     LeaseMinutes     = 5
     HeartbeatSeconds = 60
+    # Einmal "Nein" zum festen Installieren gesagt - dann nicht mehr fragen
+    InstallDeclined  = $false
 }
 $script:cfg = $script:defaults.Clone()
 
@@ -301,6 +329,7 @@ $script:selfTestBericht = ""
 
 # Erweiterte Einstellungen
 $script:advPicsBox = $null
+$script:advInstallieren = $false
 
 # Erststart-Assistent
 $script:wizDlg = $null
@@ -528,41 +557,58 @@ function Get-AppIcon {
     return $script:appIcon
 }
 
-# Legt eine Verknuepfung auf dem Desktop an - mit Icon, denn die .cmd selbst
-# kann keins haben. Rueckgabe: Pfad der Verknuepfung oder "" bei Fehler.
-function New-DesktopShortcut {
+# Legt die Verknuepfung "Animal Crossing Save-Sync" in einem Ordner an (Desktop
+# oder Startmenue) - mit Symbol, denn die .cmd selbst kann keins haben. Eine
+# vorhandene gleichen Namens wird ersetzt.
+# Rueckgabe: Pfad der Verknuepfung oder "" bei Fehler.
+function New-Verknuepfung {
+    param([string]$Ordner, [string]$Ziel, [string]$Symbol)
     try {
-        [void](Get-AppIcon)
-        $selbst = $script:SelfPath
-        if ([string]::IsNullOrWhiteSpace($selbst) -or -not (Test-Path -LiteralPath $selbst)) {
-            Write-Log "Verknuepfung nicht moeglich: der eigene Pfad ist unbekannt."
-            return ""
-        }
-        $ziel = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Animal Crossing Save-Sync.lnk'
+        $datei = Join-Path $Ordner $script:VerknuepfungsName
         $ws = New-Object -ComObject WScript.Shell
-        $lnk = $ws.CreateShortcut($ziel)
+        $lnk = $ws.CreateShortcut($datei)
 
-        if ([IO.Path]::GetExtension($selbst).ToLowerInvariant() -eq '.ps1') {
+        if ([IO.Path]::GetExtension($Ziel).ToLowerInvariant() -eq '.ps1') {
             # Direkt gestartete .ps1: ueber powershell.exe, sonst oeffnet der Editor
             $lnk.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $lnk.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $selbst)
+            $lnk.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $Ziel)
         }
         else {
-            $lnk.TargetPath = $selbst
+            $lnk.TargetPath = $Ziel
         }
-        $lnk.WorkingDirectory = Split-Path -Parent $selbst
+        $lnk.WorkingDirectory = Split-Path -Parent $Ziel
         $lnk.Description = "Animal Crossing Save-Sync + Sperre"
-        if ($script:IconPath -and (Test-Path -LiteralPath $script:IconPath)) {
-            $lnk.IconLocation = "$($script:IconPath),0"
+        if ($Symbol -and (Test-Path -LiteralPath $Symbol)) {
+            $lnk.IconLocation = "$Symbol,0"
         }
         $lnk.Save()
-        Write-Log "Verknuepfung auf dem Desktop angelegt."
-        return $ziel
+        return $datei
     }
     catch {
-        Write-Log "Verknuepfung konnte nicht angelegt werden: $($_.Exception.Message)"
+        Write-Log ("Verknuepfung in {0} konnte nicht angelegt werden: {1}" -f $Ordner, $_.Exception.Message)
         return ""
     }
+}
+
+# Verknuepfung auf dem Desktop fuer genau diese Datei - fuer alles, was nicht
+# fest installiert ist (z. B. die .ps1 aus dem Repo).
+function New-DesktopShortcut {
+    [void](Get-AppIcon)
+    $selbst = $script:SelfPath
+    if ([string]::IsNullOrWhiteSpace($selbst) -or -not (Test-Path -LiteralPath $selbst)) {
+        Write-Log "Verknuepfung nicht moeglich: der eigene Pfad ist unbekannt."
+        return ""
+    }
+    $datei = New-Verknuepfung -Ordner $script:DesktopDir -Ziel $selbst -Symbol $script:IconPath
+    if ($datei) { Write-Log "Verknuepfung auf dem Desktop angelegt." }
+    return $datei
+}
+
+# Wohin zeigt eine Verknuepfung? Rueckgabe: Pfad oder "".
+function Get-VerknuepfungsZiel {
+    param([string]$Pfad)
+    try { return "$((New-Object -ComObject WScript.Shell).CreateShortcut($Pfad).TargetPath)" }
+    catch { return "" }
 }
 
 # Eingebettetes Deko-Banner (Base64-PNG, 192x64)
@@ -5339,11 +5385,38 @@ function Show-AdvancedDialog {
         "zwischendurch ab.`n" +
         "Standard: 60, Minimum 10.") $tHeart
 
+    # Der linke Werkzeug-Knopf je nach Lage: Die installierte Fassung legt ihre
+    # Verknuepfungen neu an, eine .cmd von woanders bietet das Installieren an
+    # (nach einem Nein beim Start), eine .ps1 bekommt wie bisher eine
+    # Verknuepfung auf dem Desktop.
+    $script:advInstallieren = $false
     $bVerk = New-Object Windows.Forms.Button
-    $bVerk.Text = "Verknuepfung auf dem Desktop anlegen"
     $bVerk.Location = New-Object Drawing.Point(15, 190)
     $bVerk.Size = New-Object Drawing.Size(280, 28)
-    $bVerk.Add_Click({ [void](New-DesktopShortcut) })
+    if (Test-LaeuftInstalliert) {
+        $bVerk.Text = "Verknuepfungen neu anlegen"
+        $bVerk.Add_Click({
+                if (Install-Verknuepfungen) { Write-Log "Verknuepfungen auf dem Desktop und im Startmenue neu angelegt." }
+            })
+        $verkTipp = ("Legt die Verknuepfungen auf dem Desktop und im Startmenue neu an -`n" +
+            "zum Beispiel, wenn eine davon versehentlich geloescht wurde.")
+    }
+    elseif ([IO.Path]::GetExtension("$($script:SelfPath)").ToLowerInvariant() -eq '.cmd' -and (Get-InstallPfad)) {
+        $bVerk.Text = "Fest installieren..."
+        # Erst dieses Fenster schliessen, dann fragen - bei Ja startet das
+        # Programm neu (siehe unten nach ShowDialog).
+        $bVerk.Add_Click({ $script:advInstallieren = $true; $args[0].FindForm().Close() })
+        $verkTipp = ("Kopiert das Programm in einen festen Ordner, legt Verknuepfungen auf dem`n" +
+            "Desktop und im Startmenue an und startet von dort neu. Updates landen dann`n" +
+            "automatisch dort - die Datei hier wird nicht mehr gebraucht.")
+    }
+    else {
+        $bVerk.Text = "Verknuepfung auf dem Desktop anlegen"
+        $bVerk.Add_Click({ [void](New-DesktopShortcut) })
+        $verkTipp = ("Legt eine Verknuepfung mit Symbol auf dem Desktop an.`n" +
+            "Die heruntergeladene .cmd-Datei selbst kann kein Symbol tragen -`n" +
+            "das legt Windows fuer alle Dateien dieser Art gemeinsam fest.")
+    }
     $dlg.Controls.Add($bVerk)
 
     $bUpd = New-Object Windows.Forms.Button
@@ -5362,9 +5435,7 @@ function Show-AdvancedDialog {
     $lVer.Size = New-Object Drawing.Size(200, 20)
     $lVer.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
     $dlg.Controls.Add($lVer)
-    Set-Tip ("Legt eine Verknuepfung mit Symbol auf dem Desktop an.`n" +
-        "Die heruntergeladene .cmd-Datei selbst kann kein Symbol tragen -`n" +
-        "das legt Windows fuer alle Dateien dieser Art gemeinsam fest.") $bVerk
+    Set-Tip $verkTipp $bVerk
 
     $ok = New-Object Windows.Forms.Button
     $ok.Text = "Uebernehmen"; $ok.Location = New-Object Drawing.Point(340, 258)
@@ -5409,6 +5480,7 @@ function Show-AdvancedDialog {
                     "Fuer seltenere Herzschlaege 'Sperre gilt' erhoehen.") -f $script:cfg.HeartbeatSeconds, $script:cfg.LeaseMinutes, $wirksam))
         }
     }
+    if ($script:advInstallieren) { [void](Invoke-InstallFrage -Nachholen) }
 }
 
 #endregion
@@ -5703,6 +5775,365 @@ function Invoke-UpdatePruefung {
                 "Das Update hat nicht geklappt. Die vorhandene Fassung laeuft unveraendert weiter.`n`n" +
                 "Einzelheiten stehen im Protokoll. Du kannst die Datei auch von Hand holen:`n{0}" -f $script:ReleaseSeite))
     }
+}
+
+#endregion
+
+#region Fest installieren
+
+# --------------------------------------------------------------------------
+# Fest installieren
+# --------------------------------------------------------------------------
+# Die heruntergeladene .cmd richtet sich beim ersten Start selbst ein: Sie
+# kopiert sich nach %LOCALAPPDATA%\Programs\AC-SaveSync, legt Verknuepfungen
+# auf dem Desktop und im Startmenue an, traegt sich unter "Apps" ein und
+# startet von dort neu. Ab dann laeuft immer diese Kopie, und die Updates
+# landen auch dort - die heruntergeladene Datei wird nicht mehr gebraucht.
+# Einstellungen und Sicherheitskopien bleiben davon getrennt in AppDir.
+# Eine direkt gestartete .ps1 (Entwicklung, Oberflaechentest) installiert
+# nichts.
+
+function Get-InstallPfad {
+    if (-not $script:InstallDir) { return $null }
+    return (Join-Path $script:InstallDir 'AC-SaveSync.cmd')
+}
+
+# Laeuft dieses Programm aus dem festen Ordner? Gross-/Kleinschreibung zaehlt
+# nicht - wie bei Windows selbst.
+function Test-LaeuftInstalliert {
+    $ziel = Get-InstallPfad
+    if (-not $ziel -or [string]::IsNullOrWhiteSpace($script:SelfPath)) { return $false }
+    try { return ([IO.Path]::GetFullPath($script:SelfPath) -eq [IO.Path]::GetFullPath($ziel)) }
+    catch { return $false }
+}
+
+# Liest die Versionsnummer aus einer Programmdatei (.cmd oder .ps1), ohne sie
+# auszufuehren. Rueckgabe: z. B. '1.21', oder $null.
+function Get-DateiVersion {
+    param([string]$Pfad)
+    try {
+        if (-not $Pfad -or -not (Test-Path -LiteralPath $Pfad)) { return $null }
+        $text = [IO.File]::ReadAllText($Pfad, [Text.UTF8Encoding]::new($false))
+        $m = [regex]::Match($text, "(?m)^\`$script:Version = '([^']+)'")
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    catch { Write-Verbose "Version nicht lesbar: $($_.Exception.Message)" }
+    return $null
+}
+
+# Was eine .cmd ausserhalb des festen Ordners beim Start tut - als eigene
+# Funktion, damit sich die Entscheidung testen laesst:
+#   'installieren'  sich dorthin kopieren und von dort starten
+#   'uebergeben'    dort liegt schon eine gleich neue oder neuere Fassung - die starten
+#   'fragen'        aeltere Einrichtung: nach dem Start einmal fragen
+#   'normal'        von hier laufen (einmal abgelehnt, oder selbst gebaut)
+# -Abweichend: Die Datei dort hat einen anderen Inhalt als diese.
+function Get-InstallSchritt {
+    param([string]$VorhandeneVersion, [bool]$Erststart, [bool]$Abgelehnt, [bool]$Abweichend)
+    if ($VorhandeneVersion) {
+        # Eine aeltere Fassung dort ersetzen (Update von Hand per Download) -
+        # eine gleich neue oder neuere aber nie mit dieser ueberschreiben.
+        if (Test-VersionNeuer $script:Version $VorhandeneVersion) { return 'installieren' }
+        # Gleiche Nummer, aber anderer Inhalt: eine selbst gebaute oder
+        # geaenderte Fassung (Releases derselben Nummer sind Byte fuer Byte
+        # gleich). Die laeuft, wie doppelgeklickt, von hier - statt dass
+        # stillschweigend die installierte startet.
+        if ($Abweichend -and -not (Test-VersionNeuer $VorhandeneVersion $script:Version)) { return 'normal' }
+        return 'uebergeben'
+    }
+    if ($Erststart) { return 'installieren' }
+    if ($Abgelehnt) { return 'normal' }
+    return 'fragen'
+}
+
+# Beim Start, noch vor dem Fenster. Rueckgabe: $true = die installierte
+# Fassung ist gestartet, dieses Programm soll sich sofort beenden.
+function Invoke-InstallBeimStart {
+    $endung = [IO.Path]::GetExtension("$($script:SelfPath)").ToLowerInvariant()
+    $ziel = Get-InstallPfad
+    if ($endung -ne '.cmd' -or -not $ziel) { return $false }
+    if (Test-LaeuftInstalliert) {
+        Update-InstallEintrag
+        return $false
+    }
+    if ($script:UebergabeVon) {
+        # Gerade von einer anderen Datei hierher weitergereicht und trotzdem
+        # nicht im festen Ordner? Dann nicht noch einmal weiterreichen - das
+        # gaebe eine Endlosschleife von Neustarts.
+        Write-Log ("WARNUNG: Laeuft nicht aus dem festen Ordner, obwohl dorthin weitergereicht: {0}" -f $script:SelfPath)
+        return $false
+    }
+    # Liegt dort schon eine brauchbare Fassung? Eine beschaedigte zaehlt nicht -
+    # sonst kaeme man mit einer frisch heruntergeladenen Datei nie an ihr vorbei.
+    $vorhanden = ''
+    $abweichend = $false
+    if ((Test-Path -LiteralPath $ziel) -and -not (Test-UpdateDatei $ziel '.cmd')) {
+        $vorhanden = "$(Get-DateiVersion $ziel)"
+        $abweichend = -not (Test-GleicherInhalt $ziel $script:SelfPath)
+    }
+
+    $schritt = Get-InstallSchritt -VorhandeneVersion $vorhanden -Erststart ([bool]$script:istErststart) `
+        -Abgelehnt ([bool]$script:cfg.InstallDeclined) -Abweichend $abweichend
+    switch ($schritt) {
+        'installieren' {
+            if (Install-Programm) { return (Start-Installiertes) }
+            Write-Log "Das Programm laeuft deshalb von hier aus weiter."
+        }
+        'uebergeben' {
+            Write-Log ("Starte die installierte Fassung {0}." -f $vorhanden)
+            return (Start-Installiertes)
+        }
+        'fragen' { $script:installFrage = $true }
+        'normal' {
+            if ($vorhanden) {
+                Write-Log ("Laeuft von hier: gleiche Version wie die installierte ({0}), aber anderer Inhalt - selbst gebaut?" -f $vorhanden)
+            }
+        }
+    }
+    return $false
+}
+
+# Haben zwei Dateien denselben Inhalt? Laesst sich eine nicht lesen, gilt
+# "ja" - dann bleibt es beim Start der installierten Fassung.
+function Test-GleicherInhalt {
+    param([string]$A, [string]$B)
+    try { return ((Get-FileHash -LiteralPath $A -ErrorAction Stop).Hash -eq (Get-FileHash -LiteralPath $B -ErrorAction Stop).Hash) }
+    catch { return $true }
+}
+
+# Kopiert diese Datei in den festen Ordner, dazu die Verknuepfungen und der
+# Eintrag unter "Apps". Rueckgabe: $true, wenn die Kopie steht - scheitert nur
+# eine Verknuepfung oder der Eintrag, steht das im Protokoll, und das Programm
+# laeuft trotzdem.
+function Install-Programm {
+    $selbst = "$($script:SelfPath)"
+    $ziel = Get-InstallPfad
+    if (-not $ziel -or -not $selbst -or -not (Test-Path -LiteralPath $selbst)) {
+        Write-Log "Installieren nicht moeglich: der eigene Pfad ist unbekannt."
+        return $false
+    }
+    $neu = $ziel + '.neu'
+    try {
+        if (-not (Test-Path -LiteralPath $script:InstallDir)) {
+            New-Item -ItemType Directory -Path $script:InstallDir -Force | Out-Null
+        }
+        # Erst daneben schreiben und pruefen: Eine vorhandene Fassung bleibt so
+        # heil, falls unterwegs etwas schiefgeht. Bewusst die Bytes statt
+        # Copy-Item - Copy-Item naehme die Marke "aus dem Internet" mit, und
+        # Windows fragte dann bei jedem Start ueber die Verknuepfung erneut nach.
+        [IO.File]::WriteAllBytes($neu, [IO.File]::ReadAllBytes($selbst))
+        $fehler = Test-UpdateDatei $neu '.cmd'
+        if ($fehler) { throw "Die Kopie ist nicht in Ordnung: $fehler" }
+        Move-Item -LiteralPath $neu -Destination $ziel -Force
+    }
+    catch {
+        Write-Log ("Installieren fehlgeschlagen: {0}" -f $_.Exception.Message)
+        Remove-Item -LiteralPath $neu -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Write-Log ("Installiert: {0}" -f $ziel)
+    [void](Install-Verknuepfungen)
+    [void](Register-Deinstallation)
+    return $true
+}
+
+# Legt das Programmsymbol neben das installierte Programm - fuer die
+# Verknuepfungen und den Eintrag unter "Apps". Rueckgabe: Pfad oder "".
+function Save-InstallSymbol {
+    try {
+        $pfad = Join-Path $script:InstallDir 'ac-savesync.ico'
+        [IO.File]::WriteAllBytes($pfad, [Convert]::FromBase64String($script:IconBase64))
+        return $pfad
+    }
+    catch {
+        Write-Log ("Hinweis: Programmsymbol nicht abgelegt: {0}" -f $_.Exception.Message)
+        return ""
+    }
+}
+
+# Verknuepfungen auf dem Desktop und im Startmenue, beide auf die installierte
+# Fassung. Rueckgabe: $true, wenn beide stehen (was nicht klappt, meldet
+# New-Verknuepfung selbst im Protokoll).
+function Install-Verknuepfungen {
+    $ziel = Get-InstallPfad
+    $symbol = Save-InstallSymbol
+    $alle = $true
+    foreach ($ordner in @($script:DesktopDir, $script:StartmenueDir)) {
+        if (-not (New-Verknuepfung -Ordner $ordner -Ziel $ziel -Symbol $symbol)) { $alle = $false }
+    }
+    return $alle
+}
+
+# Befehl fuer "Deinstallieren" unter "Apps". Ueber cmd.exe, damit er nicht
+# davon abhaengt, wie Windows eine .cmd startet. Das aeussere Paar
+# Anfuehrungszeichen nimmt cmd /c selbst wieder weg. Bewusst das cmd.exe von
+# Windows statt %ComSpec% - dort koennte eine andere Kommandozeile stehen, die
+# Anfuehrungszeichen anders liest.
+function Get-DeinstallBefehl {
+    param([string]$Pfad = (Get-InstallPfad))
+    $cmd = if ($env:SystemRoot) { Join-Path $env:SystemRoot 'System32\cmd.exe' } else { $env:ComSpec }
+    return ('"{0}" /c ""{1}" /deinstallieren"' -f $cmd, $Pfad)
+}
+
+# Traegt das Programm unter "Apps" ein (Einstellungen > Apps > Installierte
+# Apps). Rueckgabe: $true, wenn der Eintrag steht.
+function Register-Deinstallation {
+    try {
+        $k = $script:UninstallKey
+        if (-not (Test-Path -LiteralPath $k)) { New-Item -Path $k -Force | Out-Null }
+        $bytes = (Get-ChildItem -LiteralPath $script:InstallDir -File | Measure-Object -Property Length -Sum).Sum
+        $texte = [ordered]@{
+            DisplayName     = 'Animal Crossing Save-Sync + Sperre'
+            DisplayVersion  = $script:Version
+            Publisher       = 'Saiyuki47'
+            InstallLocation = $script:InstallDir
+            UninstallString = Get-DeinstallBefehl
+            URLInfoAbout    = ($script:ReleaseSeite -replace '/releases/latest$', '')
+        }
+        $symbol = Join-Path $script:InstallDir 'ac-savesync.ico'
+        if (Test-Path -LiteralPath $symbol) { $texte.DisplayIcon = $symbol }
+        foreach ($n in @($texte.Keys)) {
+            New-ItemProperty -LiteralPath $k -Name $n -Value $texte[$n] -PropertyType String -Force | Out-Null
+        }
+        foreach ($n in @('NoModify', 'NoRepair')) {
+            New-ItemProperty -LiteralPath $k -Name $n -Value 1 -PropertyType DWord -Force | Out-Null
+        }
+        New-ItemProperty -LiteralPath $k -Name 'EstimatedSize' -Value ([int][math]::Ceiling($bytes / 1KB)) -PropertyType DWord -Force | Out-Null
+        return $true
+    }
+    catch {
+        Write-Log ("Hinweis: Eintrag unter 'Apps' nicht angelegt: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+# Beim Start der installierten Fassung: den Eintrag unter "Apps" auf die
+# aktuelle Versionsnummer bringen (nach einem Update stuende dort sonst noch
+# die alte) und ein verlorenes Symbol ersetzen.
+function Update-InstallEintrag {
+    if (-not (Test-Path -LiteralPath (Join-Path $script:InstallDir 'ac-savesync.ico'))) { [void](Save-InstallSymbol) }
+    $stand = $null
+    try { $stand = (Get-ItemProperty -LiteralPath $script:UninstallKey -Name 'DisplayVersion' -ErrorAction Stop).DisplayVersion }
+    catch { Write-Verbose "Noch kein Eintrag unter 'Apps'." }
+    if ($stand -ne $script:Version) { [void](Register-Deinstallation) }
+}
+
+# Startet die installierte Fassung und gibt ihr die Einzelstart-Sperre frei.
+# Der Merker ACSS_UEBERGABE sagt ihr, von welcher Datei sie kommt: Sie reicht
+# dann ihrerseits nie weiter (keine Schleife, falls ein Pfadvergleich einmal
+# nicht passt), und der Assistent kann sagen, welche Datei uebrig ist.
+# Rueckgabe: $true, wenn sie gestartet ist - dann soll sich dieses beenden.
+function Start-Installiertes {
+    $env:ACSS_UEBERGABE = "$($script:SelfPath)"
+    try { Start-Process -FilePath (Get-InstallPfad) -ErrorAction Stop }
+    catch {
+        Write-Log ("Die installierte Fassung liess sich nicht starten: {0}" -f $_.Exception.Message)
+        return $false
+    }
+    finally { Remove-Item -Path Env:\ACSS_UEBERGABE -ErrorAction SilentlyContinue }
+    Exit-EinzelInstanz
+    return $true
+}
+
+# Aeltere Einrichtung, die noch aus dem Downloads-Ordner o. Ae. laeuft: nach
+# dem Start einmal fragen (siehe Start-Timer). Ein Nein wird gemerkt;
+# -Nachholen kommt ueber "Erweitert..." und merkt sich nichts.
+# Rueckgabe: $true, wenn installiert und neu gestartet wird.
+function Invoke-InstallFrage {
+    param([switch]$Nachholen)
+    $script:installFrage = $false
+    $neu = if ($Nachholen) { '' } else { 'Neu: ' }
+    $r = Show-Meldung -Titel 'Fest installieren' -Knoepfe 'YesNo' -Symbol 'Question' -Text (
+        ("{0}AC-SaveSync kann sich fest installieren.`n`n" +
+            "Es zieht dann in einen eigenen Ordner und bekommt eine Verknuepfung auf dem Desktop " +
+            "und im Startmenue. Updates landen automatisch dort. Einstellungen und Spielstand " +
+            "bleiben, wie sie sind.`n`n" +
+            "Diese Datei brauchst du danach nicht mehr:`n{1}`n`n" +
+            "Jetzt installieren? Das Programm startet dabei neu.") -f $neu, $script:SelfPath)
+    if ($r -eq 'Yes') { return (Install-UndNeustart) }
+    if (-not $Nachholen) {
+        $script:cfg.InstallDeclined = $true
+        Save-ConfigFromUI
+        Write-Log "Nicht installiert - das geht spaeter jederzeit ueber 'Erweitert...'."
+    }
+    return $false
+}
+
+# Installiert, startet die installierte Fassung und schliesst dieses Fenster.
+function Install-UndNeustart {
+    if ($script:holdingLock) {
+        [void](Show-Meldung -Titel "Noch nicht jetzt" -Symbol 'Warning' `
+                -Text "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach installieren.")
+        return $false
+    }
+    if (-not (Install-Programm) -or -not (Start-Installiertes)) {
+        [void](Show-Meldung -Titel "Fest installieren" -Symbol 'Warning' -Text (
+                "Das hat nicht geklappt. Das Programm laeuft von hier aus unveraendert weiter.`n`n" +
+                "Einzelheiten stehen im Protokoll."))
+        return $false
+    }
+    $script:cfg.InstallDeclined = $false
+    $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
+    $script:mainForm.Close()
+    return $true
+}
+
+# Entfernt Programm, Verknuepfungen und den Eintrag unter "Apps". Eine
+# Verknuepfung nur, wenn sie auf das installierte Programm zeigt - eine selbst
+# angelegte auf eine andere Datei bleibt stehen.
+# Rueckgabe: was sich nicht entfernen liess (leer = alles weg).
+function Uninstall-Programm {
+    $ziel = Get-InstallPfad
+    $rest = New-Object System.Collections.ArrayList
+    foreach ($ordner in @($script:DesktopDir, $script:StartmenueDir)) {
+        if (-not $ordner) { continue }
+        $lnk = Join-Path $ordner $script:VerknuepfungsName
+        if (-not (Test-Path -LiteralPath $lnk) -or (Get-VerknuepfungsZiel $lnk) -ne $ziel) { continue }
+        try { Remove-Item -LiteralPath $lnk -Force -ErrorAction Stop }
+        catch { [void]$rest.Add($lnk) }
+    }
+    try {
+        if (Test-Path -LiteralPath $script:UninstallKey) { Remove-Item -LiteralPath $script:UninstallKey -Recurse -Force -ErrorAction Stop }
+    }
+    catch { [void]$rest.Add("Eintrag unter 'Apps'") }
+    try {
+        # Solange der Ordner der Arbeitsordner dieses Programms ist, laesst
+        # Windows ihn nicht loeschen - also vorher woandershin wechseln.
+        $woanders = [IO.Path]::GetTempPath()
+        [Environment]::CurrentDirectory = $woanders
+        Set-Location -LiteralPath $woanders
+        if (Test-Path -LiteralPath $script:InstallDir) { Remove-Item -LiteralPath $script:InstallDir -Recurse -Force -ErrorAction Stop }
+    }
+    catch { [void]$rest.Add($script:InstallDir) }
+    return @($rest)
+}
+
+# "Deinstallieren" unter "Apps" startet das Programm mit /deinstallieren.
+# Einstellungen, Sicherheitskopien und der gemeinsame Ordner bleiben: Darin
+# steckt der Spielstand - wer neu installiert, macht einfach weiter.
+function Invoke-Deinstallation {
+    $r = Show-Meldung -Titel 'AC-SaveSync entfernen' -Knoepfe 'YesNo' -Symbol 'Question' -Standard 'Button2' -Text (
+        "Soll AC-SaveSync von diesem PC entfernt werden?`n`n" +
+        "Entfernt werden das Programm und seine Verknuepfungen. Deine Einstellungen, die " +
+        "Sicherheitskopien deines Spielstands und der gemeinsame Ordner bleiben erhalten.")
+    if ($r -ne 'Yes') {
+        Write-Log "Deinstallieren abgebrochen."
+        return
+    }
+    $rest = @(Uninstall-Programm)
+    if ($rest.Count -gt 0) {
+        Write-Log ("Nicht alles liess sich entfernen: {0}" -f ($rest -join '; '))
+        [void](Show-Meldung -Titel 'AC-SaveSync entfernen' -Symbol 'Warning' -Text (
+                "Nicht alles liess sich entfernen - bitte von Hand loeschen:`n`n{0}" -f ($rest -join "`n")))
+        return
+    }
+    $bleibt = "Einstellungen und Sicherheitskopien:`n$($script:AppDir)"
+    if ($script:cfg.RepoPath -and (Test-Path -LiteralPath $script:cfg.RepoPath)) {
+        $bleibt += "`n`nGemeinsamer Ordner mit dem Spielstand:`n$($script:cfg.RepoPath)"
+    }
+    Write-Log "AC-SaveSync wurde entfernt."
+    [void](Show-Meldung -Titel 'AC-SaveSync entfernt' -Symbol 'Information' -Text (
+            "AC-SaveSync ist entfernt.`n`nNoch da - falls du das auch nicht mehr brauchst, von Hand loeschen:`n`n$bleibt"))
 }
 
 #endregion
@@ -6078,12 +6509,24 @@ function Show-FirstRunWizard {
     Save-ConfigFromUI
     Write-Log "Einrichtung abgeschlossen. Die Angaben sind gespeichert."
 
-    # Zum Schluss anbieten, was den taeglichen Start bequem macht.
-    $r = Show-Meldung -Titel "Fast fertig" -Knoepfe 'YesNo' -Symbol 'Question' -Text (
-        "Soll ich eine Verknuepfung auf dem Desktop anlegen?`n`n" +
-        "Dann startest du das Programm kuenftig mit einem Doppelklick auf ein" +
-        " ordentliches Symbol, statt die heruntergeladene Datei zu suchen.")
-    if ($r -eq 'Yes') { [void](New-DesktopShortcut) }
+    # Zum Schluss: wie das Programm kuenftig startet. Fest installiert liegen
+    # die Verknuepfungen schon da (siehe Install-Programm).
+    if (Test-LaeuftInstalliert) {
+        $uebrig = ""
+        if ($script:UebergabeVon) {
+            $uebrig = "`n`nDie heruntergeladene Datei brauchst du nicht mehr, du kannst sie loeschen:`n$($script:UebergabeVon)"
+        }
+        [void](Show-Meldung -Titel "Fertig" -Symbol 'Information' -Text (
+                "AC-SaveSync ist installiert. Du startest es kuenftig ueber die Verknuepfung " +
+                "auf dem Desktop oder im Startmenue." + $uebrig))
+    }
+    else {
+        $r = Show-Meldung -Titel "Fast fertig" -Knoepfe 'YesNo' -Symbol 'Question' -Text (
+            "Soll ich eine Verknuepfung auf dem Desktop anlegen?`n`n" +
+            "Dann startest du das Programm kuenftig mit einem Doppelklick auf ein" +
+            " ordentliches Symbol, statt die heruntergeladene Datei zu suchen.")
+        if ($r -eq 'Yes') { [void](New-DesktopShortcut) }
+    }
 }
 
 # Holt das gemeinsame Repo im Assistenten (Schritt 4).
@@ -6543,7 +6986,12 @@ function Show-LaufendeInstanz {
 # Laeuft das Programm mit diesen Einstellungen schon? Dann dessen Fenster
 # nach vorn holen, statt ein zweites zu oeffnen (siehe Enter-EinzelInstanz).
 if (-not (Enter-EinzelInstanz)) {
-    if (-not (Show-LaufendeInstanz)) {
+    if ($script:Auftrag -eq 'deinstallieren') {
+        [void](Show-Meldung -Titel 'AC-SaveSync entfernen' -Symbol 'Information' -Text (
+                "AC-SaveSync laeuft gerade.`n`n" +
+                "Bitte das Programm zuerst schliessen und dann noch einmal deinstallieren."))
+    }
+    elseif (-not (Show-LaufendeInstanz)) {
         [void](Show-Meldung -Titel 'AC-SaveSync' -Symbol 'Information' -Text (
                 "Das Programm laeuft bereits.`n`n" +
                 "Es laesst sich nur einmal gleichzeitig starten - zwei kaemen sich beim " +
@@ -6554,6 +7002,16 @@ if (-not (Enter-EinzelInstanz)) {
 
 Initialize-LogDatei
 Import-Config
+# Aufruf ueber "Deinstallieren" unter "Apps" (siehe Register-Deinstallation)
+if ($script:Auftrag -eq 'deinstallieren') {
+    Invoke-Deinstallation
+    Exit-EinzelInstanz
+    return
+}
+# Frisch heruntergeladen oder aeltere Einrichtung: in den festen Ordner
+# umziehen bzw. die Fassung starten, die dort schon liegt (siehe
+# Invoke-InstallBeimStart). Dann ist hier Schluss.
+if (Invoke-InstallBeimStart) { return }
 # Was fehlt oder ins Leere zeigt, selbst suchen - spart dem Nutzer die
 # Sucherei nach Dolphin und dem Save-Ordner.
 [void](Set-AutoPaths)
@@ -6837,6 +7295,11 @@ $script:startTimer.Add_Tick({
 
         # Allererster Start: erst durch die Einrichtung fuehren.
         if ($script:istErststart) { Show-FirstRunWizard }
+
+        # Aeltere Einrichtung ausserhalb des festen Ordners: einmal anbieten,
+        # fest zu installieren. Bei Ja startet das Programm von dort neu -
+        # hier geht es dann nicht weiter.
+        if ($script:installFrage -and (Invoke-InstallFrage)) { return }
 
         # Ohne Git geht gar nichts - dann sofort den Selbsttest zeigen, statt
         # den Nutzer spaeter in eine unverstaendliche Fehlermeldung laufen zu lassen.

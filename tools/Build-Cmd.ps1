@@ -18,6 +18,10 @@
   kann daher beliebige Zeichen enthalten. PowerShell liest die Datei erneut
   ein, schneidet alles bis zur Marker-Zeile ab und fuehrt nur den Rest aus.
 
+  Das erste Argument reicht der Kopf als Umgebungsvariable ACSS_AUFTRAG
+  weiter - so ruft der Eintrag unter "Apps" das Programm mit /deinstallieren
+  auf. Ohne Argument (Doppelklick) ist sie leer.
+
   Aufruf:
     powershell -ExecutionPolicy Bypass -File .\tools\Build-Cmd.ps1
 #>
@@ -108,6 +112,7 @@ rem  Nicht mit einem Editor speichern, der die Zeilenenden aendert.
 rem ===========================================================================
 setlocal EnableExtensions
 set "ACSS_SELF=%~f0"
+set "ACSS_AUFTRAG=%~1"
 $runner
 $marker
 "@

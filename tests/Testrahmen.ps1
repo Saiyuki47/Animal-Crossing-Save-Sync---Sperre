@@ -28,6 +28,9 @@ $ErrorActionPreference = 'Continue'
 
 $script:AufWindows = [IO.Path]::DirectorySeparatorChar -eq '\'
 $script:SkriptPfad = Join-Path (Split-Path -Parent $PSScriptRoot) 'AC-SaveSync.ps1'
+# Unter diesem Schluessel legen die Tests ihre Eintraege fuer "Apps" an -
+# Start-Tests.ps1 raeumt ihn am Ende komplett weg.
+$script:TestSchluessel = 'HKCU:\Software\AC-SaveSync-Tests'
 $script:Ergebnisse = New-Object System.Collections.ArrayList
 $script:TestWurzel = Join-Path ([IO.Path]::GetTempPath()) ("acss-tests-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $script:TestWurzel -Force | Out-Null
@@ -129,7 +132,22 @@ function Reset-Zustand {
     $script:cfg = @{
         DolphinPath = ''; RepoPath = ''; GamePath = ''; SaveFolder = ''; PicsFolder = ''
         PlayerName = 'Anna'; Branch = 'main'; LeaseMinutes = 5; HeartbeatSeconds = 60
+        InstallDeclined = $false
     }
+    # Fest installieren: alles in eigene Test-Ordner und einen eigenen
+    # Test-Schluessel - nie auf den echten Desktop, ins Startmenue oder unter
+    # "Apps" (siehe Remove-TestSchluessel).
+    $orte = Join-Path $script:TestWurzel ('inst-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+    $script:InstallDir = Join-Path $orte 'Programs/AC-SaveSync'
+    $script:DesktopDir = Join-Path $orte 'Desktop'
+    $script:StartmenueDir = Join-Path $orte 'Startmenue'
+    $script:VerknuepfungsName = 'Animal Crossing Save-Sync.lnk'
+    $script:UninstallKey = $script:TestSchluessel + '\' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $script:SelfPath = ''
+    $script:Auftrag = ''
+    $script:UebergabeVon = ''
+    $script:installFrage = $false
+    $script:istErststart = $false
     $script:proc = $null
     $script:holdingLock = $false
     $script:lastHeartbeat = Get-Date

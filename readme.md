@@ -26,7 +26,7 @@ die Spielzeiten jedes Spielers in die Repo-README.
 - [Spielstände: Was wird kopiert?](#spielstände-was-wird-kopiert)
 - [Spielzeit-Statistik](#spielzeit-statistik)
 - [Rübenkurs](#rübenkurs)
-- [Wo liegt die Konfiguration?](#wo-liegt-die-konfiguration)
+- [Wo liegen Programm und Konfiguration? (auch: Entfernen)](#wo-liegen-programm-und-konfiguration)
 - [Fehlerbehebung](#fehlerbehebung)
 - [Grenzen & Hinweise](#grenzen--hinweise)
 - [Tests](#tests)
@@ -81,11 +81,23 @@ die es nur klont. Beides geht bequem über den Knopf **„Repo einrichten…"**.
 ### Schritt 0 – Skript starten
 
 **Der bequeme Weg:** Unter [Releases](../../releases) die Datei **`AC-SaveSync.cmd`**
-herunterladen und **doppelklicken**. Fertig. Diese Datei enthält das komplette
-Skript und startet PowerShell selbst – eine separate `.ps1` braucht ihr nicht.
-Beim ersten Start fragt Windows einmal nach, ob die Datei aus dem Internet
-ausgeführt werden darf; das ist normal (ggf. Rechtsklick → *Eigenschaften* →
-*Zulassen* → *OK*).
+herunterladen und **doppelklicken**. Diese Datei enthält das komplette Skript und startet
+PowerShell selbst – eine separate `.ps1` braucht ihr nicht. Beim ersten Start fragt Windows
+einmal nach, ob die Datei aus dem Internet ausgeführt werden darf; das ist normal (ggf.
+Rechtsklick → *Eigenschaften* → *Zulassen* → *OK*).
+
+Danach **installiert sich das Programm selbst**: Es kopiert sich nach
+`%LOCALAPPDATA%\Programs\AC-SaveSync`, legt eine Verknüpfung auf dem Desktop und im
+Startmenü an, trägt sich unter *Einstellungen → Apps* ein und startet von dort neu.
+Adminrechte braucht es dafür nicht. Ab dann startet ihr es über die Verknüpfung; die
+heruntergeladene Datei könnt ihr löschen. Updates landen automatisch im festen Ordner.
+
+Wer das Programm schon aus einer früheren Version nutzt (etwa direkt aus dem
+Downloads-Ordner), wird nach dem Update einmal gefragt, ob es fest installiert werden
+soll. Bei „Nein" läuft es weiter wie bisher; nachholen geht jederzeit über
+**„Erweitert…" → „Fest installieren…"**. Liegt schon eine installierte Fassung da und
+startet ihr trotzdem die heruntergeladene Datei, startet diese einfach die installierte –
+oder ersetzt sie vorher, wenn die heruntergeladene neuer ist.
 
 **Wenn ihr das Repo geklont habt:** Rechtsklick auf `AC-SaveSync.ps1` →
 **„Mit PowerShell ausführen"**. Alternativ in PowerShell:
@@ -100,11 +112,15 @@ Die `.cmd` lässt sich jederzeit selbst bauen:
 powershell -ExecutionPolicy Bypass -File .\tools\Build-Cmd.ps1
 ```
 
+Eine selbst gebaute `.cmd` mit derselben Versionsnummer wie die installierte läuft von dort,
+wo sie liegt – die installierte bleibt unangetastet. Die `.ps1` installiert nie etwas.
+
 **Zum Symbol:** Eine `.cmd`-Datei kann kein eigenes Symbol tragen – Windows legt das
-für alle Dateien dieser Art gemeinsam über die Dateizuordnung fest. Das Programm bietet
-deshalb beim ersten Start an, eine **Verknüpfung mit Symbol auf dem Desktop** anzulegen
-(später jederzeit über **„Erweitert…"**). Fenster und Taskleiste tragen das Symbol
-ohnehin.
+für alle Dateien dieser Art gemeinsam über die Dateizuordnung fest. Die Verknüpfungen, die
+beim Installieren entstehen, tragen deshalb das Symbol; ist eine davon verloren gegangen,
+legt **„Erweitert…" → „Verknüpfungen neu anlegen"** sie wieder an. Wer die `.ps1` direkt
+startet, bekommt am Ende der Einrichtung eine Desktop-Verknüpfung angeboten (später über
+**„Erweitert…"**). Fenster und Taskleiste tragen das Symbol ohnehin.
 
 Das Symbol kommt aus `icon.ico` im Projektordner. Zum Austauschen einfach diese Datei
 ersetzen und danach ausführen:
@@ -217,7 +233,7 @@ wird bewusst nicht beanstandet – bei GameCube-Spielen liegen dort die Memory-C
 | **Früherer Spielstand**        | Holt einen älteren Spielstand zurück. Der jetzige bleibt dabei erhalten. Die Rettung, wenn im Spiel etwas schiefgegangen ist. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
-| **Erweitert…**                 | Selten gebrauchte Einstellungen: Spielfotos-Ordner, Branch, Sperre, Herzschlag. Dort liegt auch **„Verknüpfung auf dem Desktop anlegen"**. |
+| **Erweitert…**                 | Selten gebrauchte Einstellungen: Spielfotos-Ordner, Branch, Sperre, Herzschlag. Dort liegen auch **„Nach Updates suchen"** und – je nachdem, wie das Programm läuft – **„Verknüpfungen neu anlegen"**, **„Fest installieren…"** oder **„Verknüpfung auf dem Desktop anlegen"**. |
 | **Repo einrichten…**           | Öffnet den Einrichtungs-Dialog (anlegen / verbinden / klonen).                                   |
 
 „Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
@@ -263,7 +279,8 @@ Knopf, dann steht dort, **was** fehlt.
 
 Das Programm sieht **beim Start selbst nach**, ob es eine neuere Fassung gibt. Wenn ja,
 fragt es kurz nach – ein Klick genügt, dann lädt es sich die neue Version, ersetzt sich
-selbst und startet neu. Herunterladen von Hand ist nicht mehr nötig.
+selbst und startet neu. Herunterladen von Hand ist nicht mehr nötig. Die installierte
+Fassung ersetzt sich dabei an ihrem festen Ort, die Verknüpfungen stimmen also weiter.
 
 Wer zwischendurch nachsehen will: **„Erweitert…" → „Nach Updates suchen"**. Dort steht
 auch, welche Version gerade läuft (ebenso im Fenstertitel).
@@ -455,7 +472,7 @@ auch auf GitHub.
 
 ---
 
-## Wo liegt die Konfiguration?
+## Wo liegen Programm und Konfiguration?
 
 Deine Einstellungen werden in
 
@@ -464,11 +481,22 @@ Deine Einstellungen werden in
 ```
 
 gespeichert – im (standardmäßig ausgeblendeten) Windows-Benutzerprofil, also **getrennt vom
-Skript**. Neben der `.ps1` selbst liegt nichts. Öffnen kannst du den Ordner, indem du
+Programm**. Neben dem Programm liegen keine Einstellungen. Öffnen kannst du den Ordner, indem du
 `%APPDATA%\AC-SaveSync` in die Explorer-Adressleiste oder in „Ausführen" (Win+R) eingibst.
 
 Die Konfig ist pro Benutzer/PC – du und dein Mitspieler habt also jeweils eure eigene lokale
 Konfiguration, was auch so gewollt ist (unterschiedliche Namen, Pfade usw.).
+
+**Das Programm selbst** liegt nach dem Installieren in `%LOCALAPPDATA%\Programs\AC-SaveSync` –
+dem Ordner, den Windows für Programme eines einzelnen Benutzers vorsieht. Dort darf es sich
+beim Update ohne Adminrechte selbst ersetzen, und OneDrive synchronisiert ihn nicht.
+Schnell hin kommst du per Rechtsklick auf die Verknüpfung → „Dateispeicherort öffnen".
+
+**Entfernen:** *Einstellungen → Apps → Installierte Apps* → „Animal Crossing Save-Sync +
+Sperre" → *Deinstallieren*. Das entfernt das Programm, seine Verknüpfungen und den Eintrag.
+Einstellungen, Sicherheitskopien und der gemeinsame Ordner mit dem Spielstand bleiben
+erhalten – wer neu installiert, macht einfach weiter. Brauchst du sie nicht mehr, lösche
+`%APPDATA%\AC-SaveSync` und den gemeinsamen Ordner von Hand.
 
 ---
 
@@ -527,7 +555,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Test-Oberflaeche.ps1   # echtes
   wird es für den aktuellen Benutzer installiert.
 - **Start-Tests.ps1** prüft die Funktionen einzeln: Sperre, Spielstand, Ende-Erkennung, Pfade,
   Umlaute, Hintergrund-Aufrufe, Spielzeit-Statistik, Rübenkurs, Update-Installation, Fotos,
-  Selbsttest und Bedienung (Meldungen, Schließen während eines Vorgangs, nur einmal starten). Für den Rübenkurs werden tausende Wochen nach den Regeln der vier Muster
+  Selbsttest, festes Installieren und Deinstallieren (in Test-Ordnern, nie auf dem echten
+  Desktop oder unter „Apps") und Bedienung (Meldungen, Schließen während eines Vorgangs, nur einmal starten). Für den Rübenkurs werden tausende Wochen nach den Regeln der vier Muster
   ausgewürfelt; die Einschätzung muss dabei immer das wahre Muster enthalten und die echten
   Preise immer in der angezeigten Spanne haben.
   Mit `-Filter Update` laufen nur die Tests aus `Update.Tests.ps1`.
