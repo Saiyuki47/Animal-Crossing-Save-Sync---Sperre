@@ -116,6 +116,13 @@ if ($env:ACSS_UI_SCALE) {
 # wurde entfernt - dies ist die einzige verbliebene Stelle.
 $env:GIT_TERMINAL_PROMPT = '0'
 
+# Was git ausgibt, liest PowerShell mit der Codepage der Konsole ein - von
+# Haus aus die alte OEM-Codepage. Git schreibt aber UTF-8: Umlaute in Namen
+# und Commit-Texten kaemen verstuemmelt an, und eine Datei mit BOM, die per
+# "git show" gelesen wird, faengt mit Zeichensalat an und ist kein gueltiges
+# JSON mehr. Ohne Konsole kann das Setzen scheitern - dann bleibt es beim alten.
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+
 # --------------------------------------------------------------------------
 # Version und Update-Quelle
 # --------------------------------------------------------------------------
@@ -524,10 +531,26 @@ function Get-JsonWert {
     return $p.Value
 }
 
+# Schreibt Text als UTF-8 OHNE BOM.
+# Set-Content -Encoding UTF8 setzt unter Windows PowerShell 5.1 immer ein BOM
+# davor. Fuer Dateien, die im gemeinsamen Repo landen, ist das schaedlich:
+# Beim Lesen per "git show" steht es als Zeichensalat vor dem JSON, und die
+# Sperre des anderen gilt dann als unlesbar.
+# Gelesen wird deshalb ueberall mit "Get-Content -Encoding UTF8" - das kommt
+# mit und ohne BOM zurecht (ohne die Angabe liest 5.1 BOM-lose Dateien als
+# ANSI, und aus "Joerg" mit Umlaut wuerde ein anderer Name).
+function Write-TextDatei {
+    param([string]$Pfad, [string]$Text)
+    # .NET loest relative Pfade gegen einen anderen Ordner auf als PowerShell -
+    # deshalb vorher in einen vollstaendigen Pfad umwandeln.
+    $voll = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Pfad)
+    [IO.File]::WriteAllText($voll, $Text, [Text.UTF8Encoding]::new($false))
+}
+
 function Import-Config {
     if (Test-Path $script:ConfigPath) {
         try {
-            $j = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
+            $j = Get-Content $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
             foreach ($k in @($script:cfg.Keys)) {
                 # <FIXED> Erst nachsehen, OB es den Eintrag ueberhaupt gibt.
                 # Unter StrictMode ist das Lesen einer fehlenden Eigenschaft ein
@@ -983,8 +1006,41 @@ function Backup-Saves {
     if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
     # /MIR = spiegelt exakt ins repo-eigene 'save/' (dort ist Spiegeln sicher).
     $null = robocopy $src $dst /MIR /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
-    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Sichern (robocopy-Code $LASTEXITCODE)."; return $false }
+    if ($LASTEXITCODE -ge 8) {
+        Write-Log "FEHLER beim Sichern (robocopy-Code $LASTEXITCODE)."
+        # Bricht /MIR mittendrin ab, liegt in save/ ein Mischmasch aus altem und
+        # neuem Stand. Der darf auf keinen Fall hochgeladen werden - also save/
+        # auf den zuletzt gespeicherten Stand zuruecksetzen.
+        Undo-RepoSaveDir
+        Write-Log "  Der Spielstand im Repo bleibt auf dem letzten vollstaendigen Stand."
+        return $false
+    }
     return $true
+}
+
+# Setzt save/ im Repo auf den letzten Commit zurueck (geaenderte und geloeschte
+# Dateien zurueckholen, neu hinzugekommene entfernen). Gibt es dort noch gar
+# keinen Stand, scheitert der checkout harmlos und clean raeumt alles weg.
+function Undo-RepoSaveDir {
+    Invoke-Git @('checkout', 'HEAD', '--', 'save') | Out-Null
+    Invoke-Git @('clean', '-fdq', '--', 'save') | Out-Null
+}
+
+# Sichern mit bis zu drei Versuchen. Direkt nach dem Beenden haelt Dolphin
+# seine Dateien manchmal noch ein paar Sekunden fest.
+function Backup-SavesMitWiederholung {
+    for ($i = 1; $i -le 3; $i++) {
+        if (Backup-Saves) { return $true }
+        if ($i -lt 3) {
+            Write-Log "Neuer Versuch in 3 Sekunden..."
+            $ende = (Get-Date).AddSeconds(3)
+            while ((Get-Date) -lt $ende) {
+                [Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 200
+            }
+        }
+    }
+    return $false
 }
 
 # --------------------------------------------------------------------------
@@ -1050,7 +1106,7 @@ function Get-Playtime {
     $h = @{}
     if (Test-Path $p) {
         try {
-            $j = Get-Content $p -Raw | ConvertFrom-Json
+            $j = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
             foreach ($prop in $j.PSObject.Properties) {
                 $v = $prop.Value
                 # <FIXED> Fehlende Felder sind erlaubt und werden zu 0 bzw. "".
@@ -1073,7 +1129,7 @@ function Get-Playtime {
 
 function Save-Playtime {
     param($h)
-    ($h | ConvertTo-Json -Depth 5) | Set-Content -Path (Get-PlaytimePath) -Encoding UTF8
+    Write-TextDatei (Get-PlaytimePath) ($h | ConvertTo-Json -Depth 5)
 }
 
 function Format-Duration {
@@ -1142,7 +1198,7 @@ function Write-Readme {
 
     $lines += ""
     $lines += ("_Zuletzt aktualisiert: {0}_" -f (Get-Date).ToString("yyyy-MM-dd HH:mm"))
-    ($lines -join "`r`n") | Set-Content -Path (Join-Path $script:cfg.RepoPath 'README.md') -Encoding UTF8
+    Write-TextDatei (Join-Path $script:cfg.RepoPath 'README.md') (($lines -join "`r`n") + "`r`n")
 }
 
 # Rechnet die seit dem letzten Zeitpunkt vergangenen Sekunden dem aktuellen
@@ -1214,7 +1270,7 @@ function Set-LockFile {
         # Vorhandenen Startzeitpunkt uebernehmen - immer wieder im festen
         # Format schreiben, damit er beim naechsten Lesen eindeutig bleibt.
         try {
-            $alt = Get-Content (Get-LockPath) -Raw -ErrorAction Stop | ConvertFrom-Json
+            $alt = Get-Content (Get-LockPath) -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
             # <FIXED> fehlendes startedUtc ist erlaubt (aeltere Sperr-Dateien)
             $altStart = ConvertTo-UtcZeit (Get-JsonWert $alt 'startedUtc')
             if ($altStart) { $start = $altStart.ToString("o") }
@@ -1229,7 +1285,7 @@ function Set-LockFile {
         startedUtc = $start
         updatedUtc = [datetime]::UtcNow.ToString("o")
     }
-    ($obj | ConvertTo-Json) | Set-Content -Path (Get-LockPath) -Encoding UTF8
+    Write-TextDatei (Get-LockPath) ($obj | ConvertTo-Json)
 }
 
 # Macht aus MINUTEN eine lesbare Angabe fuer die Statusanzeige.
@@ -1249,7 +1305,7 @@ function Get-LockState {
     $lf = Get-LockPath
     if (-not (Test-Path $lf)) { return [pscustomobject]@{ State = 'free' } }
     try {
-        $j = Get-Content $lf -Raw -ErrorAction Stop | ConvertFrom-Json
+        $j = Get-Content $lf -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
         # <FIXED> Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
         $upd = ConvertTo-UtcZeit (Get-JsonWert $j 'updatedUtc')
         if (-not $upd) { return [pscustomobject]@{ State = 'unknown' } }
@@ -1292,7 +1348,8 @@ function Get-LockStateRemote {
     $j = Invoke-Git @('show', "origin/$($script:cfg.Branch):PLAYING.lock")
     if ($j.Code -ne 0) { return [pscustomobject]@{ State = 'free' } }   # Datei fehlt = niemand spielt
     try {
-        $o = $j.Text | ConvertFrom-Json
+        # Sperr-Dateien aelterer Fassungen tragen noch ein BOM - abschneiden.
+        $o = ("$($j.Text)".TrimStart([char]0xFEFF)) | ConvertFrom-Json
         # <FIXED> Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
         $upd = ConvertTo-UtcZeit (Get-JsonWert $o 'updatedUtc')
         if (-not $upd) { return $null }
@@ -1338,6 +1395,27 @@ function Invoke-AutoAuffrischen {
         Write-Log ("{0} spielt jetzt." -f $neu.Owner)
     }
     $script:letzterFremdstand = $jetzt
+}
+
+# Spielt gerade jemand anderes? Dann darf NIEMAND sonst etwas hochladen:
+# Der Spielende holt waehrend seiner Sitzung nichts vom Server. Landet dort
+# ein fremder Commit, lehnt der Server jeden seiner Herzschlaege ab - seine
+# Sperre altert, und sein Fortschritt kommt nicht mehr an.
+# Gefragt wird direkt beim Server; ohne Verbindung zaehlt der oertliche Stand.
+# Rueckgabe: $true (samt Meldung an den Nutzer), wenn gesperrt.
+function Test-FremdeSperre {
+    param([string]$Titel)
+    $lock = Get-LockStateRemote
+    if (-not $lock) { $lock = Get-LockState }
+    if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
+        [void][Windows.Forms.MessageBox]::Show(
+            ("{0} spielt gerade.`n`nSolange darf nichts anderes hochgeladen werden - sonst kommt sein " +
+            "Spielstand nicht mehr beim Server an. Bitte warten, bis er fertig ist." -f $lock.Owner),
+            $Titel, 'OK', 'Warning')
+        Write-Log ("Abgebrochen: {0} spielt gerade." -f $lock.Owner)
+        return $true
+    }
+    return $false
 }
 
 function Update-StatusUI {
@@ -1431,10 +1509,27 @@ function Start-Play {
         return
     }
 
-    Write-Log "Sperre gesichert. Starte Dolphin..."
+    Write-Log "Sperre gesichert."
     $script:holdingLock = $true
 
-    Restore-Saves | Out-Null
+    # Klappt das Zurueckschreiben nicht, spielt man mit dem ALTEN Stand auf
+    # diesem PC - und der erste Herzschlag wuerde genau diesen Stand ins Repo
+    # spiegeln und den gemeinsamen ueberschreiben. Also gar nicht erst starten.
+    if (-not (Restore-Saves)) {
+        Write-Log "Abbruch: Dolphin wird NICHT gestartet, damit der alte Stand auf diesem PC"
+        Write-Log "  nicht den gemeinsamen ueberschreibt. Laeuft Dolphin vielleicht noch?"
+        Remove-Item (Get-LockPath) -Force -ErrorAction SilentlyContinue
+        $p = Invoke-GitCommitPush ("unlock (Start abgebrochen): {0}" -f $script:cfg.PlayerName)
+        if ($p.Code -ne 0) {
+            Write-GitProblem "Die Sperre konnte nicht wieder freigegeben werden." $p
+            Write-Log ("  Sie laeuft nach {0} Min von allein ab." -f $script:cfg.LeaseMinutes)
+        }
+        else { Write-Log "Sperre wieder freigegeben." }
+        $script:holdingLock = $false
+        Update-StatusUI (Get-LockState)
+        return
+    }
+    Write-Log "Starte Dolphin..."
 
     try {
         $gp = $script:cfg.GamePath
@@ -1511,8 +1606,17 @@ function Invoke-Tick {
     }
     if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge $script:cfg.HeartbeatSeconds) {
         Set-LockFile
-        Backup-Saves | Out-Null
-        Add-Playtime
+        # Scheitert das Sichern, setzt Backup-Saves save/ selbst zurueck - der
+        # Herzschlag laeuft trotzdem weiter, damit die Sperre frisch bleibt.
+        if (-not (Backup-Saves)) {
+            Write-Log "  Diesmal wurde nur die Sperre aufgefrischt, nicht der Spielstand."
+        }
+        if ($null -ne $script:proc) { Add-Playtime }
+        else {
+            # Sitzung wartet nur noch aufs Sichern (siehe Complete-Session):
+            # Dolphin ist zu, diese Zeit zaehlt nicht als Spielzeit.
+            $script:lastAccounted = Get-Date
+        }
         $p = Invoke-GitCommitPush ("heartbeat: {0}" -f $script:cfg.PlayerName)
         if ($p.Code -ne 0) {
             $script:hbFehler++
@@ -1561,7 +1665,31 @@ function Complete-Session {
     }
 
     Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
-    Backup-Saves | Out-Null
+
+    # Ohne vollstaendig gesicherten Spielstand darf die Sperre NICHT frei
+    # werden: Der Mitspieler bekaeme den alten Stand, und beim naechsten
+    # eigenen Start wuerde der alte Stand aus dem Repo den neueren auf diesem
+    # PC ueberschreiben.
+    while (-not (Backup-SavesMitWiederholung)) {
+        $r = [Windows.Forms.MessageBox]::Show(
+            ("Der Spielstand konnte nicht ins Repo gesichert werden.`n`n" +
+            "Meist haelt noch ein Programm die Dateien fest - etwa ein Dolphin, " +
+            "das noch im Hintergrund laeuft.`n`n" +
+            "WIEDERHOLEN = es noch einmal versuchen.`n" +
+            "ABBRECHEN = die Sitzung bleibt offen und die Sperre bei dir. Der Spielstand " +
+            "wird dann NICHT hochgeladen. Spaeter auf 'Spielen beenden' klicken."),
+            "Spielstand nicht gesichert", 'RetryCancel', 'Warning')
+        if ($r -ne 'Retry') {
+            Add-Playtime
+            $script:proc = $null
+            $script:btnPlay.Enabled = $false
+            $script:btnStop.Enabled = $true
+            Write-Log "Sitzung bleibt offen - die Sperre wird weiter aufgefrischt."
+            Write-Log "  Sobald das Problem behoben ist: 'Spielen beenden' klicken."
+            $script:timer.Start()
+            return
+        }
+    }
     Move-Pics
     Add-Playtime -EndSession
     $lf = Get-LockPath
@@ -1591,11 +1719,13 @@ function Complete-Session {
 # Danach laeuft alles Weitere ueber Complete-Session - also genau derselbe Weg
 # wie beim Schliessen von Hand: sichern, hochladen, Sperre freigeben.
 function Stop-Play {
-    if (-not $script:holdingLock -or $null -eq $script:proc) {
+    if (-not $script:holdingLock) {
         Write-Log "Es laeuft gerade keine Sitzung."
         return
     }
-    if ($script:proc.HasExited) { Complete-Session; return }
+    # Ohne Prozess: Dolphin ist schon zu, und die Sitzung wartet nur noch
+    # darauf, dass der Spielstand gesichert werden kann (siehe Complete-Session).
+    if ($null -eq $script:proc -or $script:proc.HasExited) { Complete-Session; return }
 
     $r = [Windows.Forms.MessageBox]::Show(
         ("Dolphin jetzt beenden?`n`n" +
@@ -1858,6 +1988,16 @@ function Invoke-StandZurueck {
     $script:standStatus.Text = "Wird zurueckgeholt..."
     [Windows.Forms.Application]::DoEvents()
 
+    # Das Fenster kann lange offen gewesen sein: erst den neuesten Stand holen
+    # (sonst lehnt der Server das Hochladen ab) und nachsehen, ob inzwischen
+    # jemand spielt.
+    Sync-Remote
+    if (Test-FremdeSperre "Frueheren Stand zurueckholen") {
+        $script:standStatus.Text = "Nicht jetzt - gerade spielt jemand."
+        $script:standStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+
     $co = Invoke-Git @('checkout', $s.Sha, '--', 'save')
     if ($co.Code -ne 0) {
         Write-GitProblem "Der alte Stand konnte nicht geholt werden." $co
@@ -1893,6 +2033,7 @@ function Show-FruehereStaende {
 
     Write-Log "Hole die Liste frueherer Spielstaende..."
     Sync-Remote
+    if (Test-FremdeSperre "Frueherer Spielstand") { return }
     $script:standDaten = @(Get-StandListe)
     if ($script:standDaten.Count -eq 0) {
         [void][Windows.Forms.MessageBox]::Show(
@@ -2049,6 +2190,19 @@ function Invoke-FotoLoeschen {
         "auch bei deinem Mitspieler." -f $d.Name),
         "Foto loeschen", 'YesNo', 'Warning')
     if ($r -ne 'Yes') { return }
+
+    # Wie beim Zurueckholen: erst den neuesten Stand holen und nicht
+    # hochladen, waehrend jemand anderes spielt.
+    Sync-Remote
+    if (Test-FremdeSperre "Foto loeschen") { return }
+    if (-not (Test-Path -LiteralPath $d.FullName)) {
+        Write-Log ("Das Foto ist schon weg (vermutlich vom Mitspieler geloescht): {0}" -f $d.Name)
+        $script:fotoListe = @($script:fotoListe | Where-Object { $_.FullName -ne $d.FullName })
+        if ($script:fotoListe.Count -eq 0) { $script:fotoDlg.Close(); return }
+        if ($script:fotoIndex -ge $script:fotoListe.Count) { $script:fotoIndex = $script:fotoListe.Count - 1 }
+        Show-FotoAktuell
+        return
+    }
 
     # Erst das Bild freigeben, sonst laesst sich die Datei nicht loeschen.
     if ($script:fotoBild) { $script:fotoBox.Image = $null; $script:fotoBild.Dispose(); $script:fotoBild = $null }
@@ -2787,6 +2941,31 @@ pics/** -text -diff
 "@ | Set-Content -Path $ga -Encoding UTF8
     }
     Write-Readme (Get-Playtime)
+
+    # Den eigenen Spielstand gleich mit hochladen - er ist ab jetzt der
+    # gemeinsame Ausgangsstand. Ohne das waere das Repo leer, und wer zuerst
+    # spielt, laedt SEINEN Stand hoch: Startet der Mitspieler vor dir, landet
+    # sein Stand im Repo und ueberschreibt beim naechsten Start deinen.
+    # Nur wenn im Repo noch KEIN Stand liegt - ein vorhandener gemeinsamer
+    # Stand (z. B. versehentlich "Ich bin der Erste" in einem geklonten
+    # Ordner) wird so nie ueberschrieben.
+    $repoSave = Get-RepoSaveDir
+    $schonDa = (Test-Path -LiteralPath $repoSave) -and
+    (Get-ChildItem -LiteralPath $repoSave -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($schonDa) {
+        Write-Log "Im Repo liegt schon ein Spielstand - er bleibt unveraendert."
+    }
+    elseif ([string]::IsNullOrWhiteSpace($script:cfg.SaveFolder)) {
+        Write-Log "WARNUNG: Kein Save-Ordner eingetragen - es wird noch kein Spielstand hochgeladen."
+        Write-Log "  Bitte den Save-Ordner eintragen, bevor dein Mitspieler zum ersten Mal spielt."
+    }
+    elseif (Backup-Saves) {
+        if (Test-Path -LiteralPath $repoSave) { Write-Log "Dein Spielstand wird als gemeinsamer Ausgangsstand hochgeladen." }
+    }
+    else {
+        Write-Log "WARNUNG: Dein Spielstand konnte nicht ins Repo kopiert werden (siehe oben)."
+    }
+
     Invoke-Git @('add', '-A') | Out-Null
     if (-not (Test-Staged)) {
         Write-Log "Nichts Neues zu committen (schon eingerichtet)."

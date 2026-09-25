@@ -139,7 +139,8 @@ welcher Knopf für wen ist.
    **„Automatisch anlegen"** das für euch.
 2. Die Adresse des neuen Repos einfügen und den Ordner auf eurem PC wählen.
 3. **„Einrichten und hochladen"** – legt das lokale Repo an, verbindet es und lädt euren
-   Spielstand hoch. Danach **„Adresse kopieren"** und dem Mitspieler schicken.
+   Spielstand hoch (dafür muss der **Save-Ordner** eingetragen sein). Danach
+   **„Adresse kopieren"** und dem Mitspieler schicken.
 
 **„Mein Mitspieler hat ihn schon – ich hole ihn mir"** (der andere):
 
@@ -222,6 +223,12 @@ Knopf, dann steht dort, **was** fehlt.
   nichts mehr hochladen, und nach „Sperre gilt (Min)" darf der andere übernehmen.
 - **Nicht hochgeladener Fortschritt wird nicht mehr stillschweigend verworfen.** Liegt beim
   Abgleich noch etwas auf eurem PC – etwa nach einem Absturz –, fragt das Programm nach.
+- **Kein halber Spielstand im Repo.** Lässt sich der Spielstand vor dem Spielen nicht in den
+  Dolphin-Ordner schreiben, startet Dolphin gar nicht erst. Lässt er sich nach dem Spielen nicht
+  sichern (z. B. weil Dolphin die Dateien noch festhält), fragt das Programm nach; die Sperre
+  bleibt so lange bei dir, bis der Stand wirklich oben ist.
+- **Während der andere spielt,** lassen sich weder ein früherer Spielstand zurückholen noch
+  Fotos löschen – beides würde sonst seine Sitzung vom Server abschneiden.
 - **Ein Protokoll jedes Programmlaufs** liegt unter `%APPDATA%\AC-SaveSync\logs\`. Die letzten
   zehn bleiben erhalten, ältere werden automatisch gelöscht. Bewusst außerhalb des gemeinsamen
   Ordners, damit es nicht beim Mitspieler landet.
