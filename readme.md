@@ -28,6 +28,7 @@ die Spielzeiten jedes Spielers in die Repo-README.
 - [Wo liegt die Konfiguration?](#wo-liegt-die-konfiguration)
 - [Fehlerbehebung](#fehlerbehebung)
 - [Grenzen & Hinweise](#grenzen--hinweise)
+- [Tests](#tests)
 - [Lizenz](#lizenz)
 
 ---
@@ -415,6 +416,23 @@ speichere im Spiel und schau, in welchem Ordner sich die Dateien geändert haben
   ein zweites Dolphin offen, bleibt die Sitzung offen, bis auch das geschlossen ist.
 - Für Online-Besuche in Echtzeit (sich gegenseitig in der Stadt sehen) ist dieses Tool **nicht**
   gedacht – dafür bräuchtet ihr die Online-Funktion des Spiels (z. B. über Wiimmfi).
+
+---
+
+## Tests
+
+Unter `tests/` liegen automatische Tests. Sie laufen bei jedem Push auf GitHub unter
+**Windows PowerShell 5.1** (siehe *Actions* → *Tests*) und lassen sich auch selbst starten:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\Start-Tests.ps1        # Funktionen
+powershell -ExecutionPolicy Bypass -File .\tests\Test-Oberflaeche.ps1   # echtes Programm
+```
+
+Alles läuft in einem eigenen Temp-Ordner mit einem lokalen Test-Server – euer Repo, eure
+Einstellungen und euer Spielstand werden nicht angefasst. Der Oberflächentest startet das
+Programm, klickt „Spielen starten", spielt eine Sitzung mit einem Ersatz-Dolphin durch und
+legt Bildschirmfotos ab. Gebraucht wird nur Git.
 
 ---
 

@@ -1,0 +1,48 @@
+name: Tests
+
+# Laeuft bei jedem Push auf main, bei Pull Requests und von Hand.
+# Getestet wird unter Windows PowerShell 5.1 - genau der Umgebung, in der das
+# Programm bei den Spielern laeuft (nicht PowerShell 7).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Commits in den Test-Repos brauchen Name und E-Mail.
+      - name: Git einrichten
+        shell: powershell
+        run: |
+          git config --global user.name "AC-SaveSync Test"
+          git config --global user.email "test@example.com"
+          git config --global init.defaultBranch main
+          git --version
+          $PSVersionTable.PSVersion.ToString()
+
+      - name: Tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\Start-Tests.ps1
+
+      # Startet das echte Programm, klickt "Spielen starten" und spielt eine
+      # Sitzung gegen einen lokalen Test-Server durch.
+      - name: Oberflaeche (Ende-zu-Ende)
+        shell: powershell
+        run: .\tests\Test-Oberflaeche.ps1 -Ausgabe "$env:RUNNER_TEMP\oberflaeche"
+
+      - name: Bildschirmfotos und Protokoll hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oberflaeche
+          path: ${{ runner.temp }}/oberflaeche
+          if-no-files-found: ignore
