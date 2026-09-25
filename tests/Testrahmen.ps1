@@ -159,6 +159,9 @@ function Reset-Zustand {
     $script:letzteArbeit = [datetime]::MinValue
     $script:schliessenWennFrei = $false
     $script:gitPfad = $null
+    $script:schliesseAb = $false
+    $script:hbAufgeschobenSeit = $null
+    $script:instanzSperre = $null
     $script:FakeName = 'fd' + [guid]::NewGuid().ToString('N').Substring(0, 6)
     $env:COMPUTERNAME = 'TEST-PC'
 }

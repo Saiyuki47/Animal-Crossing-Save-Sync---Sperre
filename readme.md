@@ -50,7 +50,8 @@ Bei jedem Start und Ende läuft grob das hier ab:
 
 **Während des Spielens** (alle paar Sekunden, standardmäßig jede Minute – „Herzschlag"):
 - Spielstand + Spielzeit sichern und hochladen, Sperre auffrischen. So geht bei einem Absturz
-  höchstens die Zeit seit dem letzten Herzschlag verloren.
+  höchstens die Zeit seit dem letzten Herzschlag verloren. Speichert das Spiel gerade, wartet
+  der Herzschlag ein paar Sekunden, damit keine halb geschriebene Datei im Repo landet.
 
 **Beim Beenden von Dolphin:**
 1. Spielstand aus dem Dolphin-Ordner zurück ins Repo spiegeln.
@@ -151,7 +152,8 @@ welcher Knopf für wen ist.
 3. **„Jetzt holen"** – fertig.
 
 > Achtung für die zweite Person: Es wird der Spielstand des Ersten geholt. Ein eigener
-> Spielstand auf diesem PC wird dabei **nicht** hochgeladen.
+> Spielstand auf diesem PC wird dabei **nicht** hochgeladen. Beim ersten „Spielen starten“
+> wird er aber gesichert, bevor er dem gemeinsamen Stand weicht (`%APPDATA%\AC-SaveSync\ersetzt\`).
 
 ---
 
@@ -176,9 +178,9 @@ Unter **„Erweitert…"** liegen die selten gebrauchten Werte:
 
 | Feld                  | Bedeutung                                                                                      |
 | --------------------- | ---------------------------------------------------------------------------------------------- |
-| **Bilder-Ordner**     | Screenshots/Fotos, die nach dem Spielen ins Repo verschoben werden. Leer = aus.                |
+| **Spielfotos-Ordner** | Der Ordner, in dem Dolphin die Fotos aus dem Spiel ablegt (z. B. `…\Load\WiiSDSync`). Nach dem Spielen werden neue Fotos daraus in den gemeinsamen Ordner **kopiert** – die Originale bleiben, wo sie sind. Schon geteilte und im Album gelöschte Fotos kommen nicht noch einmal. Sind es mehr als 30 neue Fotos (oder über 100 MB) auf einmal, fragt das Programm vorher. Deinen Windows-Ordner „Bilder“, Desktop, Dokumente, Downloads, OneDrive, den Benutzerordner und ganze Laufwerke lehnt es ab. Leer = aus. |
 | **Branch**            | Git-Branch, meist `main`.                                                                      |
-| **Sperre gilt (Min)** | Nach so vielen Minuten ohne Herzschlag gilt eine Sperre als abgelaufen (Standard 5).           |
+| **Sperre gilt (Min)** | Nach so vielen Minuten ohne Herzschlag gilt deine Sperre als abgelaufen (Standard 5). Der Wert steht in der Sperre selbst – dein Mitspieler richtet sich danach, auch wenn er selbst etwas anderes eingestellt hat. |
 | **Herzschlag (Sek)**  | Abstand, in dem während des Spielens gesichert und die Sperre aufgefrischt wird (Standard 60). Höchstens ein Drittel von „Sperre gilt" – ein längerer Wert wird automatisch begrenzt. |
 
 **Zum Feld „Spiel":** Das Skript erkennt automatisch, was du angibst:
@@ -215,7 +217,7 @@ wird bewusst nicht beanstandet – bei GameCube-Spielen liegen dort die Memory-C
 | **Früherer Spielstand**        | Holt einen älteren Spielstand zurück. Der jetzige bleibt dabei erhalten. Die Rettung, wenn im Spiel etwas schiefgegangen ist. |
 | **Selbsttest**                 | Prüft alles Nötige der Reihe nach (Git, deine Angaben, Dolphin, Save-Ordner, gemeinsamer Ordner, Verbindung zum Server) und sagt zu jedem Problem, was zu tun ist. Erster Anlaufpunkt, wenn etwas nicht klappt. |
 | **Sperre erzwingen freigeben** | Notausgang: entfernt eine hängende Sperre (nur benutzen, wenn sicher niemand spielt).            |
-| **Erweitert…**                 | Selten gebrauchte Einstellungen: Bilder-Ordner, Branch, Sperre, Herzschlag. Dort liegt auch **„Verknüpfung auf dem Desktop anlegen"**. |
+| **Erweitert…**                 | Selten gebrauchte Einstellungen: Spielfotos-Ordner, Branch, Sperre, Herzschlag. Dort liegt auch **„Verknüpfung auf dem Desktop anlegen"**. |
 | **Repo einrichten…**           | Öffnet den Einrichtungs-Dialog (anlegen / verbinden / klonen).                                   |
 
 „Spielen starten" ist gesperrt, solange etwas Wichtiges fehlt. Fahre mit der Maus über den
@@ -232,9 +234,16 @@ Knopf, dann steht dort, **was** fehlt.
 - **Die Anzeige hält sich selbst aktuell.** Solange ihr nicht spielt, sieht das Programm alle
   drei Minuten nach, ob der andere angefangen oder aufgehört hat.
 - **Reißt beim Spielen die Verbindung ab**, meldet sich das Programm deutlich: Es kann dann
-  nichts mehr hochladen, und nach „Sperre gilt (Min)" darf der andere übernehmen.
+  nichts mehr hochladen, und nach „Sperre gilt (Min)" darf der andere übernehmen. Damit du
+  es auch im Vollbild mitbekommst, gibt es einen Warnton, und der Knopf in der Taskleiste
+  blinkt. Wichtige Meldungen während des Spielens (etwa „Sperre verloren“) erscheinen über
+  Dolphin.
+- **Das Programm läuft nur einmal.** Ein zweiter Doppelklick holt das schon offene Fenster
+  nach vorn, statt ein zweites zu öffnen – zwei würden sich beim Spielstand in die Quere kommen.
 - **Nicht hochgeladener Fortschritt wird nicht mehr stillschweigend verworfen.** Liegt beim
-  Abgleich noch etwas auf eurem PC – etwa nach einem Absturz –, fragt das Programm nach.
+  Abgleich noch etwas auf eurem PC – etwa nach einem Absturz –, fragt das Programm nach. Die
+  Frage nennt auch noch nicht hochgeladene Fotos. Die gehen selbst bei „Stand vom Server holen“
+  nicht verloren: Sie bleiben im gemeinsamen Ordner und werden beim nächsten Mal hochgeladen.
 - **Kein halber Spielstand im Repo.** Lässt sich der Spielstand vor dem Spielen nicht in den
   Dolphin-Ordner schreiben, startet Dolphin gar nicht erst. Lässt er sich nach dem Spielen nicht
   sichern (z. B. weil Dolphin die Dateien noch festhält), fragt das Programm nach; die Sperre
@@ -269,7 +278,9 @@ Ohne Internet passiert beim Start nichts Sichtbares – die Prüfung wird still 
 ### Darstellung
 
 Das Fenster passt sich der Bildschirmskalierung an: Bei 150 % wird alles größer und
-bleibt scharf, statt wie ein Foto hochgezogen zu werden.
+bleibt scharf, statt wie ein Foto hochgezogen zu werden. Maßgeblich ist der Hauptbildschirm.
+Auf einem zweiten Bildschirm mit anderer Skalierung stimmt die Größe ebenfalls – dort passt
+Windows das Fenster an, die Schrift wirkt dann etwas weicher.
 
 Wer es unabhängig davon größer oder kleiner will, kann den Faktor selbst vorgeben –
 dazu vor dem Start die Umgebungsvariable `ACSS_UI_SCALE` setzen (erlaubt sind 0,5 bis 4):
@@ -311,10 +322,13 @@ Mehr ist im Alltag nicht nötig.
 
 Damit nie zwei Leute gleichzeitig denselben Stand bespielen (und sich gegenseitig
 überschreiben), legt das Skript beim Start eine Sperr-Datei (`PLAYING.lock`) im Repo an – mit
-deinem Namen und **zwei** Zeitstempeln:
+deinem Namen, **zwei** Zeitstempeln und deiner Sperrdauer:
 
 - **Sitzungsbeginn** – bleibt die ganze Sitzung stehen. Nur dafür da, „spielt seit …" anzuzeigen.
 - **Letzter Herzschlag** – wird laufend erneuert und entscheidet, ob die Sperre abgelaufen ist.
+- **Sperrdauer** – dein Wert für „Sperre gilt (Min)". Für beide gilt die Dauer dessen, der
+  spielt: Nach ihr richtet sich sein Herzschlag. Stellt nur einer von euch den Wert um, kann
+  die Sperre des anderen so nicht zwischen zwei Herzschlägen als abgelaufen gelten.
 
 **Ein dauerhaftes Aussperren ist ausgeschlossen**, gleich dreifach abgesichert:
 
@@ -347,6 +361,13 @@ deinem lokalen **Save-Ordner** kopiert das Skript automatisch:
 - Liegt im Repo noch **kein** Spielstand (allererster Start), bleibt dein vorhandener
   Dolphin-Save unangetastet und wird stattdessen ins Repo hochgeladen.
 - Ist dein Dolphin-Save-Ordner leer, wird der Repo-Stand **nicht** überschrieben.
+- Bevor der Stand aus dem Repo deinen Dolphin-Ordner überschreibt, wird der bisherige Inhalt
+  kopiert – nach `%APPDATA%\AC-SaveSync\ersetzt\`, die letzten zehn Kopien bleiben. Sind beide
+  Stände gleich, entfällt die Kopie. So ist auch die eigene Stadt der zweiten Person noch da,
+  die beim ersten Start dem gemeinsamen Stand weicht.
+- Wurde deine letzte Sitzung nicht sauber beendet (Programm geschlossen oder abgestürzt,
+  während Dolphin lief), fragt „Spielen starten“, welcher Stand gelten soll. Der im
+  Dolphin-Ordner ist dann meist der neuere – etwa wenn du danach noch weitergespielt hast.
 
 So „impft" die erste Person das Repo mit ihrem Spielstand, und ab dann arbeiten beide mit
 demselben Stand.
@@ -480,6 +501,7 @@ speichere im Spiel und schau, in welchem Ordner sich die Dateien geändert haben
   gleichzeitiges Spielen im selben Stand.
 - Der Herzschlag erzeugt regelmäßig kleine Git-Commits. Stört dich das, stelle „Herzschlag"
   höher (z. B. 120 Sek) und „Sperre gilt" auf mindestens das Dreifache (hier 6 Minuten).
+  Das darf jeder für sich tun – die Sperrdauer steht in der Sperre, der andere richtet sich danach.
 - Startet ihr Dolphin über einen Starter (`.bat`, Mod-Launcher, Verknüpfung darauf), der sich
   selbst gleich wieder beendet, beobachtet das Programm danach das laufende Dolphin. Die Sitzung
   endet erst, wenn einige Sekunden lang kein Dolphin mehr läuft. Nebenwirkung: Ist nebenher noch
@@ -504,8 +526,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Test-Oberflaeche.ps1   # echtes
   auf typische Fehler. Die Regeln stehen in `PSScriptAnalyzerSettings.psd1`; fehlt das Modul,
   wird es für den aktuellen Benutzer installiert.
 - **Start-Tests.ps1** prüft die Funktionen einzeln: Sperre, Spielstand, Ende-Erkennung, Pfade,
-  Umlaute, Hintergrund-Aufrufe, Spielzeit-Statistik, Rübenkurs, Update-Installation, Fotos und
-  Selbsttest. Für den Rübenkurs werden tausende Wochen nach den Regeln der vier Muster
+  Umlaute, Hintergrund-Aufrufe, Spielzeit-Statistik, Rübenkurs, Update-Installation, Fotos,
+  Selbsttest und Bedienung (Meldungen, Schließen während eines Vorgangs, nur einmal starten). Für den Rübenkurs werden tausende Wochen nach den Regeln der vier Muster
   ausgewürfelt; die Einschätzung muss dabei immer das wahre Muster enthalten und die echten
   Preise immer in der angezeigten Spanne haben.
   Mit `-Filter Update` laufen nur die Tests aus `Update.Tests.ps1`.

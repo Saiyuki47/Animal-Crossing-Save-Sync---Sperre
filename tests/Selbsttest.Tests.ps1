@@ -119,6 +119,26 @@ Test "Selbsttest: Adresse fehlt, Server weg, Branch fehlt" {
     finally { $env:GIT_CONFIG_GLOBAL = $script:altGitConfig }
 }
 
+Test "Selbsttest: Spielfotos-Ordner nur geprueft, wenn einer eingetragen ist" {
+    try {
+        [void](Set-GuteUmgebung)
+        function Get-UhrAbweichung { 0.0 }
+        Soll ($null -eq (Get-Punkt @(Test-Setup) 'Spielfotos-Ordner')) "leer: kein Punkt (Fotos teilen ist aus)"
+
+        $script:cfg.PicsFolder = Join-Path $script:TestWurzel ('wiisdsync-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $p = Get-Punkt @(Test-Setup) 'Spielfotos-Ordner'
+        Soll ($null -ne $p -and -not $p.Ok -and $p.Hinweis -match 'gibt es nicht') "fehlender Ordner gemeldet"
+
+        New-Item -ItemType Directory -Path $script:cfg.PicsFolder -Force | Out-Null
+        Soll ((Get-Punkt @(Test-Setup) 'Spielfotos-Ordner').Ok) "passender Ordner: OK"
+
+        function Test-SpielfotoOrdner { 'Das ist dein Windows-Ordner "Bilder".' }
+        $p = Get-Punkt @(Test-Setup) 'Spielfotos-Ordner'
+        Soll (-not $p.Ok -and $p.Hinweis -match 'Windows-Ordner "Bilder"' -and $p.Hinweis -match 'keine Fotos geteilt') "ungeeigneter Ordner: mit Grund und Folge"
+    }
+    finally { $env:GIT_CONFIG_GLOBAL = $script:altGitConfig }
+}
+
 Test "Selbsttest-Bericht zum Kopieren" {
     $erg = @(
         [pscustomobject]@{ Name = 'Git installiert'; Ok = $true; Hinweis = 'git version 2'; Roh = '' },

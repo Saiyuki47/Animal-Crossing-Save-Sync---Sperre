@@ -109,6 +109,115 @@ Test "Restore-Saves: gesperrte Zieldatei -> Fehler statt stillem Weitermachen" -
     Soll ((Get-Content -LiteralPath (Join-Path $script:cfg.SaveFolder 'data/stadt.bin')) -eq 'neu vom Server') "Stand geschrieben"
 }
 
+Test "Test-SaveGleich: gleiche Inhalte, andere Zeitstempel -> gleich" {
+    $a = New-SaveOrdner 'Stand'
+    $b = New-SaveOrdner 'Stand'
+    (Get-Item -LiteralPath (Join-Path $b 'data/stadt.bin')).LastWriteTime = (Get-Date).AddDays(-3)
+    Soll (Test-SaveGleich $a $b) "gleicher Inhalt, andere Zeit: gleich"
+    Set-Content -LiteralPath (Join-Path $b 'data/stadt.bin') -Value 'Stanx'      # gleiche Groesse
+    Soll (-not (Test-SaveGleich $a $b)) "gleiche Groesse, anderer Inhalt: verschieden"
+    Set-Content -LiteralPath (Join-Path $b 'data/stadt.bin') -Value 'Stand'
+    Set-Content -LiteralPath (Join-Path $b 'extra.bin') -Value 'x'
+    Soll (-not (Test-SaveGleich $a $b)) "zusaetzliche Datei: verschieden"
+    Soll ($script:beschaeftigt -eq 0) "danach nicht mehr beschaeftigt"
+}
+
+Test "Restore-Saves sichert den bisherigen Stand, bevor er ueberschrieben wird" -NurWindows {
+    $r = New-TestRepos
+    $script:cfg.RepoPath = $r.a; $script:cfg.SaveFolder = New-SaveOrdner 'mein neuerer Stand'
+    New-Item -ItemType Directory -Path (Join-Path $r.a 'save/data') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $r.a 'save/data/stadt.bin') -Value 'Stand vom Server'
+    Set-Content -LiteralPath (Join-Path $r.a 'save/banner.bin') -Value 'banner'
+    $ersetzt = Join-Path $script:AppDir 'ersetzt'
+
+    Soll (Restore-Saves) "zurueckgeschrieben"
+    Soll ((Get-Content -LiteralPath (Join-Path $script:cfg.SaveFolder 'data/stadt.bin')) -eq 'Stand vom Server') "Stand vom Server im Dolphin-Ordner"
+    $kopien = @(Get-ChildItem -LiteralPath $ersetzt -Directory)
+    Soll ($kopien.Count -eq 1) "eine Sicherheitskopie"
+    Soll ((Get-Content -LiteralPath (Join-Path $kopien[0].FullName 'data/stadt.bin')) -eq 'mein neuerer Stand') "darin der bisherige Stand"
+    Soll ((Get-ProtokollText) -match 'Bisheriger Spielstand dieses PCs gesichert') "im Protokoll"
+
+    Soll (Restore-Saves) "noch einmal"
+    Soll (@(Get-ChildItem -LiteralPath $ersetzt -Directory).Count -eq 1) "gleicher Stand: keine neue Kopie"
+
+    foreach ($i in 1..12) { New-Item -ItemType Directory -Path (Join-Path $ersetzt ('20200101-0000{0:D2}' -f $i)) -Force | Out-Null }
+    Set-Content -LiteralPath (Join-Path $script:cfg.SaveFolder 'data/stadt.bin') -Value 'wieder anders'
+    Soll (Restore-Saves) "mit anderem Stand"
+    $namen = @(Get-ChildItem -LiteralPath $ersetzt -Directory | ForEach-Object { $_.Name })
+    Soll ($namen.Count -eq 10) "nur die zehn juengsten Kopien bleiben (waren $($namen.Count))"
+    Soll ($namen -notcontains '20200101-000001' -and $namen -contains '20200101-000012') "die aeltesten sind weg"
+}
+
+# Die letzte eigene Sitzung wurde nicht sauber beendet: Auf dem Server liegt
+# die eigene (abgelaufene) Sperre mit dem Stand vom letzten Herzschlag, im
+# Dolphin-Ordner ein neuerer Stand.
+function New-UnbeendeteSitzung {
+    $r = New-TestRepos -MitStart
+    $script:cfg.RepoPath = $r.a; $script:cfg.SaveFolder = New-SaveOrdner 'weitergespielt'
+    $script:cfg.DolphinPath = (Get-FakeDolphin).Exe
+    New-Item -ItemType Directory -Path (Join-Path $r.a 'save/data') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $r.a 'save/data/stadt.bin') -Value 'letzter Herzschlag'
+    Set-Content -LiteralPath (Join-Path $r.a 'save/banner.bin') -Value 'banner'
+    Set-Content -LiteralPath (Join-Path $r.a 'PLAYING.lock') -Value (New-SperrText -Besitzer 'Anna' -Rechner 'TEST-PC' -VorMinuten 20)
+    Invoke-G $r.a add -A | Out-Null; Invoke-G $r.a commit -qm 'heartbeat: Anna' | Out-Null; Invoke-G $r.a push -q origin main | Out-Null
+    return $r
+}
+
+Test "Eigene Sitzung nicht beendet, Ja: Stand im Dolphin-Ordner bleibt" -NurWindows {
+    [void](New-UnbeendeteSitzung)
+    function Save-ConfigFromUI { }
+    [AcssTest.Dialog]::Reset('Yes')
+    Start-Play
+    $t = [AcssTest.Dialog]::Texte
+    Soll ($t.Count -eq 1 -and $t[0] -match 'nicht sauber beendet') "genau eine Rueckfrage - kein 'Sperre uebernehmen?' fuer die eigene (war: $($t -join ' | '))"
+    Soll ($script:holdingLock) "Sitzung laeuft"
+    Soll ((Get-Content -LiteralPath (Join-Path $script:cfg.SaveFolder 'data/stadt.bin')) -eq 'weitergespielt') "Stand im Dolphin-Ordner nicht ueberschrieben"
+}
+
+Test "Eigene Sitzung nicht beendet, Nein: Stand vom Server, der eigene als Kopie" -NurWindows {
+    [void](New-UnbeendeteSitzung)
+    function Save-ConfigFromUI { }
+    [AcssTest.Dialog]::Reset('No')
+    Start-Play
+    Soll ($script:holdingLock) "Sitzung laeuft"
+    Soll ((Get-Content -LiteralPath (Join-Path $script:cfg.SaveFolder 'data/stadt.bin')) -eq 'letzter Herzschlag') "Stand vom Server geschrieben"
+    $kopie = Get-ChildItem -LiteralPath (Join-Path $script:AppDir 'ersetzt') -Directory | Select-Object -First 1
+    Soll ($null -ne $kopie -and (Get-Content -LiteralPath (Join-Path $kopie.FullName 'data/stadt.bin')) -eq 'weitergespielt') "der eigene Stand liegt als Kopie bereit"
+}
+
+Test "Herzschlag wartet, solange das Spiel speichert - hoechstens 20 Sekunden" {
+    $script:cfg.RepoPath = (New-TestRepos).a
+    $script:cfg.SaveFolder = New-SaveOrdner 'wird gerade geschrieben'
+    $script:holdingLock = $true
+    $script:gesichert = 0; $script:gesendet = 0
+    function Set-LockFile { }
+    function Backup-Saves { $script:gesichert++; $true }
+    function Invoke-GitCommitPush { $script:gesendet++; [pscustomobject]@{ Code = 0; Text = ''; Stage = 'push' } }
+    $alt = { Get-ChildItem -LiteralPath $script:cfg.SaveFolder -Recurse -File | ForEach-Object { $_.LastWriteTime = (Get-Date).AddMinutes(-1) } }
+
+    $script:lastHeartbeat = (Get-Date).AddMinutes(-5)
+    Soll (Test-SaveWirdGeschrieben) "gerade geschriebene Datei erkannt"
+    Invoke-Tick
+    Soll ($script:gesendet -eq 0 -and $null -ne $script:hbAufgeschobenSeit) "Herzschlag wartet"
+
+    & $alt
+    Soll (-not (Test-SaveWirdGeschrieben)) "fertig gespeichert"
+    Invoke-Tick
+    Soll ($script:gesichert -eq 1 -and $script:gesendet -eq 1) "gleich danach: mit Spielstand gesendet"
+    Soll ($null -eq $script:hbAufgeschobenSeit) "Wartezeit zurueckgesetzt"
+
+    # Das Spiel schreibt dauernd: nach 20 Sekunden nur die Sperre auffrischen
+    Set-Content -LiteralPath (Join-Path $script:cfg.SaveFolder 'data/stadt.bin') -Value 'schreibt immer noch'
+    $script:lastHeartbeat = (Get-Date).AddMinutes(-5)
+    $script:hbAufgeschobenSeit = (Get-Date).AddSeconds(-25)
+    Invoke-Tick
+    Soll ($script:gesendet -eq 2 -and $script:gesichert -eq 1) "Sperre aufgefrischt, halber Spielstand nicht gesichert"
+    Soll ((Get-ProtokollText) -match 'nur die Sperre aufgefrischt') "im Protokoll"
+
+    Get-ChildItem -LiteralPath $script:cfg.SaveFolder -Recurse -File | ForEach-Object { $_.LastWriteTime = (Get-Date).AddHours(2) }
+    Soll (-not (Test-SaveWirdGeschrieben)) "Zeitstempel in der Zukunft (verstellte Uhr) zaehlen nicht"
+}
+
 Test "Spielen starten: Zurueckschreiben scheitert -> kein Dolphin, Sperre wieder frei" -NurWindows {
     $r = New-TestRepos -MitStart
     $script:cfg.RepoPath = $r.a; $script:cfg.SaveFolder = New-SaveOrdner 'alt'

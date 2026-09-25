@@ -69,21 +69,22 @@ Add-Type -AssemblyName System.Drawing
 # Fenster anschliessend wie ein Foto auf die tatsaechliche Groesse - alles
 # wird unscharf. Angemeldet zeichnen wir in echten Bildpunkten; um die
 # richtige Groesse kuemmert sich Set-UiScale weiter unten.
+#
+# Bewusst "System" und nicht "Per Monitor" (das stand hier frueher): Damit
+# verspricht das Programm Windows, sich beim Wechsel auf einen Bildschirm mit
+# anderer Skalierung selbst neu einzurichten. WinForms tut das in
+# powershell.exe aber nicht - dafuer braeuchte es Einstellungen in einer
+# app.config, die es hier nicht gibt. Das Fenster behielte seine Pixelgroesse
+# und waere auf dem anderen Bildschirm zu klein oder zu gross (nachgemessen:
+# WinForms laesst die Nachricht WM_DPICHANGED einfach liegen).
+# So zeichnen wir scharf in der Skalierung des Hauptbildschirms, und auf
+# einem Bildschirm mit anderer Skalierung zieht Windows das Fenster auf die
+# richtige Groesse - dort dann etwas weicher, aber nie falsch gross.
 Add-Type -Name Dpi -Namespace ACSS -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-[DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr wert);
 '@
-try {
-    # -4 = "Per Monitor V2": folgt auch dem Wechsel auf einen zweiten
-    # Bildschirm mit anderer Skalierung. Gibt es erst ab Windows 10 1703.
-    if (-not [ACSS.Dpi]::SetProcessDpiAwarenessContext([IntPtr]-4)) {
-        [void][ACSS.Dpi]::SetProcessDPIAware()
-    }
-}
-catch {
-    try { [void][ACSS.Dpi]::SetProcessDPIAware() }
-    catch { Write-Verbose "DPI-Anmeldung nicht moeglich - Windows skaliert das Fenster dann selbst." }
-}
+try { [void][ACSS.Dpi]::SetProcessDPIAware() }
+catch { Write-Verbose "DPI-Anmeldung nicht moeglich - Windows skaliert das Fenster dann selbst." }
 
 # Waehrend im Hintergrund etwas laeuft (git, Kopieren, Download), verwirft
 # dieser Filter Klicks und Tastendruecke in den Fenstern des Programms - so
@@ -227,6 +228,12 @@ $script:beschaeftigtSeit = Get-Date
 $script:letzteArbeit = [datetime]::MinValue
 $script:schliessenWennFrei = $false
 $script:gitPfad = $null
+# Laeuft gerade der Abschluss einer Sitzung? (siehe Complete-Session)
+$script:schliesseAb = $false
+# Seit wann der Herzschlag wartet, weil das Spiel gerade speichert (siehe Invoke-Tick)
+$script:hbAufgeschobenSeit = $null
+# Haelt dieses Programm die "nur einmal starten"-Sperre? (siehe Enter-EinzelInstanz)
+$script:instanzSperre = $null
 
 # Vorbelegung fuer Set-StrictMode -Version Latest.
 # StrictMode bricht ab, sobald eine Variable GELESEN wird, die es noch nicht
@@ -400,6 +407,100 @@ function Set-Tip {
     )
     foreach ($c in $Controls) {
         if ($c) { $script:tips.SetToolTip($c, $Text) }
+    }
+}
+
+# Dialoge nicht schliessen, solange im Hintergrund etwas laeuft.
+# Die Eingabesperre (siehe Start-Beschaeftigt) verwirft Klicks und Tasten im
+# Fenster - das X in der Titelleiste und Alt+F4 kommen aber auf anderem Weg
+# und gingen durch. Schloss sich ein Dialog mittendrin, lief der Vorgang ins
+# Leere, oder seine Rueckfrage beim Schliessen startete ihn ein zweites Mal
+# (Ruebenkurs: "Jetzt speichern?"). Der Warte-Mauszeiger zeigt, dass gerade
+# etwas laeuft; danach laesst sich der Dialog wie gewohnt schliessen.
+function Add-SchliessSperre {
+    param($Fenster)
+    $Fenster.Add_FormClosing({
+            if ($script:beschaeftigt -gt 0) { $args[1].Cancel = $true }
+        })
+}
+
+# --------------------------------------------------------------------------
+# Meldungsfenster
+# --------------------------------------------------------------------------
+# Jede Meldung bekommt ein Fenster des Programms als Besitzer - das oberste
+# offene, also einen gerade offenen Dialog, sonst das Hauptfenster.
+# Ohne Besitzer nimmt Windows das gerade aktive Fenster. Laeuft Dolphin im
+# Vordergrund, gibt es keins: Die Meldung haengt dann an keinem Fenster des
+# Programms, liegt womoeglich hinter Dolphin, und das Hauptfenster bleibt
+# bedienbar - ein Klick dort konnte denselben Ablauf ein zweites Mal starten.
+function Get-MeldungsBesitzer {
+    try {
+        $oben = $null
+        foreach ($f in [Windows.Forms.Application]::OpenForms) {
+            if ($f.Visible) { $oben = $f }
+        }
+        if ($oben) { return $oben }
+        if ($script:mainForm -is [Windows.Forms.Form]) { return $script:mainForm }
+    }
+    catch { Write-Verbose "Kein Fenster fuer die Meldung: $($_.Exception.Message)" }
+    return $null
+}
+
+# Laesst den Knopf in der Taskleiste blinken (bis das Fenster wieder vorn ist).
+function Initialize-Blinken {
+    if ('ACSS.Blinken' -as [type]) { return }
+    Add-Type -Namespace ACSS -Name Blinken -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+[DllImport("user32.dll")] static extern bool FlashWindowEx(ref FLASHWINFO info);
+public static void Start(IntPtr fenster) {
+    FLASHWINFO f = new FLASHWINFO();
+    f.cbSize = (uint)Marshal.SizeOf(typeof(FLASHWINFO));
+    f.hwnd = fenster;
+    f.dwFlags = 3 | 12;     // FLASHW_ALL | FLASHW_TIMERNOFG: blinken, bis das Fenster vorn ist
+    FlashWindowEx(ref f);
+}
+'@
+}
+
+# Macht auf etwas Wichtiges aufmerksam, auch wenn gerade gespielt wird:
+# Warnton und blinkender Knopf in der Taskleiste. Im Vollbild sieht man
+# weder das Statusfeld noch die Taskleiste - den Ton hoert man.
+function Invoke-Aufmerksamkeit {
+    try {
+        if (-not ($script:mainForm -is [Windows.Forms.Form]) -or -not $script:mainForm.IsHandleCreated) { return }
+        [Media.SystemSounds]::Exclamation.Play()
+        Initialize-Blinken
+        [ACSS.Blinken]::Start($script:mainForm.Handle)
+    }
+    catch { Write-Verbose "Aufmerksam machen nicht moeglich: $($_.Exception.Message)" }
+}
+
+# Zeigt eine Meldung und gibt die Antwort zurueck ('Yes', 'No', 'OK' ...).
+# -Wichtig: fuer Meldungen waehrend des Spielens. Dazu Warnton und Blinken,
+# und die Meldung erscheint ueber allen Fenstern - auch ueber Dolphin im
+# Vollbild. Sonst wartete sie womoeglich unbemerkt dahinter.
+function Show-Meldung {
+    param(
+        [string]$Text,
+        [string]$Titel = 'AC-SaveSync',
+        [string]$Knoepfe = 'OK',
+        [string]$Symbol = 'None',
+        [string]$Standard = 'Button1',
+        [switch]$Wichtig
+    )
+    if ($Wichtig) { Invoke-Aufmerksamkeit }
+    $besitzer = Get-MeldungsBesitzer
+    if (-not $besitzer) {
+        return [Windows.Forms.MessageBox]::Show($Text, $Titel, $Knoepfe, $Symbol, $Standard)
+    }
+    $warOben = $besitzer.TopMost
+    if ($Wichtig) { $besitzer.TopMost = $true }
+    try {
+        return [Windows.Forms.MessageBox]::Show($besitzer, $Text, $Titel, $Knoepfe, $Symbol, $Standard)
+    }
+    finally {
+        if ($Wichtig) { $besitzer.TopMost = $warOben }
     }
 }
 
@@ -1078,18 +1179,42 @@ function Test-Repo {
 # Zwei Faelle: geaenderte Dateien, die noch nicht committet sind, und Commits,
 # die es noch nicht auf den Server geschafft haben (typisch nach einem Absturz
 # oder wenn beim Beenden das Hochladen scheiterte).
+# -OhneNeueFotos: Fotos in pics/, die Git noch gar nicht kennt, zaehlen nicht
+# mit. Ein "reset --hard" laesst sie liegen, und das naechste Hochladen nimmt
+# sie mit - sie sind also nicht in Gefahr (siehe Sync-Remote). Ohne den
+# Schalter kaeme die Frage "Fortschritt verwerfen?" sonst bei jedem Abgleich
+# wieder, bis sie endlich hochgeladen sind.
 function Get-LokalerFortschritt {
+    param([switch]$OhneNeueFotos)
     # Ausgewertet wird nur stdout: git schreibt Warnungen (z. B. zu
     # Zeilenenden) nach stderr, und die sind keine geaenderten Dateien.
     $offen = Invoke-Git @('status', '--porcelain')
     $vorne = Invoke-Git @('rev-list', '--count', "origin/$($script:cfg.Branch)..HEAD")
     $anzahl = 0
     [void][int]::TryParse(("$($vorne.Out)").Trim(), [ref]$anzahl)
+    $zeilen = @(($offen.Out -split "`r?`n") | Where-Object { $_.Trim() })
+    if ($OhneNeueFotos) { $zeilen = @($zeilen | Where-Object { $_ -notmatch '^\?\? "?pics/' }) }
     return [pscustomobject]@{
-        Dateien = @(($offen.Out -split "`r?`n") | Where-Object { $_.Trim() }).Count
+        Dateien = $zeilen.Count
         Commits = $anzahl
-        Etwas   = (($offen.Out).Trim() -ne '' -or $anzahl -gt 0)
+        Etwas   = ($zeilen.Count -gt 0 -or $anzahl -gt 0)
     }
+}
+
+# Fotos, die dieser PC schon vorgemerkt oder committet, aber noch nicht
+# hochgeladen hat - ein "reset --hard" auf den Server-Stand loeschte sie.
+# Fotos, die der Mitspieler inzwischen geloescht hat, gehoeren nicht dazu:
+# gezaehlt wird nur, was hier NEU hinzugekommen ist.
+# Rueckgabe: Pfade relativ zum Repo (z. B. "pics/Anna_..._strand.jpg").
+function Get-FotosNichtHochgeladen {
+    $pfade = @()
+    # -z: Pfade ungekuerzt und ohne Anfuehrungszeichen, auch mit Umlauten.
+    $c = Invoke-Git @('log', '-z', '--format=', '--name-only', '--diff-filter=A', "origin/$($script:cfg.Branch)..HEAD", '--', 'pics')
+    if ($c.Code -eq 0) { $pfade += @($c.Out -split "`0") }
+    $v = Invoke-Git @('diff', '-z', '--cached', '--name-only', '--diff-filter=A', '--', 'pics')
+    if ($v.Code -eq 0) { $pfade += @($v.Out -split "`0") }
+    return @($pfade | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique |
+        Where-Object { Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath $_) })
 }
 
 function Sync-Remote {
@@ -1103,23 +1228,42 @@ function Sync-Remote {
     if ($vor.Code -ne 0) { Write-GitProblem "Der Stand vom Server konnte nicht geholt werden." $vor }
 
     # Bevor etwas verworfen wird: nachfragen, wenn hier noch Ungesichertes liegt.
-    $lokal = Get-LokalerFortschritt
+    $lokal = Get-LokalerFortschritt -OhneNeueFotos
     if ($lokal.Etwas) {
         $was = @()
         if ($lokal.Commits -gt 0) { $was += ("{0} noch nicht hochgeladene Aenderung(en)" -f $lokal.Commits) }
         if ($lokal.Dateien -gt 0) { $was += ("{0} geaenderte Datei(en)" -f $lokal.Dateien) }
-        $r = [Windows.Forms.MessageBox]::Show(
-            ("Auf diesem PC liegt Fortschritt, der noch nicht beim Mitspieler ist:`n`n" +
+        # Fotos gehen dabei nicht verloren (siehe unten) - aber das muss man
+        # lesen koennen. Frueher stand hier nur "1 Aenderung", auch wenn darin
+        # alle Fotos steckten, und JA loeschte sie.
+        $fotos = @(Get-FotosNichtHochgeladen)
+        if ($fotos.Count -gt 0) { $was += ("darunter {0} Foto(s)" -f $fotos.Count) }
+        $fotoText = if ($fotos.Count -gt 0) {
+            " - die Fotos nicht: Sie bleiben im gemeinsamen Ordner und werden beim naechsten Mal hochgeladen."
+        }
+        else { "." }
+        $r = Show-Meldung -Titel "Nicht hochgeladener Fortschritt" -Knoepfe 'YesNo' -Symbol 'Warning' -Text (
+            "Auf diesem PC liegt Fortschritt, der noch nicht beim Mitspieler ist:`n`n" +
             "  " + ($was -join "`n  ") + "`n`n" +
             "Das passiert meist, wenn das Hochladen beim letzten Mal scheiterte - " +
             "etwa nach einem Absturz oder ohne Internet.`n`n" +
-            "JA  = Stand vom Server holen. Der Fortschritt oben geht dabei VERLOREN.`n" +
-            "NEIN = alles so lassen und erst einmal nichts abgleichen."),
-            "Nicht hochgeladener Fortschritt", 'YesNo', 'Warning')
+            "JA  = Stand vom Server holen. Der Fortschritt oben geht dabei VERLOREN" + $fotoText + "`n" +
+            "NEIN = alles so lassen und erst einmal nichts abgleichen.")
         if ($r -ne 'Yes') {
             Write-Log "Abgleich uebersprungen - dein oertlicher Fortschritt bleibt erhalten."
             Write-Log "Tipp: 'Spielen starten' und wieder beenden laedt ihn hoch, sobald es wieder geht."
             return
+        }
+        # Fotos in Sicherheit bringen: aus dem Index nehmen, dann gelten sie
+        # fuer Git als neue Dateien - "reset --hard" laesst sie liegen, und das
+        # naechste Hochladen nimmt sie wieder mit. In Stapeln, weil eine
+        # Befehlszeile unter Windows nicht beliebig lang sein darf.
+        for ($i = 0; $i -lt $fotos.Count; $i += 100) {
+            $stapel = @($fotos[$i..([math]::Min($i + 99, $fotos.Count - 1))])
+            [void](Invoke-Git (@('rm', '--cached', '--quiet', '--ignore-unmatch', '--') + $stapel))
+        }
+        if ($fotos.Count -gt 0) {
+            Write-Log ("{0} Foto(s) bleiben im gemeinsamen Ordner und werden beim naechsten Mal hochgeladen." -f $fotos.Count)
         }
         Write-Log "Oertlicher Fortschritt wurde auf deinen Wunsch verworfen."
     }
@@ -1131,6 +1275,8 @@ function Sync-Remote {
 # Liegt etwas zum Committen bereit? Ueber den Exitcode statt ueber den
 # Ausgabetext ("nothing to commit"), damit es auch mit anderssprachigem Git
 # funktioniert:  0 = Index deckt sich mit HEAD,  1 = es gibt Vorgemerktes.
+# Ein Fehler (z. B. 128) zaehlt bewusst als "vorgemerkt": Dann versucht es
+# der Commit und meldet den Fehler, statt dass ein leerer Push Erfolg vortaeuscht.
 function Test-Staged {
     return ((Invoke-Git @('diff', '--cached', '--quiet')).Code -ne 0)
 }
@@ -1143,7 +1289,18 @@ function Test-Staged {
 # beim anderen Spieler ankommt.
 function Invoke-GitCommitPush {
     param([string]$msg)
-    Invoke-Git @('add', '-A') | Out-Null
+    # Auch das Vormerken kann scheitern - etwa an einer .git\index.lock, die
+    # ein abgestuerztes oder nach einer Zeitueberschreitung beendetes git
+    # liegen gelassen hat. Frueher lief es dann einfach weiter: nichts
+    # vorgemerkt, kein Commit, und der Push meldete "Everything up-to-date".
+    # Die Sperre galt als gesichert und jeder Herzschlag als angekommen,
+    # obwohl nichts davon auf dem Server lag. Deshalb zaehlt das wie ein
+    # gescheiterter Commit (Stage 'commit': ein Problem am oertlichen Git).
+    $a = Invoke-Git @('add', '-A')
+    if ($a.Code -ne 0) {
+        Write-GitProblem "Speichern fehlgeschlagen - es wird nichts hochgeladen." $a
+        return [pscustomobject]@{ Code = $a.Code; Text = $a.Text; Stage = 'commit' }
+    }
     if (Test-Staged) {
         $c = Invoke-Git @('commit', '-m', $msg)
         if ($c.Code -ne 0) {
@@ -1325,14 +1482,13 @@ function Confirm-SaveOrdner {
     $grund = Test-Sammelordner $script:cfg.SaveFolder
     if (-not $grund) { return $true }
     Write-Log ("WARNUNG: Der Save-Ordner sieht nach einem Sammelordner aus: {0}" -f $grund)
-    $r = [Windows.Forms.MessageBox]::Show(
-        (("Der eingetragene Save-Ordner umfasst wahrscheinlich mehr als nur Animal Crossing:`n`n" +
+    $r = Show-Meldung -Titel "Save-Ordner pruefen" -Knoepfe 'YesNo' -Symbol 'Warning' -Standard 'Button2' -Text (
+        ("Der eingetragene Save-Ordner umfasst wahrscheinlich mehr als nur Animal Crossing:`n`n" +
         "{0}`n`n{1}`n`n" +
         "Dann wuerden die Spielstaende ALLER dieser Spiele hochgeladen - und beim Mitspieler " +
         "ueberschrieben. Richtig ist der Ordner genau eines Spiels, bei Animal Crossing " +
         "z. B. ...\Wii\title\00010000\52555550.`n`n" +
-        "{2} trotzdem fortsetzen?") -f $script:cfg.SaveFolder, $grund, $Anlass),
-        "Save-Ordner pruefen", 'YesNo', 'Warning', 'Button2')
+        "{2} trotzdem fortsetzen?") -f $script:cfg.SaveFolder, $grund, $Anlass)
     return ($r -eq 'Yes')
 }
 
@@ -1371,6 +1527,46 @@ function Set-AutoPaths {
 # --------------------------------------------------------------------------
 function Get-RepoSaveDir { Join-Path $script:cfg.RepoPath 'save' }
 
+# Liegt in beiden Ordnern derselbe Spielstand? Verglichen werden Dateinamen
+# und Inhalte (erst die Groesse, dann eine Pruefsumme) - nicht die
+# Zeitstempel: die setzt Git beim Holen jedes Mal neu.
+# Laesst sich eine Datei nicht lesen (etwa weil Dolphin sie festhaelt), gilt
+# der Stand als verschieden - im Zweifel wird also lieber gesichert.
+function Test-SaveGleich {
+    param([string]$OrdnerA, [string]$OrdnerB)
+    function Dateiliste($ordner) {
+        $liste = @{}
+        if (-not (Test-Path -LiteralPath $ordner)) { return $liste }
+        $basis = (Get-Item -LiteralPath $ordner -Force).FullName.TrimEnd('\', '/')
+        foreach ($f in @(Get-ChildItem -LiteralPath $ordner -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            $liste[$f.FullName.Substring($basis.Length + 1).ToLowerInvariant()] = $f
+        }
+        return $liste
+    }
+    try {
+        $a = Dateiliste $OrdnerA
+        $b = Dateiliste $OrdnerB
+        if ($a.Count -ne $b.Count) { return $false }
+        foreach ($k in $a.Keys) {
+            if (-not $b.ContainsKey($k) -or $a[$k].Length -ne $b[$k].Length) { return $false }
+        }
+        # Bei einem versehentlich gewaehlten Sammelordner kann das dauern -
+        # das Fenster soll dabei bedienbar bleiben wie beim Warten auf git.
+        Start-Beschaeftigt 'Vergleiche den Spielstand'
+        try {
+            foreach ($k in $a.Keys) {
+                Invoke-Nachrichten
+                $ha = (Get-FileHash -LiteralPath $a[$k].FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                $hb = (Get-FileHash -LiteralPath $b[$k].FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                if ($ha -ne $hb) { return $false }
+            }
+        }
+        finally { Stop-Beschaeftigt }
+        return $true
+    }
+    catch { return $false }
+}
+
 # true = ok/uebersprungen, false = echter Fehler
 function Restore-Saves {
     $src = Get-RepoSaveDir
@@ -1381,6 +1577,20 @@ function Restore-Saves {
         return $true
     }
     if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    elseif ((Get-ChildItem -LiteralPath $dst -Force -ErrorAction SilentlyContinue | Select-Object -First 1) -and
+        -not (Test-SaveGleich $dst $src)) {
+        # Bevor der Stand dieses PCs ueberschrieben wird: eine Kopie davon.
+        # Er kann neuer sein als der im Repo - etwa wenn das Programm waehrend
+        # einer Sitzung geschlossen und in Dolphin weitergespielt wurde. Und
+        # beim zweiten Spieler ist es beim ersten Start seine eigene Stadt.
+        # Frueher war er danach einfach weg.
+        $kopie = Save-Sicherheitskopie -Unterordner 'ersetzt' -Behalten 10
+        if (-not $kopie) {
+            Write-Log "FEHLER: Der bisherige Spielstand dieses PCs liess sich nicht sichern - er wird deshalb nicht ueberschrieben."
+            return $false
+        }
+        Write-Log ("Bisheriger Spielstand dieses PCs gesichert: {0}" -f $kopie)
+    }
     Write-Log "Schreibe Spielstand aus dem Repo in den Dolphin-Ordner..."
     # /E = inkl. Unterordner, ueberschreibt; bewusst OHNE Loeschen, damit im
     # Dolphin-Ordner nichts Fremdes geloescht wird.
@@ -1412,6 +1622,20 @@ function Backup-Saves {
     return $true
 }
 
+# Schreibt das Spiel gerade seinen Spielstand? Ja, wenn im Save-Ordner eine
+# Datei juenger als ein paar Sekunden ist (siehe Invoke-Tick). Zeitstempel in
+# der Zukunft (verstellte Uhr) zaehlen nicht mit.
+function Test-SaveWirdGeschrieben {
+    param([int]$Sekunden = 5)
+    $src = $script:cfg.SaveFolder
+    if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) { return $false }
+    $jetzt = Get-Date
+    $frisch = Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -gt $jetzt.AddSeconds(-$Sekunden) -and $_.LastWriteTime -le $jetzt.AddSeconds(2) } |
+    Select-Object -First 1
+    return [bool]$frisch
+}
+
 # Setzt save/ im Repo auf den letzten Commit zurueck (geaenderte und geloeschte
 # Dateien zurueckholen, neu hinzugekommene entfernen). Gibt es dort noch gar
 # keinen Stand, scheitert der checkout harmlos und clean raeumt alles weg.
@@ -1427,21 +1651,27 @@ function Backup-SavesMitWiederholung {
         if (Backup-Saves) { return $true }
         if ($i -lt 3) {
             Write-Log "Neuer Versuch in 3 Sekunden..."
-            $ende = (Get-Date).AddSeconds(3)
-            while ((Get-Date) -lt $ende) {
-                [Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 200
+            # Beim Warten gilt dasselbe wie bei git (siehe Start-Beschaeftigt):
+            # Das Fenster zeichnet sich neu, nimmt aber keine Klicks an.
+            Start-Beschaeftigt 'Warte, bis Dolphin den Spielstand freigibt'
+            try {
+                $ende = (Get-Date).AddSeconds(3)
+                while ((Get-Date) -lt $ende) {
+                    Invoke-Nachrichten
+                    Start-Sleep -Milliseconds 100
+                }
             }
+            finally { Stop-Beschaeftigt }
         }
     }
     return $false
 }
 
 # --------------------------------------------------------------------------
-# Screenshots/Fotos ins Repo verschieben (mit kollisionssicheren Namen)
+# Fotos aus dem Spiel in den gemeinsamen Ordner kopieren
 # --------------------------------------------------------------------------
 # Liefert die Aufnahmezeit eines Bildes fuer die Sortierung der Galerie.
-# Move-Pics baut sie in den Dateinamen ein (Spieler_JJJJMMTT-HHMMSS_Name).
+# Copy-Pics baut sie in den Dateinamen ein (Spieler_JJJJMMTT-HHMMSS_Name).
 # Bilder, die jemand von Hand in den pics-Ordner gelegt hat, haben dieses
 # Muster nicht - fuer die zaehlt die Aenderungszeit der Datei.
 function Get-BildZeit {
@@ -1457,23 +1687,165 @@ function Get-BildZeit {
     return $Datei.LastWriteTime
 }
 
-function Move-Pics {
+# Taugt der Ordner als Spielfotos-Ordner? Rueckgabe: Begruendung als Text,
+# oder "" wenn er passt.
+# Abgelehnt werden die Windows-Ordner mit deinen eigenen Dateien - allen
+# voran "Bilder" - und alles, was sie enthaelt (Benutzerordner, Laufwerk).
+# Das Feld hiess frueher "Bilder-Ordner", und genau so heisst auf Deutsch der
+# Windows-Ordner mit den eigenen Fotos: Wer ihn waehlte, dem wanderten alle
+# privaten Fotos zum Mitspieler und auf GitHub. Unterordner (etwa ein
+# Dolphin, das auf dem Desktop entpackt wurde) bleiben erlaubt.
+function Test-SpielfotoOrdner {
+    param([string]$Pfad)
+    if ([string]::IsNullOrWhiteSpace($Pfad)) { return "" }
+    try { $voll = [IO.Path]::GetFullPath($Pfad.Trim()).TrimEnd('\', '/') }
+    catch { return "" }
+    $laufwerk = [IO.Path]::GetPathRoot($voll + [IO.Path]::DirectorySeparatorChar)
+    if ($laufwerk -and $voll -ieq $laufwerk.TrimEnd('\', '/')) { return "Das ist ein ganzes Laufwerk." }
+
+    $eigene = @(
+        @{ Pfad = [Environment]::GetFolderPath('MyPictures'); Name = 'dein Windows-Ordner "Bilder"' }
+        @{ Pfad = [Environment]::GetFolderPath('CommonPictures'); Name = 'der Windows-Ordner "Oeffentliche Bilder"' }
+        @{ Pfad = [Environment]::GetFolderPath('Desktop'); Name = 'dein Desktop' }
+        @{ Pfad = [Environment]::GetFolderPath('MyDocuments'); Name = 'dein Ordner "Dokumente"' }
+        @{ Pfad = $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE 'Downloads' }); Name = 'dein Ordner "Downloads"' }
+        @{ Pfad = $env:OneDrive; Name = 'dein OneDrive' }
+        @{ Pfad = $env:OneDriveConsumer; Name = 'dein OneDrive' }
+        @{ Pfad = $env:OneDriveCommercial; Name = 'dein OneDrive' }
+        @{ Pfad = $env:USERPROFILE; Name = 'dein Benutzerordner' }
+    )
+    $eigene = @($eigene | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Pfad) } |
+        ForEach-Object { @{ Pfad = [IO.Path]::GetFullPath($_.Pfad).TrimEnd('\', '/'); Name = $_.Name } })
+    # Erst genau dieser Ordner, dann einer, der ihn enthaelt - so heisst es beim
+    # Benutzerordner "Das ist dein Benutzerordner" statt "Darin liegt 'Bilder'".
+    foreach ($e in $eigene) {
+        if ($voll -ieq $e.Pfad) { return ("Das ist {0}." -f $e.Name) }
+    }
+    foreach ($e in $eigene) {
+        if ($e.Pfad.StartsWith($voll + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            return ("Darin liegt {0}." -f $e.Name)
+        }
+    }
+    return ""
+}
+
+# Die Erklaerung dazu, wenn ein Ordner abgelehnt wird (Erweitert, Selbsttest).
+function Get-SpielfotoOrdnerTipp {
+    return ("Dann landeten deine privaten Fotos beim Mitspieler und auf GitHub. Bitte den Ordner " +
+        "waehlen, in dem Dolphin die Fotos aus dem Spiel ablegt - z. B. ...\Load\WiiSDSync im Dolphin-Ordner.")
+}
+
+# Git-Pruefsummen (Objekt-IDs) von Dateien - so, wie Git sie speichern wuerde.
+# Rueckgabe: IDs in derselben Reihenfolge wie die Pfade, oder $null bei einem
+# Fehler. In Stapeln, weil eine Befehlszeile nicht beliebig lang sein darf.
+function Get-GitDateiIds {
+    param([string[]]$Pfade)
+    $ids = New-Object System.Collections.ArrayList
+    $alle = @($Pfade)
+    for ($i = 0; $i -lt $alle.Count; $i += 50) {
+        $stapel = @($alle[$i..([math]::Min($i + 49, $alle.Count - 1))])
+        # --no-filters: den Inhalt so nehmen, wie er ist (keine Zeilenende-Umwandlung)
+        $r = Invoke-Git (@('hash-object', '--no-filters', '--') + $stapel)
+        $zeilen = @($r.Out -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($r.Code -ne 0 -or $zeilen.Count -ne $stapel.Count) { return $null }
+        [void]$ids.AddRange($zeilen)
+    }
+    return , $ids.ToArray()
+}
+
+# Welche Fotos wurden schon geteilt? Alles, was je in pics/ lag - im Verlauf
+# (auch inzwischen geloeschte), jetzt vorgemerkte und noch nicht vorgemerkte.
+# Rueckgabe: Menge von Git-Pruefsummen.
+function Get-GeteilteFotoIds {
+    $menge = New-Object 'System.Collections.Generic.HashSet[string]'
+    $v = Invoke-Git @('log', '--format=', '--raw', '--no-abbrev', '--', 'pics')
+    foreach ($z in ($v.Out -split "`r?`n")) {
+        if ($z -match '^:\d+ \d+ ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ') {
+            foreach ($id in $Matches[1], $Matches[2]) { if ($id -notmatch '^0+$') { [void]$menge.Add($id) } }
+        }
+    }
+    $s = Invoke-Git @('ls-files', '-s', '--', 'pics')
+    foreach ($z in ($s.Out -split "`r?`n")) {
+        if ($z -match '^\d+ ([0-9a-f]{40,64}) ') { [void]$menge.Add($Matches[1]) }
+    }
+    $o = Invoke-Git @('ls-files', '-z', '--others', '--modified', '--', 'pics')
+    $pfade = @($o.Out -split "`0" | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+        ForEach-Object { Join-Path $script:cfg.RepoPath $_ } | Where-Object { Test-Path -LiteralPath $_ })
+    if ($pfade.Count -gt 0) {
+        # Nicht in @() packen: Get-GitDateiIds liefert die Liste schon als
+        # Ganzes - @() machte daraus eine Liste mit der Liste als einzigem Eintrag.
+        $gefunden = Get-GitDateiIds $pfade
+        if ($gefunden) { foreach ($id in $gefunden) { [void]$menge.Add($id) } }
+    }
+    return , $menge
+}
+
+# Kopiert neue Fotos aus dem Spielfotos-Ordner nach pics/ im Repo. Die
+# Originale bleiben, wo sie sind - frueher wurden sie verschoben, und wenn
+# danach das Hochladen scheiterte und der naechste Abgleich den Stand
+# verwarf, waren sie ganz weg.
+# Weil die Originale bleiben, muss erkannt werden, was schon geteilt ist -
+# sonst kaeme nach jeder Sitzung alles noch einmal. Verglichen wird der
+# Inhalt, nicht Name oder Zeitstempel (Dolphin schreibt seinen SD-Ordner
+# beim Beenden womoeglich neu). Als geteilt gilt alles, was je in pics/ lag:
+# Ein Foto, das ihr im Album geloescht habt, kommt so nicht zurueck. Eine
+# Kopie, die nie hochgeladen und dann verworfen wurde, dagegen schon.
+function Copy-Pics {
     $src = $script:cfg.PicsFolder
     if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
-    if (-not (Test-Path -LiteralPath $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
-    $dst = Join-Path $script:cfg.RepoPath 'pics'
-    if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $src)) { Write-Log "Spielfotos-Ordner nicht gefunden - uebersprungen."; return }
+    $grund = Test-SpielfotoOrdner $src
+    if ($grund) {
+        Write-Log ("Es werden keine Fotos geteilt - der Spielfotos-Ordner ist ungeeignet: {0}" -f $grund)
+        Write-Log "  Unter 'Erweitert...' den Ordner eintragen, in dem Dolphin die Fotos aus dem Spiel ablegt."
+        return
+    }
 
     $exts = @('.jpg', '.jpeg', '.png')
-    $files = Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object { $exts -contains $_.Extension.ToLowerInvariant() }
-    if (-not $files) { Write-Log "Keine neuen Bilder gefunden."; return }
+    $files = @(Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $exts -contains $_.Extension.ToLowerInvariant() })
+    if ($files.Count -eq 0) { Write-Log "Keine neuen Fotos gefunden."; return }
 
+    $ids = Get-GitDateiIds @($files | ForEach-Object { $_.FullName })
+    if ($null -eq $ids) {
+        # Ohne Pruefsummen liesse sich nicht erkennen, was schon geteilt ist.
+        Write-Log "Fotos werden diesmal nicht geteilt - sie liessen sich nicht vergleichen (siehe Git-Meldung)."
+        return
+    }
+    $bekannt = Get-GeteilteFotoIds
+    $neu = @()
+    for ($i = 0; $i -lt $files.Count; $i++) {
+        # Add liefert $false, wenn der Inhalt schon bekannt ist - so kommt
+        # auch ein Foto, das zweimal im Ordner liegt, nur einmal mit.
+        if ($bekannt.Add($ids[$i])) { $neu += $files[$i] }
+    }
+    if ($neu.Count -eq 0) { Write-Log "Keine neuen Fotos gefunden."; return }
+
+    # Sehr viele auf einmal: erst fragen. So viele macht man im Spiel kaum -
+    # eher ist der Ordner falsch.
+    $bytes = [double]($neu | Measure-Object -Property Length -Sum).Sum
+    if ($neu.Count -gt 30 -or $bytes -gt 100MB) {
+        $r = Show-Meldung -Titel "Fotos teilen" -Knoepfe 'YesNo' -Symbol 'Question' -Standard 'Button2' -Text (
+            ("Im Spielfotos-Ordner liegen {0} neue Fotos ({1:N1} MB) - so viele auf einmal sind ungewoehnlich.`n`n" +
+            "{2}`n`n" +
+            "Alle in den gemeinsamen Ordner kopieren? Dein Mitspieler bekommt sie dann auch, " +
+            "und sie bleiben im Verlauf des Repos.`n`n" +
+            "JA = alle kopieren.`n" +
+            "NEIN = diesmal keine. Stimmt der Ordner nicht, unter 'Erweitert...' den Ordner " +
+            "eintragen, in dem Dolphin die Fotos aus dem Spiel ablegt.") -f $neu.Count, ($bytes / 1MB), $src)
+        if ($r -ne 'Yes') {
+            Write-Log ("{0} neue Fotos wurden auf deinen Wunsch nicht geteilt." -f $neu.Count)
+            return
+        }
+    }
+
+    $dst = Join-Path $script:cfg.RepoPath 'pics'
+    if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
     $safe = ($script:cfg.PlayerName -replace '[^\w\-]', '_')
     if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "Unbekannt" }
 
-    $moved = 0
-    foreach ($f in $files) {
+    $kopiert = 0
+    foreach ($f in $neu) {
         # Eindeutiger Name: Spieler + Aufnahme-Zeit + Originalname (alles bereinigt)
         $stamp = $f.LastWriteTime.ToString("yyyyMMdd-HHmmss")
         $stem = ("{0}_{1}_{2}" -f $safe, $stamp, $f.BaseName) -replace '[^\w\-]', '_'
@@ -1484,10 +1856,10 @@ function Move-Pics {
             $target = Join-Path $dst ("{0}_{1}{2}" -f $stem, $i, $ext)
             $i++
         }
-        try { Move-Item -LiteralPath $f.FullName -Destination $target -Force; $moved++ }
-        catch { Write-Log "Bild konnte nicht verschoben werden: $($f.Name)" }
+        try { Copy-Item -LiteralPath $f.FullName -Destination $target -Force; $kopiert++ }
+        catch { Write-Log "Foto konnte nicht kopiert werden: $($f.Name)" }
     }
-    Write-Log ("{0} Bild(er) ins Repo verschoben und lokal entfernt." -f $moved)
+    Write-Log ("{0} Foto(s) in den gemeinsamen Ordner kopiert - die Originale bleiben im Spielfotos-Ordner." -f $kopiert)
 }
 
 # --------------------------------------------------------------------------
@@ -1681,12 +2053,31 @@ function Set-LockFile {
     if (-not $start) { $start = [datetime]::UtcNow.ToString("o") }
 
     $obj = [ordered]@{
-        owner      = $script:cfg.PlayerName
-        machine    = $env:COMPUTERNAME
-        startedUtc = $start
-        updatedUtc = [datetime]::UtcNow.ToString("o")
+        owner        = $script:cfg.PlayerName
+        machine      = $env:COMPUTERNAME
+        startedUtc   = $start
+        updatedUtc   = [datetime]::UtcNow.ToString("o")
+        # Nach so vielen Minuten ohne Herzschlag gilt DIESE Sperre als
+        # abgelaufen - fuer beide Spieler gleich (siehe Get-SperrDauer).
+        leaseMinutes = [int]$script:cfg.LeaseMinutes
     }
     Write-TextDatei (Get-LockPath) ($obj | ConvertTo-Json)
+}
+
+# Wie lange gilt eine Sperre ohne Herzschlag? Die Dauer steht in der Sperre
+# selbst, und es gilt die des Spielenden - nach ihr richtet sich sein
+# Herzschlag (hoechstens ein Drittel davon, siehe Get-HerzschlagSek).
+# Frueher entschied die EIGENE Einstellung. Stellte nur einer von beiden
+# "Sperre gilt" herunter, galt die Sperre des anderen zwischen zwei seiner
+# Herzschlaege schon als abgelaufen und durfte uebernommen werden, waehrend
+# er noch spielte. Sperr-Dateien aelterer Fassungen tragen die Angabe noch
+# nicht - fuer sie bleibt es bei der eigenen Einstellung.
+function Get-SperrDauer {
+    param($Sperre)
+    $minuten = 0
+    $wert = Get-JsonWert $Sperre 'leaseMinutes'
+    if ($null -ne $wert -and [int]::TryParse("$wert", [ref]$minuten) -and $minuten -ge 1) { return $minuten }
+    return [int]$script:cfg.LeaseMinutes
 }
 
 # Macht aus MINUTEN eine lesbare Angabe fuer die Statusanzeige.
@@ -1728,7 +2119,7 @@ function Get-LockState {
             Machine        = $rechner
             AgeMinutes     = $age       # seit dem letzten Herzschlag -> Ablauf
             SessionMinutes = $dauer     # seit Sitzungsbeginn -> Anzeige
-            Stale          = ($age -gt $script:cfg.LeaseMinutes)
+            Stale          = ($age -gt (Get-SperrDauer $j))
             Mine           = $mine
         }
     }
@@ -1767,7 +2158,7 @@ function Get-LockStateRemote {
             Machine        = $rechner
             AgeMinutes     = $age
             SessionMinutes = $dauer
-            Stale          = ($age -gt $script:cfg.LeaseMinutes)
+            Stale          = ($age -gt (Get-SperrDauer $o))
             Mine           = (($besitzer -eq $script:cfg.PlayerName) -and ($rechner -eq $env:COMPUTERNAME))
         }
     }
@@ -1823,10 +2214,9 @@ function Test-FremdeSperre {
     $lock = Get-LockStateRemote
     if (-not $lock) { $lock = Get-LockState }
     if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
-        [void][Windows.Forms.MessageBox]::Show(
-            (("{0} spielt gerade.`n`nSolange darf nichts anderes hochgeladen werden - sonst kommt sein " +
-            "Spielstand nicht mehr beim Server an. Bitte warten, bis er fertig ist.") -f $lock.Owner),
-            $Titel, 'OK', 'Warning')
+        [void](Show-Meldung -Titel $Titel -Symbol 'Warning' -Text (
+                ("{0} spielt gerade.`n`nSolange darf nichts anderes hochgeladen werden - sonst kommt sein " +
+                "Spielstand nicht mehr beim Server an. Bitte warten, bis er fertig ist.") -f $lock.Owner))
         Write-Log ("Abgebrochen: {0} spielt gerade." -f $lock.Owner)
         return $true
     }
@@ -1870,6 +2260,53 @@ function Update-StatusUI {
 # --------------------------------------------------------------------------
 # Ablauf: Spielen starten
 # --------------------------------------------------------------------------
+# Gibt die gerade gesicherte Sperre wieder frei, wenn der Start danach doch
+# scheitert (Spielstand nicht schreibbar, Dolphin startet nicht). Es wurde
+# nicht gespielt: keine Sitzung, keine Spielzeit, keine Bilder. Der Betreff
+# "unlock (Start abgebrochen)" sagt das auch der Spielzeit-Auswertung
+# (siehe ConvertFrom-GitVerlauf).
+function Undo-SperreNachAbbruch {
+    Remove-Item -LiteralPath (Get-LockPath) -Force -ErrorAction SilentlyContinue
+    $p = Invoke-GitCommitPush ("unlock (Start abgebrochen): {0}" -f $script:cfg.PlayerName)
+    if ($p.Code -ne 0) {
+        Write-GitProblem "Die Sperre konnte nicht wieder freigegeben werden." $p
+        Write-Log ("  Sie laeuft nach {0} Min von allein ab." -f $script:cfg.LeaseMinutes)
+    }
+    else { Write-Log "Sperre wieder freigegeben." }
+    $script:holdingLock = $false
+    $script:proc = $null
+    Update-StatusUI (Get-LockState)
+}
+
+# Liegt beim Start die Sperre schon bei dir, wurde deine letzte Sitzung auf
+# diesem PC nicht sauber beendet: Das Programm wurde geschlossen oder ist
+# abgestuerzt, waehrend Dolphin lief. Seitdem durfte niemand sonst spielen -
+# der Stand im Dolphin-Ordner ist also mindestens so neu wie der im Repo,
+# und womoeglich wurde danach sogar weitergespielt. Frueher ueberschrieb ihn
+# "Spielen starten" ohne Rueckfrage mit dem aelteren Stand vom letzten
+# Herzschlag - und genau dieser Fortschritt war weg.
+# Rueckgabe: $true = den Stand im Dolphin-Ordner behalten (der naechste
+# Herzschlag laedt ihn hoch), $false = wie immer den aus dem Repo holen.
+function Confirm-EigenenStandBehalten {
+    $dst = $script:cfg.SaveFolder
+    $src = Get-RepoSaveDir
+    if ([string]::IsNullOrWhiteSpace($dst) -or -not (Test-Path -LiteralPath $dst) -or
+        -not (Get-ChildItem -LiteralPath $dst -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { return $false }
+    if (-not (Test-Path -LiteralPath $src) -or (Test-SaveGleich $dst $src)) { return $false }
+    Write-Log "Deine letzte Sitzung wurde nicht sauber beendet - im Dolphin-Ordner liegt ein anderer Spielstand als im Repo."
+    $r = Show-Meldung -Titel "Letzte Sitzung nicht beendet" -Knoepfe 'YesNo' -Symbol 'Question' -Text (
+        "Deine letzte Sitzung auf diesem PC wurde nicht sauber beendet - das Programm wurde " +
+        "geschlossen oder ist abgestuerzt, waehrend Dolphin lief.`n`n" +
+        "Im Dolphin-Ordner liegt ein anderer Spielstand als im gemeinsamen Ordner. Meist ist es " +
+        "der neuere: gespeichert, nachdem zuletzt hochgeladen wurde.`n`n" +
+        "JA = den Stand aus dem Dolphin-Ordner behalten und hochladen (empfohlen).`n" +
+        "NEIN = den Stand aus dem gemeinsamen Ordner nehmen. Der aus dem Dolphin-Ordner " +
+        "wird vorher gesichert.")
+    if ($r -eq 'Yes') { return $true }
+    Write-Log "Du hast den Stand aus dem gemeinsamen Ordner gewaehlt."
+    return $false
+}
+
 function Start-Play {
     Save-ConfigFromUI
 
@@ -1889,21 +2326,26 @@ function Start-Play {
         Write-Log ("GESPERRT: {0} spielt gerade (seit {1}). Bitte warten." -f $lock.Owner, (Format-Minuten $lock.SessionMinutes))
         return
     }
-    if ($lock.State -eq 'locked' -and $lock.Stale) {
+    # Die eigene, abgelaufene Sperre braucht keine Rueckfrage "uebernehmen?" -
+    # um sie kuemmert sich gleich darunter Confirm-EigenenStandBehalten.
+    if ($lock.State -eq 'locked' -and -not $lock.Mine -and $lock.Stale) {
         # Nicht still uebernehmen: "abgelaufen" heisst nur, dass eine Weile kein
         # Herzschlag ankam. Das kann auch ein kurzer Netzausfall beim anderen
         # sein - oder eine falsch gehende Uhr. Wer nachfragt, verhindert, dass
         # zwei gleichzeitig spielen und einer seinen Fortschritt verliert.
-        $r = [Windows.Forms.MessageBox]::Show(
-            (("Die Sperre von {0} ist abgelaufen - seit {1} kam kein Lebenszeichen mehr.`n`n" +
+        $r = Show-Meldung -Titel "Abgelaufene Sperre" -Knoepfe 'YesNo' -Symbol 'Question' -Text (
+            ("Die Sperre von {0} ist abgelaufen - seit {1} kam kein Lebenszeichen mehr.`n`n" +
             "Meist ist das Spiel bei {0} abgestuerzt oder das Programm wurde geschlossen. " +
             "Spielt {0} aber doch noch (z. B. ohne Internet), verliert einer von euch " +
             "seinen Fortschritt.`n`n" +
-            "Sperre uebernehmen und spielen?") -f $lock.Owner, (Format-Minuten $lock.AgeMinutes)),
-            "Abgelaufene Sperre", 'YesNo', 'Question')
+            "Sperre uebernehmen und spielen?") -f $lock.Owner, (Format-Minuten $lock.AgeMinutes))
         if ($r -ne 'Yes') { Write-Log "Nicht uebernommen."; return }
         Write-Log ("Alte Sperre von {0} ist abgelaufen -> ich uebernehme." -f $lock.Owner)
     }
+
+    # Liegt die Sperre schon bei dir, wurde deine letzte Sitzung hier nicht
+    # sauber beendet (siehe Confirm-EigenenStandBehalten).
+    $eigenenBehalten = ($lock.State -eq 'locked' -and $lock.Mine -and (Confirm-EigenenStandBehalten))
 
     # Stand VOR dem Sperr-Commit merken. Wird der Push abgelehnt, muss genau
     # dieser Commit wieder weg - aber nichts, was schon vorher hier lag.
@@ -1913,6 +2355,9 @@ function Start-Play {
     # Sperre sichern (mit Wettlauf-Schutz: wer zuerst pusht, gewinnt)
     $acquired = $false
     for ($i = 1; $i -le 3 -and -not $acquired; $i++) {
+        # Sperr-Datei vor dem Versuch merken (siehe Abbruch gleich darunter).
+        $lockPfad = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Get-LockPath))
+        $lockVorher = if (Test-Path -LiteralPath $lockPfad) { [IO.File]::ReadAllBytes($lockPfad) } else { $null }
         # -Neu: hier beginnt unsere Sitzung, die Zeitmessung faengt bei null an.
         # Ohne das wuerde ein uebernommener Startzeitpunkt des anderen Spielers
         # weiterlaufen.
@@ -1922,8 +2367,14 @@ function Start-Play {
 
         # Scheitert schon der Commit, hilft kein zweiter Versuch - das ist kein
         # Wettlauf, sondern ein Problem am lokalen Git (siehe Meldung oben).
+        # Die nur oertlich geschriebene Sperre kommt wieder weg: Sonst zeigte
+        # die Anzeige "DU spielst gerade", und der naechste Abgleich fragte
+        # nach "nicht hochgeladenem Fortschritt". Bewusst ohne git - das ist
+        # hier ja gerade blockiert.
         if ($p.Stage -eq 'commit') {
-            Write-Log "Abbruch: die Sperre konnte lokal nicht committet werden."
+            if ($null -eq $lockVorher) { Remove-Item -LiteralPath $lockPfad -Force -ErrorAction SilentlyContinue }
+            else { [IO.File]::WriteAllBytes($lockPfad, $lockVorher) }
+            Write-Log "Abbruch: die Sperre konnte lokal nicht gespeichert werden - Dolphin wird nicht gestartet."
             return
         }
 
@@ -1970,18 +2421,13 @@ function Start-Play {
     # Klappt das Zurueckschreiben nicht, spielt man mit dem ALTEN Stand auf
     # diesem PC - und der erste Herzschlag wuerde genau diesen Stand ins Repo
     # spiegeln und den gemeinsamen ueberschreiben. Also gar nicht erst starten.
-    if (-not (Restore-Saves)) {
+    if ($eigenenBehalten) {
+        Write-Log "Der Spielstand im Dolphin-Ordner bleibt - er wird mit dem naechsten Herzschlag hochgeladen."
+    }
+    elseif (-not (Restore-Saves)) {
         Write-Log "Abbruch: Dolphin wird NICHT gestartet, damit der alte Stand auf diesem PC"
         Write-Log "  nicht den gemeinsamen ueberschreibt. Laeuft Dolphin vielleicht noch?"
-        Remove-Item -LiteralPath (Get-LockPath) -Force -ErrorAction SilentlyContinue
-        $p = Invoke-GitCommitPush ("unlock (Start abgebrochen): {0}" -f $script:cfg.PlayerName)
-        if ($p.Code -ne 0) {
-            Write-GitProblem "Die Sperre konnte nicht wieder freigegeben werden." $p
-            Write-Log ("  Sie laeuft nach {0} Min von allein ab." -f $script:cfg.LeaseMinutes)
-        }
-        else { Write-Log "Sperre wieder freigegeben." }
-        $script:holdingLock = $false
-        Update-StatusUI (Get-LockState)
+        Undo-SperreNachAbbruch
         return
     }
     Write-Log "Starte Dolphin..."
@@ -2044,7 +2490,10 @@ function Start-Play {
     }
     catch {
         Write-Log "Start fehlgeschlagen: $_"
-        Complete-Session
+        # Gespielt wurde nicht: nur die Sperre wieder freigeben. Frueher lief
+        # hier Complete-Session - das zaehlte eine Sitzung und rechnete die
+        # ganze Zeit seit dem letzten Sitzungsende (oft Stunden) als Spielzeit an.
+        Undo-SperreNachAbbruch
         return
     }
 
@@ -2113,16 +2562,29 @@ function Test-DolphinBeendet {
 # --------------------------------------------------------------------------
 # Sperre waehrend der Sitzung verloren
 # --------------------------------------------------------------------------
-# Kopiert den Save-Ordner nach %APPDATA%\AC-SaveSync\gerettet\<Zeit>.
+# Kopiert den Save-Ordner nach %APPDATA%\AC-SaveSync\<Unterordner>\<Zeit>.
+#   -Unterordner  'gerettet': nach verlorener Sperre - wird nie aufgeraeumt
+#                 'ersetzt':  Stand vor dem Zurueckschreiben (Restore-Saves)
+#   -Behalten     nur die juengsten so vielen Kopien behalten (0 = alle)
 # Rueckgabe: Pfad der Kopie oder "" bei Fehler.
 function Save-Sicherheitskopie {
+    param([string]$Unterordner = 'gerettet', [int]$Behalten = 0)
     $src = $script:cfg.SaveFolder
     if ([string]::IsNullOrWhiteSpace($src) -or -not (Test-Path -LiteralPath $src)) { return "" }
     try {
-        $ziel = Join-Path (Join-Path $script:AppDir 'gerettet') (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $wurzel = Join-Path $script:AppDir $Unterordner
+        $name = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $ziel = Join-Path $wurzel $name
+        # Zwei Kopien in derselben Sekunde duerfen sich nicht vermischen.
+        for ($n = 2; (Test-Path -LiteralPath $ziel); $n++) { $ziel = Join-Path $wurzel ("{0}-{1}" -f $name, $n) }
         New-Item -ItemType Directory -Path $ziel -Force | Out-Null
         $code = Invoke-Robocopy $src $ziel @('/E')
         if ($code -ge 8) { Write-Log "FEHLER bei der Sicherheitskopie (robocopy-Code $code)."; return "" }
+        if ($Behalten -gt 0) {
+            Get-ChildItem -LiteralPath $wurzel -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -Skip $Behalten |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        }
         return $ziel
     }
     catch {
@@ -2161,18 +2623,19 @@ function Invoke-SperreVerloren {
     Write-Log "  Ab jetzt wird nichts mehr hochgeladen - dein Stand wuerde sonst den des anderen ueberschreiben."
 
     # Der Timer liefe waehrend der Meldung weiter und riefe sie erneut auf.
+    # -Wichtig: Das passiert mitten im Spiel - die Meldung muss ueber Dolphin
+    # erscheinen und hoerbar sein, sonst spielt man ahnungslos weiter.
     $script:timer.Stop()
-    [void][Windows.Forms.MessageBox]::Show(
-        ($(if ($wer) { "$wer hat deine Sperre uebernommen." } else { "Deine Sperre wurde freigegeben." }) +
-        "`n`nMeist, weil eine Weile nichts von dir beim Server ankam (Internet weg?). " +
-        "Dein Spielstand kann ab jetzt NICHT mehr hochgeladen werden.`n`n" +
-        "Was jetzt:`n" +
-        "1. Im Spiel speichern und Dolphin beenden.`n" +
-        "2. Das Programm legt dann eine Kopie deines Spielstands in`n" +
-        "    %APPDATA%\AC-SaveSync\gerettet ab.`n" +
-        "3. Sprecht euch ab, wessen Stand weitergilt. Beim naechsten 'Spielen starten' " +
-        "wird der Stand vom Server geholt - deiner steckt dann nur noch in der Kopie."),
-        "Sperre verloren", 'OK', 'Warning')
+    [void](Show-Meldung -Wichtig -Titel "Sperre verloren" -Symbol 'Warning' -Text (
+            $(if ($wer) { "$wer hat deine Sperre uebernommen." } else { "Deine Sperre wurde freigegeben." }) +
+            "`n`nMeist, weil eine Weile nichts von dir beim Server ankam (Internet weg?). " +
+            "Dein Spielstand kann ab jetzt NICHT mehr hochgeladen werden.`n`n" +
+            "Was jetzt:`n" +
+            "1. Im Spiel speichern und Dolphin beenden.`n" +
+            "2. Das Programm legt dann eine Kopie deines Spielstands in`n" +
+            "    %APPDATA%\AC-SaveSync\gerettet ab.`n" +
+            "3. Sprecht euch ab, wessen Stand weitergilt. Beim naechsten 'Spielen starten' " +
+            "wird der Stand vom Server geholt - deiner steckt dann nur noch in der Kopie."))
     $script:timer.Start()
 }
 
@@ -2196,10 +2659,26 @@ function Invoke-Tick {
     # Nach verlorener Sperre gibt es nichts mehr hochzuladen.
     if ($script:sperreVerloren) { return }
     if (((Get-Date) - $script:lastHeartbeat).TotalSeconds -ge (Get-HerzschlagSek)) {
+        # Speichert das Spiel gerade, kurz warten (der Timer kommt in drei
+        # Sekunden wieder): Sonst landet eine halb geschriebene Datei im
+        # Verlauf - und genau die gilt nach einem Absturz, oder man holt sie
+        # spaeter als "frueheren Spielstand" zurueck. Schreibt das Spiel
+        # laenger als 20 Sekunden am Stueck, wird nur die Sperre aufgefrischt:
+        # Die darf nicht altern, nur weil gespeichert wird.
+        $mitSpielstand = $true
+        if (Test-SaveWirdGeschrieben) {
+            if ($null -eq $script:hbAufgeschobenSeit) { $script:hbAufgeschobenSeit = Get-Date }
+            if (((Get-Date) - $script:hbAufgeschobenSeit).TotalSeconds -lt 20) { return }
+            $mitSpielstand = $false
+        }
+        $script:hbAufgeschobenSeit = $null
         Set-LockFile
+        if (-not $mitSpielstand) {
+            Write-Log "Das Spiel schreibt gerade seinen Spielstand - diesmal wird nur die Sperre aufgefrischt."
+        }
         # Scheitert das Sichern, setzt Backup-Saves save/ selbst zurueck - der
         # Herzschlag laeuft trotzdem weiter, damit die Sperre frisch bleibt.
-        if (-not (Backup-Saves)) {
+        elseif (-not (Backup-Saves)) {
             Write-Log "  Diesmal wurde nur die Sperre aufgefrischt, nicht der Spielstand."
         }
         if ($null -ne $script:proc) { Add-Playtime }
@@ -2239,6 +2718,9 @@ function Invoke-Tick {
                 Write-Log ("WARNUNG: Seit {0} kommt nichts mehr beim Server an." -f (Format-Minuten $still))
                 Write-Log "  Solange das so bleibt, kann dein Mitspieler die Sperre uebernehmen."
                 Write-Log "  Pruefe deine Internetverbindung - der 'Selbsttest' zeigt Einzelheiten."
+                # Beim ersten Mal auch hoerbar und in der Taskleiste: Beim
+                # Spielen im Vollbild sieht man das Statusfeld nicht.
+                if ($script:hbFehler -eq 2) { Invoke-Aufmerksamkeit }
             }
         }
         else {
@@ -2255,86 +2737,96 @@ function Invoke-Tick {
 }
 
 function Complete-Session {
-    if ($script:timer) { $script:timer.Stop() }
-    if (-not $script:holdingLock) {
-        $script:btnPlay.Enabled = $true
+    # Nicht zweimal gleichzeitig. Waehrend hier auf Dolphin gewartet oder
+    # nachgefragt wird, konnte frueher ein Klick auf "Spielen beenden" einen
+    # zweiten Abschluss starten - mit doppeltem Commit und doppelt gezaehlter
+    # Sitzung. Der Knopf wird deshalb auch gleich gesperrt.
+    if ($script:schliesseAb) { return }
+    $script:schliesseAb = $true
+    try {
+        if ($script:timer) { $script:timer.Stop() }
+        if (-not $script:holdingLock) {
+            $script:btnPlay.Enabled = $true
+            $script:btnStop.Enabled = $false
+            return
+        }
         $script:btnStop.Enabled = $false
-        return
-    }
 
-    # Sperre verloren: nichts ins Repo schreiben und nichts hochladen - der
-    # Stand des anderen gilt. Der eigene wird nur ausserhalb des Repos gesichert,
-    # denn beim naechsten Abgleich wird er aus dem Save-Ordner verdraengt.
-    if ($script:sperreVerloren) {
-        Write-Log "Dolphin beendet. Deine Sperre war weg - es wird NICHT hochgeladen."
-        $kopie = Save-Sicherheitskopie
-        if ($kopie) {
-            Write-Log ("  Eine Kopie deines Spielstands liegt hier: {0}" -f $kopie)
-            Write-Log "  Sie wird nicht automatisch verwendet. Sprecht euch ab, wessen Stand gilt."
+        # Sperre verloren: nichts ins Repo schreiben und nichts hochladen - der
+        # Stand des anderen gilt. Der eigene wird nur ausserhalb des Repos gesichert,
+        # denn beim naechsten Abgleich wird er aus dem Save-Ordner verdraengt.
+        if ($script:sperreVerloren) {
+            Write-Log "Dolphin beendet. Deine Sperre war weg - es wird NICHT hochgeladen."
+            $kopie = Save-Sicherheitskopie
+            if ($kopie) {
+                Write-Log ("  Eine Kopie deines Spielstands liegt hier: {0}" -f $kopie)
+                Write-Log "  Sie wird nicht automatisch verwendet. Sprecht euch ab, wessen Stand gilt."
+            }
+            else {
+                Write-Log "  ACHTUNG: Die Kopie hat nicht geklappt - dein Stand liegt nur noch im Save-Ordner."
+                Write-Log "  Diesen Ordner von Hand sichern, BEVOR du wieder 'Spielen starten' klickst!"
+            }
+            # Keine Fotos kopieren - der naechste Abgleich verwuerfe sie dort.
+            # Sie liegen ja weiter im Spielfotos-Ordner und kommen beim
+            # naechsten Mal mit (siehe Copy-Pics).
+            $script:holdingLock = $false
+            $script:proc = $null
+            $script:btnPlay.Enabled = $true
+            $script:btnStop.Enabled = $false
+            [void](Update-ReadyState)
+            $s = Get-LockStateRemote
+            if ($s) { Update-StatusUI $s }
+            return
+        }
+
+        Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
+
+        # Ohne vollstaendig gesicherten Spielstand darf die Sperre NICHT frei
+        # werden: Der Mitspieler bekaeme den alten Stand, und beim naechsten
+        # eigenen Start wuerde der alte Stand aus dem Repo den neueren auf diesem
+        # PC ueberschreiben.
+        while (-not (Backup-SavesMitWiederholung)) {
+            $r = Show-Meldung -Wichtig -Titel "Spielstand nicht gesichert" -Knoepfe 'RetryCancel' -Symbol 'Warning' -Text (
+                "Der Spielstand konnte nicht ins Repo gesichert werden.`n`n" +
+                "Meist haelt noch ein Programm die Dateien fest - etwa ein Dolphin, " +
+                "das noch im Hintergrund laeuft.`n`n" +
+                "WIEDERHOLEN = es noch einmal versuchen.`n" +
+                "ABBRECHEN = die Sitzung bleibt offen und die Sperre bei dir. Der Spielstand " +
+                "wird dann NICHT hochgeladen. Spaeter auf 'Spielen beenden' klicken.")
+            if ($r -ne 'Retry') {
+                Add-Playtime
+                $script:proc = $null
+                $script:btnPlay.Enabled = $false
+                $script:btnStop.Enabled = $true
+                Write-Log "Sitzung bleibt offen - die Sperre wird weiter aufgefrischt."
+                Write-Log "  Sobald das Problem behoben ist: 'Spielen beenden' klicken."
+                $script:timer.Start()
+                return
+            }
+        }
+        Copy-Pics
+        Add-Playtime -EndSession
+        $lf = Get-LockPath
+        Remove-Item -LiteralPath $lf -Force -ErrorAction SilentlyContinue
+        $p = Invoke-GitCommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
+
+        if ($p.Code -ne 0) {
+            Write-GitProblem "Hochladen beim Beenden fehlgeschlagen." $p
+            Write-Log "  Keine Panik: dein Fortschritt ist lokal gespeichert und nicht verloren."
+            Write-Log "  Er wird beim naechsten erfolgreichen Hochladen mitgenommen."
         }
         else {
-            Write-Log "  ACHTUNG: Die Kopie hat nicht geklappt - dein Stand liegt nur noch im Save-Ordner."
-            Write-Log "  Diesen Ordner von Hand sichern, BEVOR du wieder 'Spielen starten' klickst!"
+            Write-Log "Fertig. Spielstand hochgeladen, Sperre freigegeben."
         }
-        # Bilder bleiben im Bilder-Ordner (Move-Pics wuerde sie ins Repo
-        # verschieben, und der naechste Abgleich wuerde sie dort verwerfen).
+
         $script:holdingLock = $false
         $script:proc = $null
         $script:btnPlay.Enabled = $true
         $script:btnStop.Enabled = $false
         [void](Update-ReadyState)
-        $s = Get-LockStateRemote
-        if ($s) { Update-StatusUI $s }
-        return
+        Update-StatusUI (Get-LockState)
     }
-
-    Write-Log "Dolphin beendet. Speichere Fortschritt und gebe Sperre frei..."
-
-    # Ohne vollstaendig gesicherten Spielstand darf die Sperre NICHT frei
-    # werden: Der Mitspieler bekaeme den alten Stand, und beim naechsten
-    # eigenen Start wuerde der alte Stand aus dem Repo den neueren auf diesem
-    # PC ueberschreiben.
-    while (-not (Backup-SavesMitWiederholung)) {
-        $r = [Windows.Forms.MessageBox]::Show(
-            ("Der Spielstand konnte nicht ins Repo gesichert werden.`n`n" +
-            "Meist haelt noch ein Programm die Dateien fest - etwa ein Dolphin, " +
-            "das noch im Hintergrund laeuft.`n`n" +
-            "WIEDERHOLEN = es noch einmal versuchen.`n" +
-            "ABBRECHEN = die Sitzung bleibt offen und die Sperre bei dir. Der Spielstand " +
-            "wird dann NICHT hochgeladen. Spaeter auf 'Spielen beenden' klicken."),
-            "Spielstand nicht gesichert", 'RetryCancel', 'Warning')
-        if ($r -ne 'Retry') {
-            Add-Playtime
-            $script:proc = $null
-            $script:btnPlay.Enabled = $false
-            $script:btnStop.Enabled = $true
-            Write-Log "Sitzung bleibt offen - die Sperre wird weiter aufgefrischt."
-            Write-Log "  Sobald das Problem behoben ist: 'Spielen beenden' klicken."
-            $script:timer.Start()
-            return
-        }
-    }
-    Move-Pics
-    Add-Playtime -EndSession
-    $lf = Get-LockPath
-    Remove-Item -LiteralPath $lf -Force -ErrorAction SilentlyContinue
-    $p = Invoke-GitCommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
-
-    if ($p.Code -ne 0) {
-        Write-GitProblem "Hochladen beim Beenden fehlgeschlagen." $p
-        Write-Log "  Keine Panik: dein Fortschritt ist lokal gespeichert und nicht verloren."
-        Write-Log "  Er wird beim naechsten erfolgreichen Hochladen mitgenommen."
-    }
-    else {
-        Write-Log "Fertig. Spielstand hochgeladen, Sperre freigegeben."
-    }
-
-    $script:holdingLock = $false
-    $script:proc = $null
-    $script:btnPlay.Enabled = $true
-    $script:btnStop.Enabled = $false
-    [void](Update-ReadyState)
-    Update-StatusUI (Get-LockState)
+    finally { $script:schliesseAb = $false }
 }
 
 # Dolphin aus dem Programm heraus beenden (Knopf "Spielen beenden").
@@ -2353,13 +2845,12 @@ function Stop-Play {
     # weiterlaufende Dolphin - dann wird DAS beendet.
     if (Test-DolphinBeendet -Sofort) { Complete-Session; return }
 
-    $r = [Windows.Forms.MessageBox]::Show(
-        ("Dolphin jetzt beenden?`n`n" +
+    $r = Show-Meldung -Titel "Spielen beenden" -Knoepfe 'YesNo' -Symbol 'Warning' -Text (
+        "Dolphin jetzt beenden?`n`n" +
         "WICHTIG: Speichere vorher IM SPIEL. Alles seit dem letzten Speichern " +
         "im Spiel ist sonst weg - das Skript kann nur sichern, was Dolphin " +
         "bereits auf die Festplatte geschrieben hat.`n`n" +
-        "Danach wird der Spielstand hochgeladen und die Sperre freigegeben."),
-        "Spielen beenden", 'YesNo', 'Warning')
+        "Danach wird der Spielstand hochgeladen und die Sperre freigegeben.")
     if ($r -ne 'Yes') { return }
 
     # Timer anhalten, damit die Ende-Erkennung nicht parallel Complete-Session
@@ -2391,11 +2882,10 @@ function Stop-Play {
     }
 
     if (-not $script:proc.HasExited) {
-        $f = [Windows.Forms.MessageBox]::Show(
-            ("Dolphin laesst sich nicht normal beenden.`n`n" +
+        $f = Show-Meldung -Titel "Beenden erzwingen" -Knoepfe 'YesNo' -Symbol 'Warning' -Text (
+            "Dolphin laesst sich nicht normal beenden.`n`n" +
             "Hart abbrechen? Was Dolphin noch nicht auf die Festplatte " +
-            "geschrieben hat, geht dabei verloren."),
-            "Beenden erzwingen", 'YesNo', 'Warning')
+            "geschrieben hat, geht dabei verloren.")
         if ($f -eq 'Yes') {
             try {
                 $script:proc.Kill()
@@ -2437,9 +2927,8 @@ function Unlock-Session {
         return
     }
     if (-not (Test-Repo)) { return }
-    $r = [Windows.Forms.MessageBox]::Show(
-        "Sperre wirklich zwangsweise freigeben?`n`nNur benutzen, wenn sicher ist, dass niemand spielt (z. B. nach einem Absturz).",
-        "Sperre erzwingen", 'YesNo', 'Warning')
+    $r = Show-Meldung -Titel "Sperre erzwingen" -Knoepfe 'YesNo' -Symbol 'Warning' `
+        -Text "Sperre wirklich zwangsweise freigeben?`n`nNur benutzen, wenn sicher ist, dass niemand spielt (z. B. nach einem Absturz)."
     if ($r -ne 'Yes') { return }
 
     Sync-Remote
@@ -3656,9 +4145,12 @@ function Show-Ruebenkurs {
 
     $dlg.Add_FormClosing({
             $e = $args[1]
+            # Waehrend "Speichern" noch laeuft, nicht schliessen - die Frage
+            # darunter startete sonst ein zweites Speichern (siehe Add-SchliessSperre).
+            if ($script:beschaeftigt -gt 0) { $e.Cancel = $true; return }
             if (-not $script:rkGeaendert) { return }
-            $r = [Windows.Forms.MessageBox]::Show("Die neuen Eintraege sind noch nicht gespeichert.`n`nJetzt speichern und hochladen?",
-                (Get-RkName), 'YesNoCancel', 'Question')
+            $r = Show-Meldung -Titel (Get-RkName) -Knoepfe 'YesNoCancel' -Symbol 'Question' `
+                -Text "Die neuen Eintraege sind noch nicht gespeichert.`n`nJetzt speichern und hochladen?"
             if ($r -eq 'Cancel') { $e.Cancel = $true; return }
             if ($r -eq 'Yes') { [void](Invoke-RkSpeichern) }
         })
@@ -3976,9 +4468,8 @@ function Show-Spielzeit {
     $h = Get-Playtime
     $sitzungen = @(Get-Sitzungen)
     if ((-not $h -or $h.Keys.Count -eq 0) -and $sitzungen.Count -eq 0) {
-        [void][Windows.Forms.MessageBox]::Show(
-            "Noch keine Spielzeit aufgezeichnet.`n`nSie wird waehrend des Spielens mitgezaehlt.",
-            "Spielzeit", 'OK', 'Information')
+        [void](Show-Meldung -Titel "Spielzeit" -Symbol 'Information' `
+                -Text "Noch keine Spielzeit aufgezeichnet.`n`nSie wird waehrend des Spielens mitgezaehlt.")
         return
     }
     $a = Get-SpielzeitAuswertung -Sitzungen $sitzungen
@@ -4130,12 +4621,11 @@ function Invoke-StandZurueck {
     if ($i -lt 0) { return }
     $s = $script:standDaten[$i]
 
-    $r = [Windows.Forms.MessageBox]::Show(
-        (("Den Spielstand vom {0} zurueckholen?`n`n" +
+    $r = Show-Meldung -Titel "Frueheren Stand zurueckholen" -Knoepfe 'YesNo' -Symbol 'Warning' -Text (
+        ("Den Spielstand vom {0} zurueckholen?`n`n" +
         "Der jetzige Stand geht dabei NICHT verloren - er bleibt in der Liste " +
         "und laesst sich genauso zurueckholen.`n`n" +
-        "Achtung: Dein Mitspieler bekommt den alten Stand beim naechsten Mal ebenfalls.") -f $s.Datum),
-        "Frueheren Stand zurueckholen", 'YesNo', 'Warning')
+        "Achtung: Dein Mitspieler bekommt den alten Stand beim naechsten Mal ebenfalls.") -f $s.Datum)
     if ($r -ne 'Yes') { return }
 
     $script:standStatus.Text = "Wird zurueckgeholt..."
@@ -4178,9 +4668,8 @@ function Invoke-StandZurueck {
 function Show-FruehereStaende {
     if (-not (Test-Repo)) { return }
     if ($script:holdingLock) {
-        [void][Windows.Forms.MessageBox]::Show(
-            "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden'.",
-            "Frueherer Spielstand", 'OK', 'Warning')
+        [void](Show-Meldung -Titel "Frueherer Spielstand" -Symbol 'Warning' `
+                -Text "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden'.")
         return
     }
 
@@ -4189,9 +4678,8 @@ function Show-FruehereStaende {
     if (Test-FremdeSperre "Frueherer Spielstand") { return }
     $script:standDaten = @(Get-StandListe)
     if ($script:standDaten.Count -eq 0) {
-        [void][Windows.Forms.MessageBox]::Show(
-            "Es sind noch keine Spielstaende gespeichert.`n`nSie entstehen automatisch waehrend des Spielens.",
-            "Frueherer Spielstand", 'OK', 'Information')
+        [void](Show-Meldung -Titel "Frueherer Spielstand" -Symbol 'Information' `
+                -Text "Es sind noch keine Spielstaende gespeichert.`n`nSie entstehen automatisch waehrend des Spielens.")
         return
     }
 
@@ -4241,6 +4729,7 @@ function Show-FruehereStaende {
     $bZu.Add_Click({ $script:standDlg.Close() })
     $dlg.Controls.Add($bZu)
 
+    Add-SchliessSperre $dlg
     Set-UiScale $dlg
     [void]$dlg.ShowDialog()
 }
@@ -4338,10 +4827,9 @@ function Invoke-FotoLoeschen {
     if ($script:fotoListe.Count -eq 0) { return }
     if ($script:fotoShow.Enabled) { Invoke-FotoDiashow }      # Diashow anhalten
     $d = $script:fotoListe[$script:fotoIndex]
-    $r = [Windows.Forms.MessageBox]::Show(
-        (("Dieses Foto loeschen?`n`n{0}`n`nEs liegt im gemeinsamen Ordner - es verschwindet damit " +
-        "auch bei deinem Mitspieler.") -f $d.Name),
-        "Foto loeschen", 'YesNo', 'Warning')
+    $r = Show-Meldung -Titel "Foto loeschen" -Knoepfe 'YesNo' -Symbol 'Warning' -Text (
+        ("Dieses Foto loeschen?`n`n{0}`n`nEs liegt im gemeinsamen Ordner - es verschwindet damit " +
+        "auch bei deinem Mitspieler.") -f $d.Name)
     if ($r -ne 'Yes') { return }
 
     # Wie beim Zurueckholen: erst den neuesten Stand holen und nicht
@@ -4374,8 +4862,7 @@ function Invoke-FotoLoeschen {
 
 function Show-Fotos {
     if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) {
-        [void][Windows.Forms.MessageBox]::Show("Es ist noch kein gemeinsamer Ordner eingerichtet.",
-            "Fotos", 'OK', 'Information')
+        [void](Show-Meldung -Titel "Fotos" -Symbol 'Information' -Text "Es ist noch kein gemeinsamer Ordner eingerichtet.")
         return
     }
     $script:fotoOrdner = Join-Path $script:cfg.RepoPath 'pics'
@@ -4387,10 +4874,9 @@ function Show-Fotos {
             Sort-Object @{ Expression = { Get-BildZeit $_ } }, @{ Expression = { $_.Name } } -Descending)
     }
     if ($script:fotoListe.Count -eq 0) {
-        [void][Windows.Forms.MessageBox]::Show(
-            ("Noch keine Fotos da.`n`nSie landen automatisch hier, wenn du nach dem Spielen " +
-            "welche im Bilder-Ordner hast - den stellst du unter 'Erweitert...' ein."),
-            "Fotos", 'OK', 'Information')
+        [void](Show-Meldung -Titel "Fotos" -Symbol 'Information' -Text (
+                "Noch keine Fotos da.`n`nSie landen automatisch hier, wenn du im Spiel welche machst " +
+                "und unter 'Erweitert...' der Spielfotos-Ordner von Dolphin eingetragen ist."))
         return
     }
 
@@ -4508,6 +4994,7 @@ function Show-Fotos {
         })
 
     $script:fotoIndex = 0
+    Add-SchliessSperre $dlg
     Set-UiScale $dlg
     Show-FotoAktuell
     [void]$dlg.ShowDialog()
@@ -4579,6 +5066,21 @@ function Test-Setup {
     }
     else {
         $e += Neu "Save-Ordner" $true $script:cfg.SaveFolder
+    }
+
+    # 5b) Spielfotos-Ordner - nur, wenn einer eingetragen ist (sonst ist das
+    # Teilen von Fotos einfach aus). Ein ungeeigneter wird nicht benutzt.
+    if (-not [string]::IsNullOrWhiteSpace($script:cfg.PicsFolder)) {
+        $grund = Test-SpielfotoOrdner $script:cfg.PicsFolder
+        if ($grund) {
+            $e += Neu "Spielfotos-Ordner" $false ("{0} Es werden keine Fotos geteilt. {1} Unter 'Erweitert...' aendern." -f $grund, (Get-SpielfotoOrdnerTipp)) ""
+        }
+        elseif (-not (Test-Path -LiteralPath $script:cfg.PicsFolder)) {
+            $e += Neu "Spielfotos-Ordner" $false ("'" + $script:cfg.PicsFolder + "' gibt es nicht. Unter 'Erweitert...' den Ordner waehlen, in dem Dolphin die Fotos aus dem Spiel ablegt.") ""
+        }
+        else {
+            $e += Neu "Spielfotos-Ordner" $true $script:cfg.PicsFolder
+        }
     }
 
     # 6) Uhrzeit - davon haengt ab, ob Sperren richtig als abgelaufen gelten.
@@ -4794,14 +5296,21 @@ function Show-AdvancedDialog {
         return $t
     }
 
-    $tPics = Zeile "Bilder-Ordner:" $script:txtPics.Text 46 340
+    $tPics = Zeile "Spielfotos-Ordner:" $script:txtPics.Text 46 340
     $bPics = New-Object Windows.Forms.Button
     $bPics.Text = "..."; $bPics.Location = New-Object Drawing.Point(508, 45)
     $bPics.Size = New-Object Drawing.Size(60, 24)
     $script:advPicsBox = $tPics
     $bPics.Add_Click({
-            $p = Select-FolderModern $script:advPicsBox.Text "Bilder-Ordner waehlen"
-            if ($p) { $script:advPicsBox.Text = $p }
+            $p = Select-FolderModern $script:advPicsBox.Text "Spielfotos-Ordner waehlen - den Ordner von Dolphin, z. B. ...\Load\WiiSDSync"
+            if (-not $p) { return }
+            $grund = Test-SpielfotoOrdner $p
+            if ($grund) {
+                [void](Show-Meldung -Titel "Spielfotos-Ordner" -Symbol 'Warning' `
+                        -Text ("Dieser Ordner passt nicht: {0}`n`n{1}" -f $grund, (Get-SpielfotoOrdnerTipp)))
+                return
+            }
+            $script:advPicsBox.Text = $p
         })
     $dlg.Controls.Add($bPics)
 
@@ -4809,15 +5318,20 @@ function Show-AdvancedDialog {
     $tLease = Zeile "Sperre gilt (Min):" $script:txtLease.Text 118 60
     $tHeart = Zeile "Herzschlag (Sek):" $script:txtHeart.Text 154 60
 
-    Set-Tip ("Ordner mit deinen Screenshots/Fotos, z. B. ...\Load\WiiSDSync.`n" +
-        "Nach dem Spielen werden die Bilder ins Repo VERSCHOBEN (Unterordner 'pics')`n" +
-        "und sind danach hier lokal nicht mehr vorhanden.`n" +
-        "Leer lassen = Bilder bleiben unangetastet.") $tPics $bPics
+    Set-Tip ("Der Ordner, in dem Dolphin die Fotos aus dem Spiel ablegt,`n" +
+        "z. B. ...\Load\WiiSDSync im Dolphin-Ordner.`n" +
+        "Nach dem Spielen werden neue Fotos daraus in den gemeinsamen Ordner`n" +
+        "KOPIERT (Unterordner 'pics') - hier bleiben sie liegen.`n" +
+        "Nicht deinen Windows-Ordner 'Bilder' waehlen: Der wird abgelehnt,`n" +
+        "sonst landeten deine privaten Fotos beim Mitspieler.`n" +
+        "Leer lassen = keine Fotos teilen.") $tPics $bPics
     Set-Tip ("Der Git-Zweig, auf dem synchronisiert wird - normalerweise 'main'.`n" +
         "Beide Spieler muessen denselben Branch eingetragen haben.") $tBranch
-    Set-Tip ("Wie lange eine Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
+    Set-Tip ("Wie lange DEINE Sperre ohne Herzschlag gueltig bleibt (in Minuten).`n" +
         "Danach gilt sie als abgelaufen und darf uebernommen werden - so bleibt`n" +
         "sie nach einem Absturz nicht ewig haengen.`n" +
+        "Der Wert steht in der Sperre selbst: dein Mitspieler richtet sich danach,`n" +
+        "auch wenn er selbst etwas anderes eingestellt hat.`n" +
         "Standard: 5, Minimum 1.") $tLease
     Set-Tip ("Wie oft waehrend des Spielens gespeichert und hochgeladen wird (in Sekunden).`n" +
         "Kleiner = bei einem Absturz geht weniger verloren, aber mehr Git-Verkehr.`n" +
@@ -4864,6 +5378,17 @@ function Show-AdvancedDialog {
     $dlg.Controls.Add($ab)
     $dlg.AcceptButton = $ok; $dlg.CancelButton = $ab
 
+    # Einen ungeeigneten Spielfotos-Ordner auch dann nicht uebernehmen, wenn
+    # er von Hand eingetippt wurde (siehe Test-SpielfotoOrdner).
+    $dlg.Add_FormClosing({
+            if ($args[0].DialogResult -ne 'OK') { return }
+            $grund = Test-SpielfotoOrdner $script:advPicsBox.Text
+            if (-not $grund) { return }
+            [void](Show-Meldung -Titel "Spielfotos-Ordner" -Symbol 'Warning' `
+                    -Text ("Dieser Ordner passt nicht: {0}`n`n{1}" -f $grund, (Get-SpielfotoOrdnerTipp)))
+            $args[1].Cancel = $true
+        })
+    Add-SchliessSperre $dlg
     Set-UiScale $dlg
     if ($dlg.ShowDialog() -eq 'OK') {
         $script:txtPics.Text = $tPics.Text
@@ -4876,13 +5401,12 @@ function Show-AdvancedDialog {
         if ($wirksam -lt $script:cfg.HeartbeatSeconds) {
             Write-Log ("Hinweis: Herzschlag {0} s ist zu lang fuer 'Sperre gilt' {1} Min - es wird alle {2} s gesendet." -f
                 $script:cfg.HeartbeatSeconds, $script:cfg.LeaseMinutes, $wirksam)
-            [void][Windows.Forms.MessageBox]::Show(
-                (("Der Herzschlag ({0} s) ist zu lang fuer 'Sperre gilt' ({1} Min).`n`n" +
-                "Die Sperre wuerde zwischen zwei Herzschlaegen ablaufen, und dein Mitspieler " +
-                "koennte sie uebernehmen, waehrend du spielst.`n`n" +
-                "Es wird deshalb alle {2} s gesendet (hoechstens ein Drittel der Sperrdauer). " +
-                "Fuer seltenere Herzschlaege 'Sperre gilt' erhoehen.") -f $script:cfg.HeartbeatSeconds, $script:cfg.LeaseMinutes, $wirksam),
-                "Herzschlag begrenzt", 'OK', 'Information')
+            [void](Show-Meldung -Titel "Herzschlag begrenzt" -Symbol 'Information' -Text (
+                    ("Der Herzschlag ({0} s) ist zu lang fuer 'Sperre gilt' ({1} Min).`n`n" +
+                    "Die Sperre wuerde zwischen zwei Herzschlaegen ablaufen, und dein Mitspieler " +
+                    "koennte sie uebernehmen, waehrend du spielst.`n`n" +
+                    "Es wird deshalb alle {2} s gesendet (hoechstens ein Drittel der Sperrdauer). " +
+                    "Fuer seltenere Herzschlaege 'Sperre gilt' erhoehen.") -f $script:cfg.HeartbeatSeconds, $script:cfg.LeaseMinutes, $wirksam))
         }
     }
 }
@@ -4944,13 +5468,12 @@ function Test-UhrBeimStart {
     Write-Log ("WARNUNG: Die Uhr dieses PCs geht etwa {0} {1}." -f (Format-Minuten ($betrag / 60)), $richtung)
     Write-Log "  Dann stimmt die Anzeige 'spielt seit' nicht, und abgelaufene Sperren werden falsch erkannt."
     if ($betrag -ge 120) {
-        [void][Windows.Forms.MessageBox]::Show(
-            (("Die Uhr dieses PCs geht etwa {0} {1}.`n`n" +
-            "Das Programm erkennt daran, ob eine Sperre abgelaufen ist. Mit falscher Uhr " +
-            "kann dein Mitspieler als abgemeldet gelten, obwohl er spielt (oder umgekehrt).`n`n" +
-            "Abhilfe: Windows-Einstellungen > Zeit und Sprache > 'Jetzt synchronisieren', " +
-            "und 'Uhrzeit automatisch festlegen' einschalten.") -f (Format-Minuten ($betrag / 60)), $richtung),
-            "Uhrzeit pruefen", 'OK', 'Warning')
+        [void](Show-Meldung -Titel "Uhrzeit pruefen" -Symbol 'Warning' -Text (
+                ("Die Uhr dieses PCs geht etwa {0} {1}.`n`n" +
+                "Das Programm erkennt daran, ob eine Sperre abgelaufen ist. Mit falscher Uhr " +
+                "kann dein Mitspieler als abgemeldet gelten, obwohl er spielt (oder umgekehrt).`n`n" +
+                "Abhilfe: Windows-Einstellungen > Zeit und Sprache > 'Jetzt synchronisieren', " +
+                "und 'Uhrzeit automatisch festlegen' einschalten.") -f (Format-Minuten ($betrag / 60)), $richtung))
     }
 }
 
@@ -5131,9 +5654,8 @@ function Invoke-UpdatePruefung {
     $info = Get-NeuesteVersion
     if (-not $info) {
         if (-not $Still) {
-            [void][Windows.Forms.MessageBox]::Show(
-                "Die Update-Pruefung hat nicht geklappt.`n`nMeist fehlt gerade die Internetverbindung. Einzelheiten stehen im Protokoll.",
-                "Nach Updates suchen", 'OK', 'Information')
+            [void](Show-Meldung -Titel "Nach Updates suchen" -Symbol 'Information' `
+                    -Text "Die Update-Pruefung hat nicht geklappt.`n`nMeist fehlt gerade die Internetverbindung. Einzelheiten stehen im Protokoll.")
         }
         return
     }
@@ -5141,9 +5663,8 @@ function Invoke-UpdatePruefung {
     if (-not (Test-VersionNeuer $info.Version $script:Version)) {
         Write-Log ("Version {0} ist aktuell." -f $script:Version)
         if (-not $Still) {
-            [void][Windows.Forms.MessageBox]::Show(
-                ("Du hast bereits die neueste Fassung (Version {0})." -f $script:Version),
-                "Nach Updates suchen", 'OK', 'Information')
+            [void](Show-Meldung -Titel "Nach Updates suchen" -Symbol 'Information' `
+                    -Text ("Du hast bereits die neueste Fassung (Version {0})." -f $script:Version))
         }
         return
     }
@@ -5155,33 +5676,32 @@ function Invoke-UpdatePruefung {
         $was = "`n`nNeu darin:`n" + (($neuigkeiten | ForEach-Object { "- $_" }) -join "`n")
     }
 
-    $r = [Windows.Forms.MessageBox]::Show(
-        ("Version {0} ist verfuegbar - du hast {1}.{2}`n`nJetzt aktualisieren? Das Programm startet dabei neu." -f
-        $info.Version, $script:Version, $was),
-        "Update verfuegbar", 'YesNo', 'Question')
+    $r = Show-Meldung -Titel "Update verfuegbar" -Knoepfe 'YesNo' -Symbol 'Question' -Text (
+        "Version {0} ist verfuegbar - du hast {1}.{2}`n`nJetzt aktualisieren? Das Programm startet dabei neu." -f
+        $info.Version, $script:Version, $was)
     if ($r -ne 'Yes') { return }
 
     if ($script:holdingLock) {
-        [void][Windows.Forms.MessageBox]::Show(
-            "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach aktualisieren.",
-            "Noch nicht jetzt", 'OK', 'Warning')
+        [void](Show-Meldung -Titel "Noch nicht jetzt" -Symbol 'Warning' `
+                -Text "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach aktualisieren.")
         return
     }
 
     if (Install-Update $info) {
-        [void][Windows.Forms.MessageBox]::Show(
-            ("Fertig - Version {0} ist installiert.`n`nDas Programm startet jetzt neu." -f $info.Version),
-            "Update abgeschlossen", 'OK', 'Information')
+        [void](Show-Meldung -Titel "Update abgeschlossen" -Symbol 'Information' `
+                -Text ("Fertig - Version {0} ist installiert.`n`nDas Programm startet jetzt neu." -f $info.Version))
+        # Die neue Fassung soll gleich loslegen koennen, statt auf diese zu
+        # warten, bis sie sich geschlossen hat (siehe Enter-EinzelInstanz).
+        Exit-EinzelInstanz
         try { Restart-Programm }
         catch { Write-Log "Neustart fehlgeschlagen - bitte von Hand starten." }
         $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
         $script:mainForm.Close()
     }
     else {
-        [void][Windows.Forms.MessageBox]::Show(
-            ("Das Update hat nicht geklappt. Die vorhandene Fassung laeuft unveraendert weiter.`n`n" +
-            "Einzelheiten stehen im Protokoll. Du kannst die Datei auch von Hand holen:`n{0}" -f $script:ReleaseSeite),
-            "Update fehlgeschlagen", 'OK', 'Warning')
+        [void](Show-Meldung -Titel "Update fehlgeschlagen" -Symbol 'Warning' -Text (
+                "Das Update hat nicht geklappt. Die vorhandene Fassung laeuft unveraendert weiter.`n`n" +
+                "Einzelheiten stehen im Protokoll. Du kannst die Datei auch von Hand holen:`n{0}" -f $script:ReleaseSeite))
     }
 }
 
@@ -5248,8 +5768,12 @@ pics/** -text -diff
         Write-Log "WARNUNG: Dein Spielstand konnte nicht ins Repo kopiert werden (siehe oben)."
     }
 
-    Invoke-Git @('add', '-A') | Out-Null
-    if (-not (Test-Staged)) {
+    $a = Invoke-Git @('add', '-A')
+    if ($a.Code -ne 0) {
+        # Sonst hiesse es gleich "Nichts Neues zu committen" (siehe Invoke-GitCommitPush).
+        Write-GitProblem "Das Repo ist noch nicht startklar - Speichern fehlgeschlagen." $a
+    }
+    elseif (-not (Test-Staged)) {
         Write-Log "Nichts Neues zu committen (schon eingerichtet)."
     }
     else {
@@ -5542,6 +6066,7 @@ function Show-FirstRunWizard {
     $dlg.AcceptButton = $script:wizNext
 
     Update-WizStep
+    Add-SchliessSperre $dlg
     Set-UiScale $dlg
     [void]$dlg.ShowDialog()
 
@@ -5554,11 +6079,10 @@ function Show-FirstRunWizard {
     Write-Log "Einrichtung abgeschlossen. Die Angaben sind gespeichert."
 
     # Zum Schluss anbieten, was den taeglichen Start bequem macht.
-    $r = [Windows.Forms.MessageBox]::Show(
-        ("Soll ich eine Verknuepfung auf dem Desktop anlegen?`n`n" +
+    $r = Show-Meldung -Titel "Fast fertig" -Knoepfe 'YesNo' -Symbol 'Question' -Text (
+        "Soll ich eine Verknuepfung auf dem Desktop anlegen?`n`n" +
         "Dann startest du das Programm kuenftig mit einem Doppelklick auf ein" +
-        " ordentliches Symbol, statt die heruntergeladene Datei zu suchen."),
-        "Fast fertig", 'YesNo', 'Question')
+        " ordentliches Symbol, statt die heruntergeladene Datei zu suchen.")
     if ($r -eq 'Yes') { [void](New-DesktopShortcut) }
 }
 
@@ -5922,8 +6446,91 @@ function Show-SetupDialog {
     Set-Tip "Schliesst dieses Fenster. Die Einstellungen bleiben erhalten." $bc
 
     Show-SetupSeite 0
+    Add-SchliessSperre $dlg
     Set-UiScale $dlg
     [void]$dlg.ShowDialog()
+}
+
+#endregion
+
+#region Nur einmal starten
+
+# --------------------------------------------------------------------------
+# Nur ein Programm pro Einstellungsordner
+# --------------------------------------------------------------------------
+# Zwei gleichzeitig laufende Programme arbeiteten im selben gemeinsamen
+# Ordner und hielten beide die eigene Sperre fuer "ihre": "Spielen starten"
+# im zweiten schriebe den Spielstand unter das laufende Spiel und startete
+# ein zweites Dolphin, und zwei Herzschlaege stritten sich um git. Das
+# passiert leicht - der Start dauert ein paar Sekunden, und man klickt
+# einfach noch einmal.
+# Der Name der Sperre haengt am Einstellungsordner: So kommen sich der
+# Oberflaechentest (eigene Einstellungen) und das echte Programm nicht in
+# die Quere.
+function Get-InstanzName {
+    param([string]$Ordner = $script:AppDir)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $h = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Ordner.TrimEnd('\', '/').ToLowerInvariant())) }
+    finally { $sha.Dispose() }
+    return 'Local\AC-SaveSync-' + (-join ($h[0..7] | ForEach-Object { $_.ToString('x2') }))
+}
+
+# Rueckgabe: $true = dieses Programm ist das einzige (und haelt die Sperre),
+# $false = es laeuft schon eines. Kurz gewartet wird fuer den Fall, dass
+# sich das andere gerade beendet.
+function Enter-EinzelInstanz {
+    param([string]$Name = (Get-InstanzName), [int]$WarteSek = 3)
+    try { $m = New-Object Threading.Mutex($false, $Name) }
+    catch {
+        # Ohne Sperre lieber trotzdem starten als gar nicht.
+        Write-Verbose "Einzelstart-Sperre nicht moeglich: $($_.Exception.Message)"
+        return $true
+    }
+    $frei = $false
+    try { $frei = $m.WaitOne([TimeSpan]::FromSeconds($WarteSek)) }
+    catch [Threading.AbandonedMutexException] {
+        # Das andere Programm ist abgestuerzt, ohne sie freizugeben - dann
+        # gehoert sie jetzt diesem.
+        $frei = $true
+    }
+    if (-not $frei) { $m.Dispose(); return $false }
+    $script:instanzSperre = $m
+    return $true
+}
+
+function Exit-EinzelInstanz {
+    if (-not $script:instanzSperre) { return }
+    try { $script:instanzSperre.ReleaseMutex() }
+    catch { Write-Verbose "Einzelstart-Sperre schon frei: $($_.Exception.Message)" }
+    $script:instanzSperre.Dispose()
+    $script:instanzSperre = $null
+}
+
+# Holt das Fenster des schon laufenden Programms nach vorn (auch aus der
+# Taskleiste). Rueckgabe: $true, wenn eins gefunden wurde - waehrend es noch
+# startet, hat es noch keins.
+function Show-LaufendeInstanz {
+    try {
+        $andere = Get-Process -Name powershell, pwsh -ErrorAction SilentlyContinue |
+        Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'Animal Crossing - Save-Sync*' } |
+        Select-Object -First 1
+        if (-not $andere) { return $false }
+        if (-not ('ACSS.Vorn' -as [type])) {
+            Add-Type -Namespace ACSS -Name Vorn -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr fenster);
+[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr fenster, int wie);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr fenster);
+'@
+        }
+        $h = $andere.MainWindowHandle
+        if ([ACSS.Vorn]::IsIconic($h)) { [void][ACSS.Vorn]::ShowWindowAsync($h, 9) }   # 9 = SW_RESTORE
+        [void][ACSS.Vorn]::SetForegroundWindow($h)
+        return $true
+    }
+    catch {
+        Write-Verbose "Laufendes Programm nicht gefunden: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 #endregion
@@ -5933,16 +6540,36 @@ function Show-SetupDialog {
 # ==========================================================================
 # Grafische Oberflaeche
 # ==========================================================================
+# Laeuft das Programm mit diesen Einstellungen schon? Dann dessen Fenster
+# nach vorn holen, statt ein zweites zu oeffnen (siehe Enter-EinzelInstanz).
+if (-not (Enter-EinzelInstanz)) {
+    if (-not (Show-LaufendeInstanz)) {
+        [void](Show-Meldung -Titel 'AC-SaveSync' -Symbol 'Information' -Text (
+                "Das Programm laeuft bereits.`n`n" +
+                "Es laesst sich nur einmal gleichzeitig starten - zwei kaemen sich beim " +
+                "gemeinsamen Spielstand in die Quere."))
+    }
+    return
+}
+
 Initialize-LogDatei
 Import-Config
 # Was fehlt oder ins Leere zeigt, selbst suchen - spart dem Nutzer die
 # Sucherei nach Dolphin und dem Save-Ordner.
 [void](Set-AutoPaths)
+# Ein ungeeigneter Spielfotos-Ordner - etwa aus einer aelteren Fassung, in
+# der das Feld noch "Bilder-Ordner" hiess - wird nicht benutzt. Gleich sagen,
+# warum, statt dass die Fotos einfach ausbleiben (siehe Copy-Pics).
+$fotoGrund = Test-SpielfotoOrdner $script:cfg.PicsFolder
+if ($fotoGrund) {
+    Write-Log ("WARNUNG: Der Spielfotos-Ordner wird nicht benutzt: {0}" -f $fotoGrund)
+    Write-Log "  Unter 'Erweitert...' den Ordner eintragen, in dem Dolphin die Fotos aus dem Spiel ablegt."
+}
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Animal Crossing - Save-Sync & Sperre  (v$($script:Version))"
 # Hoehe passt zum Inhalt: zwei Knopfreihen, dafuer zwei Eingabezeilen weniger
-# (Bilder-Ordner, Branch, Sperre und Herzschlag stecken jetzt in "Erweitert...").
+# (Spielfotos-Ordner, Branch, Sperre und Herzschlag stecken jetzt in "Erweitert...").
 $form.Size = New-Object Drawing.Size(660, 802)
 $form.StartPosition = "CenterScreen"
 $form.MinimumSize = New-Object Drawing.Size(660, 742)
@@ -6013,7 +6640,7 @@ $btnSetup = New-Button "Repo einrichten..." 470 ($y - 2) 138 26
 Set-Tip ("Dein Spielername. Er steht in der Sperre und in der Spielzeit-Statistik.`n" +
     "WICHTIG: Beide Spieler muessen UNTERSCHIEDLICHE Namen benutzen,`n" +
     "sonst haelt jeder die Sperre des anderen fuer die eigene.") $lblName $script:txtName
-Set-Tip ("Selten gebrauchte Einstellungen: Bilder-Ordner, Branch,`n" +
+Set-Tip ("Selten gebrauchte Einstellungen: Spielfotos-Ordner, Branch,`n" +
     "Gueltigkeit der Sperre und Herzschlag-Takt.`n" +
     "Die Standardwerte passen fuer die allermeisten.") $btnAdvanced
 Set-Tip ("Hilfe fuer die einmalige Einrichtung:`n" +
@@ -6025,7 +6652,7 @@ Set-Tip ("Hilfe fuer die einmalige Einrichtung:`n" +
 # funktioniert), sind dort aber unsichtbar. Bearbeitet werden sie im Dialog
 # "Erweitert...", der die Werte hier hineinschreibt. Weil unsichtbare
 # Controls nichts zeichnen, duerfen sie an derselben Stelle liegen.
-$lblPics = New-Label "Bilder-Ordner:" 15 $y
+$lblPics = New-Label "Spielfotos-Ordner:" 15 $y
 $script:txtPics = New-Text $script:cfg.PicsFolder 140 $y 400
 $btnBrowsePics = New-Button "..." 548 $y 60 24
 $lblBranch = New-Label "Branch:" 15 $y 60
@@ -6086,8 +6713,8 @@ Set-Tip ("Holt einen frueheren Spielstand zurueck - Git hat bei jedem`n" +
     "Die Rettung, wenn im Spiel etwas schiefgegangen ist.") $btnStaende
 Set-Tip ("Zeigt die Fotos aus dem gemeinsamen Ordner - neueste zuerst.`n" +
     "Blaettern geht auch mit den Pfeiltasten.`n" +
-    "Die Bilder landen dort automatisch nach dem Spielen, wenn unter`n" +
-    "'Erweitert...' ein Bilder-Ordner eingetragen ist.") $btnFotos
+    "Die Fotos aus dem Spiel landen dort automatisch nach dem Spielen,`n" +
+    "wenn unter 'Erweitert...' der Spielfotos-Ordner eingetragen ist.") $btnFotos
 Set-Tip ("Prueft der Reihe nach alles, was zum Spielen noetig ist:`n" +
     "Git, deine Angaben, Dolphin, den gemeinsamen Ordner und die`n" +
     "Verbindung zum Server. Zu jedem Problem steht dabei, was zu tun ist.`n" +
@@ -6268,8 +6895,8 @@ $btnBrowseSave.Add_Click({
         if ($p) { $script:txtSave.Text = $p }
     })
 $btnBrowsePics.Add_Click({
-        $p = Select-FolderModern $script:txtPics.Text "Bilder-Ordner waehlen, z. B. ...\Load\WiiSDSync (in den Ordner wechseln, dann 'Oeffnen')"
-        if ($p) { $script:txtPics.Text = $p }
+        $p = Select-FolderModern $script:txtPics.Text "Spielfotos-Ordner waehlen, z. B. ...\Load\WiiSDSync (in den Ordner wechseln, dann 'Oeffnen')"
+        if ($p -and -not (Test-SpielfotoOrdner $p)) { $script:txtPics.Text = $p }
     })
 $script:btnPlay.Add_Click({ Start-Play })
 $script:btnStop.Add_Click({ Stop-Play })
@@ -6300,12 +6927,11 @@ $form.Add_FormClosing({
         # Beim Neustart nach einem Update nicht noch einmal nachfragen.
         if ($script:updateLaeuft) { return }
         if ($script:holdingLock) {
-            $r = [Windows.Forms.MessageBox]::Show(
-                ("Es laeuft noch eine Sitzung und du haeltst die Sperre.`n`n" +
+            $r = Show-Meldung -Titel "Achtung" -Knoepfe 'YesNo' -Symbol 'Warning' -Text (
+                "Es laeuft noch eine Sitzung und du haeltst die Sperre.`n`n" +
                 "Sauberer waere 'Spielen beenden' - dann wird hochgeladen und die Sperre freigegeben.`n`n" +
                 "Beim Schliessen wird der Spielstand NICHT automatisch hochgeladen. " +
-                "Die Sperre laeuft aber spaetestens nach {0} Min automatisch ab.`n`nTrotzdem schliessen?" -f $script:cfg.LeaseMinutes),
-                "Achtung", 'YesNo', 'Warning')
+                "Die Sperre laeuft aber spaetestens nach {0} Min automatisch ab.`n`nTrotzdem schliessen?" -f $script:cfg.LeaseMinutes)
             if ($r -ne 'Yes') { $e.Cancel = $true }
         }
     })
@@ -6321,5 +6947,6 @@ $form.Add_Shown({ $script:startTimer.Start(); $script:fortschrittTimer.Start() }
 Write-Log "Bereit."
 Set-UiScale $form
 [void]$form.ShowDialog()
+Exit-EinzelInstanz
 
 #endregion

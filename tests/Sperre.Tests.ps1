@@ -19,6 +19,36 @@ Test "Herzschlag wird auf ein Drittel der Sperrdauer begrenzt" {
     }
 }
 
+Test "Sperrdauer steht in der Sperre: es gilt die des Spielenden" {
+    $r = New-TestRepos -Klone a, b -MitStart
+    $script:cfg.RepoPath = $r.a
+    $script:cfg.LeaseMinutes = 7
+    Set-LockFile -Neu
+    $eigen = Get-Content -LiteralPath (Get-LockPath) -Raw -Encoding UTF8 | ConvertFrom-Json
+    Soll ((Get-JsonWert $eigen 'leaseMinutes') -eq 7) "eigene Sperrdauer steht in der Sperr-Datei"
+    Remove-Item -LiteralPath (Get-LockPath) -Force
+
+    # Max: letzter Herzschlag vor 4 Minuten, seine Sperre gilt 15 Minuten
+    $t = [datetime]::UtcNow.AddMinutes(-4).ToString('o')
+    $mitDauer = { param($m) '{"owner":"Max","machine":"ANDERER-PC","startedUtc":"' + $t + '","updatedUtc":"' + $t + '","leaseMinutes":' + $m + '}' }
+    Push-Als $r.b 'PLAYING.lock' (& $mitDauer 15)
+    $script:cfg.LeaseMinutes = 3
+    Soll (-not (Get-LockStateRemote).Stale) "bei mir 3 Min eingestellt - Max' Sperre (15 Min) ist trotzdem frisch"
+    Invoke-G $r.a pull -q origin main | Out-Null
+    Soll (-not (Get-LockState).Stale) "auch oertlich gelesen frisch"
+
+    Push-Als $r.b 'PLAYING.lock' (& $mitDauer 3)
+    $script:cfg.LeaseMinutes = 15
+    Soll ((Get-LockStateRemote).Stale) "Max hat 3 Min: abgelaufen, obwohl bei mir 15 eingestellt sind"
+
+    # Sperr-Datei einer aelteren Fassung ohne Angabe: eigene Einstellung
+    Push-Als $r.b 'PLAYING.lock' (New-SperrText -Besitzer 'Max' -VorMinuten 4)
+    $script:cfg.LeaseMinutes = 3
+    Soll ((Get-LockStateRemote).Stale) "ohne Angabe, eigene 3 Min: abgelaufen"
+    $script:cfg.LeaseMinutes = 15
+    Soll (-not (Get-LockStateRemote).Stale) "ohne Angabe, eigene 15 Min: frisch"
+}
+
 Test "Test-FremdeSperre: blockiert, solange jemand anderes spielt" {
     $r = New-TestRepos -Klone a, b -MitStart
     $script:cfg.RepoPath = $r.a
@@ -70,13 +100,13 @@ Test "Nach verlorener Sperre: nichts hochladen, Sicherheitskopie anlegen" {
     $script:cfg.SaveFolder = $save
     $script:gepusht = $false; $script:bilder = $false
     function Invoke-GitCommitPush { $script:gepusht = $true; [pscustomobject]@{ Code = 0; Text = ''; Stage = 'push' } }
-    function Move-Pics { $script:bilder = $true }
+    function Copy-Pics { $script:bilder = $true }
     if (-not $script:AufWindows) { function Save-Sicherheitskopie { '/ersatz/gerettet' } }   # ohne robocopy
 
     $script:sperreVerloren = $true; $script:holdingLock = $true
     Complete-Session
     Soll (-not $script:gepusht) "nichts hochgeladen"
-    Soll (-not $script:bilder) "Bilder nicht ins Repo verschoben"
+    Soll (-not $script:bilder) "keine Fotos in den gemeinsamen Ordner kopiert"
     Soll (-not $script:holdingLock -and -not $script:btnStop.Enabled) "Sitzung beendet"
     Soll ((Get-ProtokollText) -match 'Kopie deines Spielstands liegt hier') "Pfad der Kopie im Protokoll"
     if ($script:AufWindows) {
@@ -144,4 +174,43 @@ Test "Wettlauf mit echtem lokalem Fortschritt: der bleibt erhalten" {
     Start-Play
     Soll ($script:syncAufrufe -ge 2) "normaler Abgleich (mit Rueckfrage) wird aufgerufen"
     Soll ((Invoke-G $r.a log --format=%s) -match 'lokaler Fortschritt') "Fortschritt nicht weggeworfen"
+}
+
+Test "git add scheitert (index.lock): Fehler statt vorgetaeuschtem Erfolg, keine Sitzung" {
+    $r = New-TestRepos -Klone a -MitStart
+    $script:cfg.RepoPath = $r.a; $script:cfg.DolphinPath = Get-TestDolphinPfad
+    function Save-ConfigFromUI { }
+    # So bleibt sie liegen, wenn git mittendrin abstuerzt oder beendet wird.
+    $indexSperre = Join-Path $r.a '.git/index.lock'
+    New-Item -ItemType File -Path $indexSperre | Out-Null
+    try {
+        Set-LockFile -Neu
+        $p = Invoke-GitCommitPush 'lock: Anna'
+        Soll ($p.Code -ne 0 -and $p.Stage -eq 'commit') "Fehler statt Erfolg (Code $($p.Code), Stage $($p.Stage))"
+        Soll ((Get-ProtokollText) -match 'blockiert sich selbst') "Klartext zur index.lock im Protokoll"
+        Remove-Item -LiteralPath (Get-LockPath) -Force
+
+        Start-Play
+        Soll (-not $script:holdingLock -and $null -eq $script:proc) "keine Sitzung, kein Dolphin"
+        Soll (-not (Test-Path -LiteralPath (Get-LockPath))) "keine liegengebliebene Sperr-Datei"
+    }
+    finally { Remove-Item -LiteralPath $indexSperre -Force -ErrorAction SilentlyContinue }
+    Soll ((Invoke-G $r.a ls-tree --name-only origin/main) -notmatch 'PLAYING.lock') "keine Sperre auf dem Server"
+}
+
+Test "Dolphin startet nicht: keine Sitzung, keine Spielzeit, Sperre wieder frei" -NurWindows {
+    $r = New-TestRepos -Klone a -MitStart
+    $script:cfg.RepoPath = $r.a
+    # Die Datei gibt es, ein Programm ist sie aber nicht - Start-Process scheitert.
+    $kaputt = Join-Path $script:TestWurzel ('kaputt-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.exe')
+    Set-Content -LiteralPath $kaputt -Value 'kein Programm'
+    $script:cfg.DolphinPath = $kaputt
+    function Save-ConfigFromUI { }
+    $script:lastAccounted = (Get-Date).AddHours(-3)     # das Programm laeuft schon lange
+    Start-Play
+    Soll ((Get-ProtokollText) -match 'Start fehlgeschlagen') "Fehlstart erkannt"
+    Soll (-not $script:holdingLock -and $null -eq $script:proc) "keine Sitzung"
+    Soll ((Get-Playtime).Count -eq 0) "keine Sitzung und keine Spielzeit gezaehlt"
+    Soll ((Invoke-G $r.a ls-tree --name-only origin/main) -notmatch 'PLAYING.lock') "Sperre auf dem Server wieder frei"
+    Soll ((Invoke-G $r.a log -1 --format=%s origin/main) -match 'Start abgebrochen') "im Verlauf als abgebrochener Start"
 }
