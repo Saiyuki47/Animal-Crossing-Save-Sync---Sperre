@@ -30,10 +30,11 @@
   Voraussetzungen (einmalig):
   ---------------------------
     - Git muss installiert und im PATH sein  (git --version testen)
-    - Ihr habt EIN gemeinsames privates Git-Repo (z. B. GitHub) und BEIDE
-      habt es lokal geklont. RepoPath zeigt auf diesen Ordner.
-    - Der Dolphin-Spielstand liegt in diesem Repo-Ordner (oder ihr verlinkt
-      den Dolphin-Save-Ordner per Symlink dort hinein).
+    - Ihr habt EIN gemeinsames privates Git-Repo (z. B. GitHub). Anlegen bzw.
+      holen geht bequem ueber "Repo einrichten..." im Programm.
+    - Der Spielstand wird zwischen dem Save-Ordner von Dolphin und dem
+      Unterordner save/ im Repo hin- und herkopiert (siehe Backup-Saves und
+      Restore-Saves) - Dolphin selbst muss dafuer nicht umgestellt werden.
     - Eure Git-Zugangsdaten sind gespeichert (Git Credential Manager bei HTTPS
       oder ein SSH-Key), sonst kann das Skript nicht ohne Nachfrage pushen.
     - Beide benutzen dieses Skript, ABER mit UNTERSCHIEDLICHEM Spielernamen.
@@ -111,9 +112,6 @@ if ($env:ACSS_UI_SCALE) {
 # ewig warten. Mit 0 bricht Git stattdessen mit einer Meldung ab - und die
 # uebersetzt Write-GitProblem weiter unten in Klartext.
 # Der Windows-Anmelde-Dialog (Credential Manager) erscheint weiterhin normal.
-# <FIXED> Diese Zuweisung stand doppelt im Skript (einmal hier, einmal weiter
-# unten vor dem Abschnitt "Konfiguration"). Die zweite war wirkungslos und
-# wurde entfernt - dies ist die einzige verbliebene Stelle.
 $env:GIT_TERMINAL_PROMPT = '0'
 
 # Was git ausgibt, liest PowerShell mit der Codepage der Konsole ein - von
@@ -129,7 +127,7 @@ try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 # Diese Nummer MUSS zum Git-Tag des Releases passen (Tag v1.12 -> '1.12').
 # Der Release-Workflow prueft das und bricht ab, wenn es auseinanderlaeuft -
 # sonst wuerde sich das Programm fuer aelter oder neuer halten, als es ist.
-$script:Version = '1.16'
+$script:Version = '1.17'
 $script:ReleaseApi = 'https://api.github.com/repos/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync---Sperre/releases/latest'
 
@@ -142,7 +140,7 @@ $script:ReleaseSeite = 'https://github.com/Saiyuki47/Animal-Crossing-Save-Sync--
 $script:AppDir = if ($env:APPDATA) { Join-Path $env:APPDATA "AC-SaveSync" }
 elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "AC-SaveSync" }
 else { Join-Path (Get-Location).Path "AC-SaveSync" }
-if (-not (Test-Path $script:AppDir)) {
+if (-not (Test-Path -LiteralPath $script:AppDir)) {
     New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
 }
 $script:ConfigPath = Join-Path $script:AppDir "acsync-config.json"
@@ -153,7 +151,7 @@ $script:SelfPath = $PSCommandPath
 $script:LogPfad = $null
 # Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
 # dann fuehrt der Assistent durch die Einrichtung (siehe Start-Timer).
-$script:istErststart = -not (Test-Path $script:ConfigPath)
+$script:istErststart = -not (Test-Path -LiteralPath $script:ConfigPath)
 
 $script:defaults = @{
     DolphinPath      = "C:\Program Files\Dolphin-x64\Dolphin.exe"
@@ -194,7 +192,7 @@ $script:endeSeit = $null
 # Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
 $script:configSaved = $false
 
-# <FIXED> Vorbelegung fuer Set-StrictMode -Version Latest.
+# Vorbelegung fuer Set-StrictMode -Version Latest.
 # StrictMode bricht ab, sobald eine Variable GELESEN wird, die es noch nicht
 # gibt. Die folgenden Werte entstehen erst spaeter - die Oberflaeche legt sie
 # beim Aufbau an, die Dialoge erst beim Oeffnen. Vorher fragt der Code sie aber
@@ -366,8 +364,8 @@ function Set-Tip {
     }
 }
 
-# Eingebettetes Programm-Icon (Base64-ICO, selbst gezeichnetes Blatt-Motiv,
-# erzeugt von tools/New-Icon.ps1). Es dient dem Fenster, der Taskleiste und
+# Eingebettetes Programm-Icon (Base64-ICO aus icon.ico, eingetragen von
+# tools/Set-Icon.ps1). Es dient dem Fenster, der Taskleiste und
 # der Desktop-Verknuepfung.
 # Hinweis: Eine .cmd-Datei selbst kann KEIN Icon tragen - das legt Windows
 # ueber die Dateizuordnung fest. Deshalb der Weg ueber die Verknuepfung.
@@ -464,7 +462,7 @@ function Select-FolderModern {
     $d.CheckPathExists = $true
     $d.Multiselect = $false
     $d.FileName = "Diesen Ordner waehlen"
-    if ($InitialPath -and (Test-Path $InitialPath)) { $d.InitialDirectory = $InitialPath }
+    if ($InitialPath -and (Test-Path -LiteralPath $InitialPath)) { $d.InitialDirectory = $InitialPath }
     if ($d.ShowDialog() -eq 'OK') { return [IO.Path]::GetDirectoryName($d.FileName) }
     return $null
 }
@@ -483,7 +481,7 @@ function Select-FolderModern {
 function Initialize-LogDatei {
     try {
         $ordner = Join-Path $script:AppDir 'logs'
-        if (-not (Test-Path $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
         $script:LogPfad = Join-Path $ordner ("ac-savesync_{0}.log" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
         ("=== AC-SaveSync {0} - gestartet {1} ===" -f $script:Version, (Get-Date).ToString("dd.MM.yyyy HH:mm:ss")) |
         Set-Content -LiteralPath $script:LogPfad -Encoding UTF8
@@ -522,7 +520,7 @@ function Write-Log {
     }
 }
 
-# <FIXED> Liest einen Eintrag aus einem ConvertFrom-Json-Ergebnis, ohne dass ein
+# Liest einen Eintrag aus einem ConvertFrom-Json-Ergebnis, ohne dass ein
 # fehlender Eintrag unter StrictMode zum Fehler wird.
 # Das ist keine Bequemlichkeit, sondern noetig: Mehrere Stellen RECHNEN damit,
 # dass ein Eintrag fehlen kann - eine Sperr-Datei aus einer aelteren Fassung hat
@@ -555,11 +553,11 @@ function Write-TextDatei {
 }
 
 function Import-Config {
-    if (Test-Path $script:ConfigPath) {
+    if (Test-Path -LiteralPath $script:ConfigPath) {
         try {
-            $j = Get-Content $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $j = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
             foreach ($k in @($script:cfg.Keys)) {
-                # <FIXED> Erst nachsehen, OB es den Eintrag ueberhaupt gibt.
+                # Erst nachsehen, OB es den Eintrag ueberhaupt gibt.
                 # Unter StrictMode ist das Lesen einer fehlenden Eigenschaft ein
                 # Fehler - und eine Einstellungsdatei aus einer aelteren Fassung
                 # kennt neuere Schluessel noch nicht. Ohne diese Pruefung wuerde
@@ -609,7 +607,7 @@ function Save-ConfigFromUI {
     # "gespeichert" melden, obwohl die Datei nicht geschrieben werden konnte.
     $script:configSaved = $false
     try {
-        ($script:cfg | ConvertTo-Json) | Set-Content -Path $script:ConfigPath -Encoding UTF8
+        ($script:cfg | ConvertTo-Json) | Set-Content -LiteralPath $script:ConfigPath -Encoding UTF8
         $script:configSaved = $true
     }
     catch {
@@ -640,6 +638,12 @@ function ConvertTo-GitText {
 
 function Invoke-Git {
     param([string[]]$GitArgs)
+    # Ohne Repo-Ordner NICHT loslegen: "git -C ''" arbeitet im aktuellen
+    # Ordner - im schlimmsten Fall in einem ganz anderen Repo, auf das dann
+    # etwa ein "reset --hard" losgelassen wuerde.
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) {
+        return [pscustomobject]@{ Code = 128; Text = 'Kein Repo-Ordner eingetragen.' }
+    }
     $out = & git -C $script:cfg.RepoPath @GitArgs 2>&1
     [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
 }
@@ -705,7 +709,7 @@ $script:GitKlartext = @(
     }
     @{ Muster = 'would be overwritten by merge|local changes.*would be overwritten|CONFLICT|Automatic merge failed'
         Text  = 'Lokale Aenderungen stehen dem Stand vom Server im Weg.'
-        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Achtung: dabei werden lokale Aenderungen verworfen.' 
+        Tipp  = 'Meist reicht "Status pruefen" - das holt den Server-Stand. Liegt dabei noch Ungesichertes auf diesem PC, fragt das Programm vorher nach.' 
     }
     @{ Muster = 'Filename too long|unable to write file.*too long|path too long'
         Text  = 'Ein Dateiname wird zu lang - Windows steigt bei sehr langen Pfaden aus.'
@@ -744,7 +748,12 @@ function Write-GitProblem {
 }
 
 function Test-Repo {
-    if (-not (Test-Path (Join-Path $script:cfg.RepoPath ".git"))) {
+    # Erst auf leer pruefen: Join-Path wirft bei einem leeren Pfad einen Fehler.
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) {
+        Write-Log "FEHLER: Es ist noch kein Repo-Ordner eingetragen. Oben ausfuellen oder 'Repo einrichten...' nutzen."
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath ".git"))) {
         Write-Log "FEHLER: Unter RepoPath liegt kein Git-Repo. Bitte erst das gemeinsame Repo dorthin klonen."
         return $false
     }
@@ -892,7 +901,7 @@ function Find-DolphinExe {
     foreach ($w in $wurzeln) {
         try {
             foreach ($k in (Get-ItemProperty $w -ErrorAction SilentlyContinue)) {
-                # <FIXED> Nicht jeder Deinstallations-Eintrag hat DisplayName
+                # Nicht jeder Deinstallations-Eintrag hat DisplayName
                 # oder InstallLocation. Unter StrictMode wuerde der erste solche
                 # Eintrag die ganze Registry-Suche abbrechen (der catch liegt um
                 # die Schleife) - Dolphin waere dann unauffindbar.
@@ -1051,11 +1060,11 @@ function Restore-Saves {
     $src = Get-RepoSaveDir
     $dst = $script:cfg.SaveFolder
     if ([string]::IsNullOrWhiteSpace($dst)) { return $true }   # Feld leer -> Funktion aus
-    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+    if (-not (Test-Path -LiteralPath $src) -or -not (Get-ChildItem -LiteralPath $src -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
         Write-Log "Noch kein Spielstand im Repo - vorhandener Dolphin-Save bleibt unangetastet."
         return $true
     }
-    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
     Write-Log "Schreibe Spielstand aus dem Repo in den Dolphin-Ordner..."
     # /E = inkl. Unterordner, ueberschreibt; bewusst OHNE Loeschen, damit im
     # Dolphin-Ordner nichts Fremdes geloescht wird.
@@ -1068,11 +1077,11 @@ function Backup-Saves {
     $src = $script:cfg.SaveFolder
     $dst = Get-RepoSaveDir
     if ([string]::IsNullOrWhiteSpace($src)) { return $true }   # Feld leer -> Funktion aus
-    if (-not (Test-Path $src) -or -not (Get-ChildItem -Force $src -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+    if (-not (Test-Path -LiteralPath $src) -or -not (Get-ChildItem -LiteralPath $src -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
         Write-Log "Dolphin-Save-Ordner ist leer/fehlt - nichts zu sichern."
         return $true
     }
-    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
     # /MIR = spiegelt exakt ins repo-eigene 'save/' (dort ist Spiegeln sicher).
     $null = robocopy $src $dst /MIR /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
     if ($LASTEXITCODE -ge 8) {
@@ -1135,12 +1144,12 @@ function Get-BildZeit {
 function Move-Pics {
     $src = $script:cfg.PicsFolder
     if ([string]::IsNullOrWhiteSpace($src)) { return }   # Feld leer -> Funktion aus
-    if (-not (Test-Path $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
+    if (-not (Test-Path -LiteralPath $src)) { Write-Log "Bilder-Ordner nicht gefunden - uebersprungen."; return }
     $dst = Join-Path $script:cfg.RepoPath 'pics'
-    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
 
     $exts = @('.jpg', '.jpeg', '.png')
-    $files = Get-ChildItem -Path $src -Recurse -File -ErrorAction SilentlyContinue |
+    $files = Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object { $exts -contains $_.Extension.ToLowerInvariant() }
     if (-not $files) { Write-Log "Keine neuen Bilder gefunden."; return }
 
@@ -1155,7 +1164,7 @@ function Move-Pics {
         $ext = $f.Extension.ToLowerInvariant()
         $target = Join-Path $dst ($stem + $ext)
         $i = 1
-        while (Test-Path $target) {
+        while (Test-Path -LiteralPath $target) {
             $target = Join-Path $dst ("{0}_{1}{2}" -f $stem, $i, $ext)
             $i++
         }
@@ -1173,12 +1182,12 @@ function Get-PlaytimePath { Join-Path $script:cfg.RepoPath 'playtime.json' }
 function Get-Playtime {
     $p = Get-PlaytimePath
     $h = @{}
-    if (Test-Path $p) {
+    if (Test-Path -LiteralPath $p) {
         try {
-            $j = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+            $j = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
             foreach ($prop in $j.PSObject.Properties) {
                 $v = $prop.Value
-                # <FIXED> Fehlende Felder sind erlaubt und werden zu 0 bzw. "".
+                # Fehlende Felder sind erlaubt und werden zu 0 bzw. "".
                 # Ohne Get-JsonWert wuerde StrictMode hier abbrechen und die
                 # gesamte Statistik verwerfen, nur weil ein Eintrag unvollstaendig ist.
                 $h[$prop.Name] = @{
@@ -1246,13 +1255,13 @@ function Write-Readme {
     # faengt mit dem Spielernamen an, dadurch stand frueher alles von "Zoe"
     # vor allem von "Anna" - auch wenn Zoes Bild zwei Wochen aelter war.
     $picsDir = Join-Path $script:cfg.RepoPath 'pics'
-    if (Test-Path $picsDir) {
+    if (Test-Path -LiteralPath $picsDir) {
         $imgExts = @('.jpg', '.jpeg', '.png')
-        # <FIXED> Ergebnis in @() klammern. Ohne das liefert die Pipeline bei
+        # Ergebnis in @() klammern. Ohne das liefert die Pipeline bei
         # GENAU EINEM Bild kein Feld, sondern das Bild selbst - und "$imgs.Count"
         # ist unter StrictMode dann ein Fehler. Die Galerie fiel dadurch still
         # aus der README, sobald nur ein einziges Foto im Ordner lag.
-        $imgs = @(Get-ChildItem -Path $picsDir -File -ErrorAction SilentlyContinue |
+        $imgs = @(Get-ChildItem -LiteralPath $picsDir -File -ErrorAction SilentlyContinue |
             Where-Object { $imgExts -contains $_.Extension.ToLowerInvariant() } |
             Sort-Object @{ Expression = { Get-BildZeit $_ } }, @{ Expression = { $_.Name } } -Descending)
         if ($imgs -and $imgs.Count -gt 0) {
@@ -1339,8 +1348,8 @@ function Set-LockFile {
         # Vorhandenen Startzeitpunkt uebernehmen - immer wieder im festen
         # Format schreiben, damit er beim naechsten Lesen eindeutig bleibt.
         try {
-            $alt = Get-Content (Get-LockPath) -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
-            # <FIXED> fehlendes startedUtc ist erlaubt (aeltere Sperr-Dateien)
+            $alt = Get-Content -LiteralPath (Get-LockPath) -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+            # fehlendes startedUtc ist erlaubt (aeltere Sperr-Dateien)
             $altStart = ConvertTo-UtcZeit (Get-JsonWert $alt 'startedUtc')
             if ($altStart) { $start = $altStart.ToString("o") }
         }
@@ -1372,10 +1381,10 @@ function Format-Minuten {
 
 function Get-LockState {
     $lf = Get-LockPath
-    if (-not (Test-Path $lf)) { return [pscustomobject]@{ State = 'free' } }
+    if (-not (Test-Path -LiteralPath $lf)) { return [pscustomobject]@{ State = 'free' } }
     try {
-        $j = Get-Content $lf -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
-        # <FIXED> Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
+        $j = Get-Content -LiteralPath $lf -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+        # Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
         $upd = ConvertTo-UtcZeit (Get-JsonWert $j 'updatedUtc')
         if (-not $upd) { return [pscustomobject]@{ State = 'unknown' } }
         $age = ([datetime]::UtcNow - $upd).TotalMinutes
@@ -1419,7 +1428,7 @@ function Get-LockStateRemote {
     try {
         # Sperr-Dateien aelterer Fassungen tragen noch ein BOM - abschneiden.
         $o = ("$($j.Text)".TrimStart([char]0xFEFF)) | ConvertFrom-Json
-        # <FIXED> Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
+        # Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
         $upd = ConvertTo-UtcZeit (Get-JsonWert $o 'updatedUtc')
         if (-not $upd) { return $null }
         $age = ([datetime]::UtcNow - $upd).TotalMinutes
@@ -1446,7 +1455,7 @@ function Invoke-AutoAuffrischen {
     # Nur wenn gerade nichts laeuft und alles eingerichtet ist.
     if ($script:holdingLock -or -not $script:gitDa) { return }
     if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { return }
-    if (-not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) { return }
+    if (-not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))) { return }
 
     $neu = Get-LockStateRemote
     if (-not $neu) { return }        # kein Netz o. ae. - stillschweigend nichts tun
@@ -1464,6 +1473,20 @@ function Invoke-AutoAuffrischen {
         Write-Log ("{0} spielt jetzt." -f $neu.Owner)
     }
     $script:letzterFremdstand = $jetzt
+}
+
+# Startet die automatische Anzeige, sobald es ein Repo gibt. Beim Programmstart
+# passiert das im Start-Timer - wird das Repo aber erst danach eingerichtet
+# oder eingetragen, lief die Anzeige bisher bis zum naechsten Neustart nicht.
+# -MitStatus: zusaetzlich sofort den Status pruefen (nach der Einrichtung).
+function Start-AutoAuffrischen {
+    param([switch]$MitStatus)
+    if (-not $script:autoTimer -or $script:autoTimer.Enabled -or -not $script:gitDa) { return }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
+        -not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))) { return }
+    $script:letzterFremdstand = $null
+    $script:autoTimer.Start()
+    if ($MitStatus) { Update-Status -SkipSave }
 }
 
 # Spielt gerade jemand anderes? Dann darf NIEMAND sonst etwas hochladen:
@@ -1527,7 +1550,7 @@ function Update-StatusUI {
 function Start-Play {
     Save-ConfigFromUI
 
-    if (-not (Test-Path $script:cfg.DolphinPath)) {
+    if (-not (Test-Path -LiteralPath $script:cfg.DolphinPath)) {
         Write-Log "FEHLER: Dolphin nicht gefunden unter: $($script:cfg.DolphinPath)"
         return
     }
@@ -1627,7 +1650,7 @@ function Start-Play {
     if (-not (Restore-Saves)) {
         Write-Log "Abbruch: Dolphin wird NICHT gestartet, damit der alte Stand auf diesem PC"
         Write-Log "  nicht den gemeinsamen ueberschreibt. Laeuft Dolphin vielleicht noch?"
-        Remove-Item (Get-LockPath) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Get-LockPath) -Force -ErrorAction SilentlyContinue
         $p = Invoke-GitCommitPush ("unlock (Start abgebrochen): {0}" -f $script:cfg.PlayerName)
         if ($p.Code -ne 0) {
             Write-GitProblem "Die Sperre konnte nicht wieder freigegeben werden." $p
@@ -1647,7 +1670,7 @@ function Start-Play {
 
     try {
         $gp = $script:cfg.GamePath
-        if ($gp -and (Test-Path $gp)) {
+        if ($gp -and (Test-Path -LiteralPath $gp)) {
             $ext = [IO.Path]::GetExtension($gp).ToLowerInvariant()
 
             if ($ext -eq '.lnk') {
@@ -1663,7 +1686,7 @@ function Start-Play {
                 }
                 catch { $tgt = $null }
 
-                if ([string]::IsNullOrWhiteSpace($tgt) -or -not (Test-Path $tgt)) {
+                if ([string]::IsNullOrWhiteSpace($tgt) -or -not (Test-Path -LiteralPath $tgt)) {
                     Write-Log "Verknuepfung nicht aufloesbar - starte sie direkt."
                     $script:proc = Start-Process -FilePath $gp -PassThru
                 }
@@ -1967,7 +1990,7 @@ function Complete-Session {
     Move-Pics
     Add-Playtime -EndSession
     $lf = Get-LockPath
-    Remove-Item $lf -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lf -Force -ErrorAction SilentlyContinue
     $p = Invoke-GitCommitPush ("Session beendet + Spielstand ({0})" -f $script:cfg.PlayerName)
 
     if ($p.Code -ne 0) {
@@ -2094,7 +2117,7 @@ function Unlock-Session {
 
     Sync-Remote
     $lf = Get-LockPath
-    if (Test-Path $lf) { Remove-Item $lf -Force }
+    if (Test-Path -LiteralPath $lf) { Remove-Item -LiteralPath $lf -Force }
     $p = Invoke-GitCommitPush ("force-unlock durch {0}" -f $script:cfg.PlayerName)
     if ($p.Code -eq 0) { Write-Log "Sperre wurde zwangsweise freigegeben." }
     else { Write-GitProblem "Die Sperre konnte nicht freigegeben werden." $p }
@@ -2114,7 +2137,7 @@ function Update-ReadyState {
     if ([string]::IsNullOrWhiteSpace($script:cfg.DolphinPath) -or
         -not (Test-Path -LiteralPath $script:cfg.DolphinPath)) { $fehlt += "Dolphin wurde nicht gefunden" }
     if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
-        -not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) { $fehlt += "der gemeinsame Ordner ist noch kein Repo" }
+        -not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))) { $fehlt += "der gemeinsame Ordner ist noch kein Repo" }
 
     $bereit = ($fehlt.Count -eq 0)
     $script:btnPlay.Enabled = $bereit
@@ -2155,7 +2178,7 @@ function Update-Status {
     $lock = Get-LockState
     Update-StatusUI $lock
     if ($lock.State -eq 'free') { Write-Log "Frei - du kannst spielen." }
-    # <FIXED> Ist die Sperr-Datei unlesbar, liefert Get-LockState nur .State -
+    # Ist die Sperr-Datei unlesbar, liefert Get-LockState nur .State -
     # ohne .Mine, .Stale und .Owner. Unter StrictMode waere jede Abfrage darauf
     # ein Fehler, deshalb faengt dieser Zweig den Fall vorher ab. Vorher lief er
     # bis in den letzten else-Zweig und meldete " spielt gerade." ohne Namen.
@@ -2717,7 +2740,7 @@ function Test-Setup {
 
     # 6) Repo-Ordner
     $istRepo = (-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
-    (Test-Path (Join-Path $script:cfg.RepoPath '.git'))
+    (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))
     if (-not $istRepo) {
         $e += Neu "Gemeinsamer Ordner" $false ("Unter '" + $script:cfg.RepoPath + "' liegt kein Git-Repo. " +
             "Unten auf 'Repo einrichten...' klicken - oder den Ordner korrigieren.") ""
@@ -3081,7 +3104,7 @@ function Get-NeuesteVersion {
 
         $r = Invoke-RestMethod -Uri $script:ReleaseApi -TimeoutSec 15 `
             -Headers @{ 'User-Agent' = 'AC-SaveSync'; 'Accept' = 'application/vnd.github+json' }
-        # <FIXED> Antwort ueber Get-JsonWert auswerten: Bei einer Fehlermeldung
+        # Antwort ueber Get-JsonWert auswerten: Bei einer Fehlermeldung
         # von GitHub (Zaehlgrenze erreicht, Repo ohne Release) fehlen diese
         # Felder - unter StrictMode waere das ein Fehler statt eines sauberen
         # "keine Auskunft moeglich".
@@ -3145,7 +3168,7 @@ function Install-Update {
     }
     $endung = [IO.Path]::GetExtension($selbst).ToLowerInvariant()
     $gesucht = if ($endung -eq '.cmd') { 'AC-SaveSync.cmd' } else { 'AC-SaveSync.ps1' }
-    # <FIXED> Namen der Release-Dateien ueber Get-JsonWert vergleichen.
+    # Namen der Release-Dateien ueber Get-JsonWert vergleichen.
     $datei = $Info.Dateien | Where-Object { (Get-JsonWert $_ 'name') -eq $gesucht } | Select-Object -First 1
     if (-not $datei) {
         Write-Log "Im Release ist keine Datei '$gesucht' enthalten."
@@ -3153,7 +3176,7 @@ function Install-Update {
     }
 
     $ordner = Join-Path $script:AppDir 'update'
-    if (-not (Test-Path $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $ordner)) { New-Item -ItemType Directory -Path $ordner -Force | Out-Null }
     $neu = Join-Path $ordner $gesucht
 
     Write-Log ("Lade Version {0} herunter..." -f $Info.Version)
@@ -3281,11 +3304,12 @@ function Invoke-UpdatePruefung {
 # --------------------------------------------------------------------------
 function Initialize-Repo {
     Save-ConfigFromUI
-    if (-not (Test-Path $script:cfg.RepoPath)) {
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { Write-Log "Bitte zuerst einen Ordner angeben."; return }
+    if (-not (Test-Path -LiteralPath $script:cfg.RepoPath)) {
         New-Item -ItemType Directory -Path $script:cfg.RepoPath -Force | Out-Null
         Write-Log "Ordner erstellt: $($script:cfg.RepoPath)"
     }
-    if (Test-Path (Join-Path $script:cfg.RepoPath '.git')) {
+    if (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git')) {
         Write-Log "Ordner ist bereits ein Git-Repo."
     }
     else {
@@ -3293,7 +3317,7 @@ function Initialize-Repo {
         Write-Log "git init: $($r.Text)"
     }
     $ga = Join-Path $script:cfg.RepoPath '.gitattributes'
-    if (-not (Test-Path $ga)) {
+    if (-not (Test-Path -LiteralPath $ga)) {
         @"
 # Spielstaende sind Binaerdateien: keine Zeilenende-Umwandlung, kein Merge
 save/** -text -diff
@@ -3302,7 +3326,7 @@ pics/** -text -diff
 *.raw -text -diff
 *.dat -text -diff
 *.sav -text -diff
-"@ | Set-Content -Path $ga -Encoding UTF8
+"@ | Set-Content -LiteralPath $ga -Encoding UTF8
     }
     Write-Readme (Get-Playtime)
 
@@ -3355,7 +3379,8 @@ function Connect-Remote {
     param([string]$url)
     Save-ConfigFromUI
     if ([string]::IsNullOrWhiteSpace($url)) { Write-Log "Bitte im Fenster oben die Remote-URL eintragen."; return }
-    if (-not (Test-Path (Join-Path $script:cfg.RepoPath '.git'))) {
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
+        -not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))) {
         Write-Log "Erst Schritt 1 (Lokales Repo anlegen) ausfuehren."; return
     }
     $r = Invoke-Git @('remote')
@@ -3377,14 +3402,17 @@ function Copy-Repo {
     Save-ConfigFromUI
     if ([string]::IsNullOrWhiteSpace($url)) { Write-Log "Bitte im Fenster oben die Remote-URL eintragen."; return }
     $target = $script:cfg.RepoPath
-    if (Test-Path (Join-Path $target '.git')) { Write-Log "Zielordner ist bereits ein Repo - Klonen nicht noetig."; return }
-    if ((Test-Path $target) -and (Get-ChildItem -Force $target | Select-Object -First 1)) {
+    if ([string]::IsNullOrWhiteSpace($target)) { Write-Log "Bitte zuerst einen Ordner angeben."; return }
+    if (Test-Path -LiteralPath (Join-Path $target '.git')) { Write-Log "Zielordner ist bereits ein Repo - Klonen nicht noetig."; return }
+    if ((Test-Path -LiteralPath $target) -and (Get-ChildItem -LiteralPath $target -Force | Select-Object -First 1)) {
         Write-Log "Zielordner ist nicht leer. Bitte einen leeren/neuen Ordner als RepoPath waehlen."; return
     }
     Write-Log "Klone Repo..."
-    $out = & git clone $url $target 2>&1
+    # "--" davor: eine Adresse, die mit "-" beginnt, wuerde git sonst als
+    # Option lesen statt als Adresse.
+    $out = & git clone -- $url $target 2>&1
     $text = ConvertTo-GitText $out
-    if (-not (Test-Path (Join-Path $target '.git'))) {
+    if (-not (Test-Path -LiteralPath (Join-Path $target '.git'))) {
         Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." ([pscustomobject]@{ Text = $text })
         return
     }
@@ -3410,6 +3438,7 @@ function New-RemoteWithGh {
     param([string]$name)
     Save-ConfigFromUI
     if ([string]::IsNullOrWhiteSpace($name)) { Write-Log "Bitte einen Repo-Namen eingeben."; return }
+    if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { Write-Log "Bitte zuerst einen Ordner angeben."; return }
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if (-not $gh) {
         Write-Log "GitHub CLI (gh) nicht gefunden. Erstelle das leere Repo auf github.com und nutze dann 'Verbinden & hochladen'."
@@ -3652,7 +3681,12 @@ function Invoke-WizClone {
         $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
         return
     }
-    if (Test-Path (Join-Path $ziel '.git')) {
+    if (-not $ziel) {
+        $script:wizHolStatus.Text = "Bitte einen Ordner auf deinem PC angeben."
+        $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(170, 0, 0)
+        return
+    }
+    if (Test-Path -LiteralPath (Join-Path $ziel '.git')) {
         $script:wizHolStatus.Text = "In diesem Ordner liegt bereits ein Repo - passt."
         $script:wizHolStatus.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
         return
@@ -3734,6 +3768,7 @@ function Invoke-SetupErstellen {
         $script:setupStatusA.Text = "Fertig! Schick die Adresse jetzt an deinen Mitspieler."
         $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
         $script:setupKopierA.Enabled = $true
+        Start-AutoAuffrischen -MitStatus
     }
     else {
         $script:setupStatusA.Text = "Hat nicht geklappt - die Einzelheiten stehen im Protokoll im Hauptfenster."
@@ -3768,6 +3803,7 @@ function Invoke-SetupHolen {
     # sein. Erst wenn HEAD auf einen echten Stand zeigt, ist es wirklich fertig.
     if ((Invoke-GitRaw @('rev-parse', '--verify', 'HEAD') $script:cfg.RepoPath).Code -eq 0) {
         $script:setupStatusB.Text = "Fertig! Du kannst das Fenster schliessen und spielen."
+        Start-AutoAuffrischen -MitStatus
         $script:setupStatusB.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
     }
     else {
@@ -3789,6 +3825,7 @@ function Invoke-SetupGh {
         $script:setupStatusA.Text = "Fertig! Schick die Adresse oben an deinen Mitspieler."
         $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
         $script:setupKopierA.Enabled = $true
+        Start-AutoAuffrischen -MitStatus
     }
     else {
         $script:setupStatusA.Text = "Hat nicht geklappt - Einzelheiten im Protokoll im Hauptfenster."
@@ -3873,7 +3910,7 @@ function Show-SetupDialog {
     # Die Pruefung auf einen leeren Pfad muss zuerst kommen: Join-Path wirft
     # bei einem leeren Pfad einen Fehler - der Dialog wuerde gar nicht aufgehen.
     if ((-not [string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) -and
-        (Test-Path (Join-Path $script:cfg.RepoPath '.git')) -and
+        (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git')) -and
         (Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath).Code -eq 0) {
         $fertig = SeitenText $s0 "Uebrigens: Auf diesem PC ist bereits alles eingerichtet." 300 20
         $fertig.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
@@ -4170,7 +4207,8 @@ Set-Tip ("Beendet Dolphin aus dem Programm heraus und schliesst die Sitzung`n" +
     "Vorher unbedingt IM SPIEL speichern!`n" +
     "Nur waehrend einer laufenden Sitzung anklickbar.") $script:btnStop
 Set-Tip ("Holt den aktuellen Stand vom Server und zeigt oben an,`n" +
-    "ob gerade jemand spielt. Aendert sonst nichts.") $btnRefresh
+    "ob gerade jemand spielt. Liegt auf diesem PC noch nicht Hochgeladenes,`n" +
+    "wird vorher nachgefragt.") $btnRefresh
 Set-Tip ("Notausgang: loescht die Sperre, obwohl niemand Dolphin`n" +
     "sauber beendet hat.`n" +
     "Nur benutzen, wenn sicher ist, dass niemand spielt (z. B. nach`n" +
@@ -4219,6 +4257,7 @@ $script:saveTimer.Add_Tick({
         $script:saveTimer.Stop()
         Save-ConfigFromUI
         [void](Update-ReadyState)
+        Start-AutoAuffrischen      # falls der Repo-Ordner gerade erst gueltig wurde
     })
 foreach ($feld in @($script:txtDolphin, $script:txtRepo, $script:txtGame, $script:txtSave,
         $script:txtPics, $script:txtName, $script:txtBranch, $script:txtLease, $script:txtHeart)) {
@@ -4258,12 +4297,12 @@ $script:startTimer.Add_Tick({
         }
 
         if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath) -or
-            -not (Test-Path (Join-Path $script:cfg.RepoPath ".git"))) {
+            -not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath ".git"))) {
             # Erster Start: noch kein Repo. Hier bewusst keine Fehlermeldung,
             # sondern ein Hinweis - der Nutzer hat ja noch nichts falsch gemacht.
             $script:lblStatus.Text = "Noch kein Repo eingerichtet"
             Write-Log "Noch kein Repo eingerichtet - Status wurde nicht geprueft."
-            Write-Log "Pfade oben ausfuellen (oder 'Repo einrichten...'), dann 'Speichern'."
+            Write-Log "Pfade oben ausfuellen oder 'Repo einrichten...' nutzen - gespeichert wird automatisch."
             Write-Log "Der Knopf 'Selbsttest' zeigt jederzeit, was noch fehlt."
             return
         }
