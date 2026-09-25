@@ -14,9 +14,10 @@
                                    Texte und antwortet, wie der Test es vorgibt
 
   Die Funktionen des Programms werden direkt aus AC-SaveSync.ps1 geladen -
-  getestet wird also genau der Code, der ausgeliefert wird. Nur zwei Stellen
-  werden dabei umgelenkt: Meldungsfenster (wuerden auf eine Antwort warten)
-  und DoEvents (gibt es ohne Oberflaeche nicht).
+  getestet wird also genau der Code, der ausgeliefert wird. Umgelenkt werden
+  nur Meldungsfenster (wuerden auf eine Antwort warten), DoEvents und der
+  Warte-Mauszeiger (gibt es ohne Oberflaeche nicht). DoEvents zaehlt dabei
+  mit - so laesst sich pruefen, dass das Fenster beim Warten bedienbar bleibt.
 
   Bewusst ohne Pester: so laeuft alles ohne Nachinstallieren identisch unter
   Windows PowerShell 5.1 und PowerShell 7 (auch unter Linux).
@@ -50,16 +51,21 @@ namespace AcssTest {
         public static string Show(object a, object b, object c) { return Antwort(a); }
         public static string Show(object a, object b, object c, object d) { return Antwort(a); }
         public static string Show(object a, object b, object c, object d, object e) { return Antwort(a); }
-        public static void DoEvents() { }
-        public static void Reset(string standard) { Texte.Clear(); Antworten.Clear(); Standard = standard; }
+        public static int DoEventsAnzahl;
+        public static bool UseWaitCursor;
+        public static void DoEvents() { DoEventsAnzahl++; }
+        public static void Reset(string standard) { Texte.Clear(); Antworten.Clear(); Standard = standard; DoEventsAnzahl = 0; }
     }
     public class Uhr {   // Ersatz fuer Windows.Forms.Timer
         public bool Enabled; public int Starts; public int Stops; public int Interval;
         public void Start() { Enabled = true; Starts++; }
         public void Stop() { Enabled = false; Stops++; }
     }
-    public class Feld {  // Ersatz fuer Label, Button, TextBox
-        public string Text = ""; public object BackColor; public object ForeColor; public bool Enabled;
+    public class Feld {  // Ersatz fuer Label, Button, TextBox, Panel
+        public string Text = ""; public object BackColor; public object ForeColor; public bool Enabled; public bool Visible;
+    }
+    public class Fenster {  // Ersatz fuer das Hauptfenster
+        public int Geschlossen; public void Close() { Geschlossen++; }
     }
     public class Tipps { // Ersatz fuer Windows.Forms.ToolTip
         public int Anzahl; public void SetToolTip(object c, string t) { Anzahl++; }
@@ -81,11 +87,21 @@ function Import-AcssFunktionen {
         }, $false)
     foreach ($f in $funktionen) {
         $code = $f.Extent.Text.Replace('[Windows.Forms.MessageBox]::Show(', '[AcssTest.Dialog]::Show(').
-        Replace('[Windows.Forms.Application]::DoEvents()', '[AcssTest.Dialog]::DoEvents()')
+        Replace('[Windows.Forms.Application]::DoEvents()', '[AcssTest.Dialog]::DoEvents()').
+        Replace('[Windows.Forms.Application]::UseWaitCursor', '[AcssTest.Dialog]::UseWaitCursor')
         . ([scriptblock]::Create($code))
         # Die Funktion lebt sonst nur im Bereich dieses Aufrufs.
         Set-Item -Path "function:script:$($f.Name)" -Value (Get-Item "function:$($f.Name)").ScriptBlock
     }
+
+    # Einige Werte stehen nicht in Funktionen, sondern ganz oben im Skript:
+    # die Klartext-Tabelle fuer Git-Meldungen und die Versionsangaben.
+    $werte = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $args[0].Left.Extent.Text -match '^\$script:(GitKlartext|Version|ReleaseApi|ReleaseSeite)$' -and
+            $null -eq $args[0].Parent.Parent.Parent
+        }, $false)
+    foreach ($w in $werte) { . ([scriptblock]::Create($w.Extent.Text)) }
 
     # Genau die Zeile ausfuehren, mit der das Programm die Konsole auf UTF-8
     # stellt - so wird auch geprueft, dass es sie noch gibt.
@@ -133,6 +149,16 @@ function Reset-Zustand {
     $script:btnPlay = New-Object AcssTest.Feld
     $script:btnStop = New-Object AcssTest.Feld
     $script:tips = New-Object AcssTest.Tipps
+    $script:mainForm = $null
+    $script:fortschrittPanel = $null
+    $script:fortschrittText = $null
+    $script:eingabeSperreDa = $false
+    $script:beschaeftigt = 0
+    $script:beschaeftigtText = ''
+    $script:beschaeftigtSeit = Get-Date
+    $script:letzteArbeit = [datetime]::MinValue
+    $script:schliessenWennFrei = $false
+    $script:gitPfad = $null
     $script:FakeName = 'fd' + [guid]::NewGuid().ToString('N').Substring(0, 6)
     $env:COMPUTERNAME = 'TEST-PC'
 }
@@ -151,23 +177,26 @@ function Test {
         return
     }
     Reset-Zustand
-    $vorher = Get-Location
+    # Der Testblock laeuft in diesem Bereich - eigene Variablen deshalb mit
+    # Namen, die ein Test nicht versehentlich ueberschreibt.
+    $__testName = $Name
+    $__testOrt = Get-Location
     try {
         . $Block
-        [void]$script:Ergebnisse.Add([pscustomobject]@{ Name = $Name; Status = 'ok'; Grund = '' })
-        Write-Host ("  OK   {0}" -f $Name) -ForegroundColor Green
+        [void]$script:Ergebnisse.Add([pscustomobject]@{ Name = $__testName; Status = 'ok'; Grund = '' })
+        Write-Host ("  OK   {0}" -f $__testName) -ForegroundColor Green
     }
     catch {
-        $wo = $_.InvocationInfo
-        $grund = "{0}  (Zeile {1}: {2})" -f $_.Exception.Message, $wo.ScriptLineNumber, $wo.Line.Trim()
-        [void]$script:Ergebnisse.Add([pscustomobject]@{ Name = $Name; Status = 'FEHLER'; Grund = $grund })
-        Write-Host ("  FEHL {0}" -f $Name) -ForegroundColor Red
-        Write-Host ("       {0}" -f $grund) -ForegroundColor Red
-        $letzte = @($script:Protokoll | Select-Object -Last 8)
-        if ($letzte.Count) { Write-Host ("       Protokoll: " + ($letzte -join ' | ')) -ForegroundColor DarkYellow }
+        $__wo = $_.InvocationInfo
+        $__grund = "{0}  (Zeile {1}: {2})" -f $_.Exception.Message, $__wo.ScriptLineNumber, $__wo.Line.Trim()
+        [void]$script:Ergebnisse.Add([pscustomobject]@{ Name = $__testName; Status = 'FEHLER'; Grund = $__grund })
+        Write-Host ("  FEHL {0}" -f $__testName) -ForegroundColor Red
+        Write-Host ("       {0}" -f $__grund) -ForegroundColor Red
+        $__letzte = @($script:Protokoll | Select-Object -Last 8)
+        if ($__letzte.Count) { Write-Host ("       Protokoll: " + ($__letzte -join ' | ')) -ForegroundColor DarkYellow }
     }
     finally {
-        Set-Location $vorher
+        Set-Location $__testOrt
         Stop-TestProzesse
     }
 }

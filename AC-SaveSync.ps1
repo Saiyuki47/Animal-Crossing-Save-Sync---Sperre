@@ -85,6 +85,32 @@ catch {
     catch { Write-Verbose "DPI-Anmeldung nicht moeglich - Windows skaliert das Fenster dann selbst." }
 }
 
+# Waehrend im Hintergrund etwas laeuft (git, Kopieren, Download), verwirft
+# dieser Filter Klicks und Tastendruecke in den Fenstern des Programms - so
+# kann niemand ein zweites git starten, solange das erste noch arbeitet.
+# Bewegen, Verkleinern und Neuzeichnen gehen weiter: die Titelleiste schickt
+# andere Nachrichten als der Fensterinhalt. Siehe Start-Beschaeftigt.
+$script:eingabeSperreDa = $false
+try {
+    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+namespace ACSS {
+    public class EingabeSperre : System.Windows.Forms.IMessageFilter {
+        public static bool Aktiv;
+        public bool PreFilterMessage(ref System.Windows.Forms.Message m) {
+            if (!Aktiv) return false;
+            int n = m.Msg;
+            if (n >= 0x0100 && n <= 0x0103) return true;   // Tastatur
+            if (n >= 0x0201 && n <= 0x020E) return true;   // Maustasten und Rad (Bewegung bleibt)
+            return false;
+        }
+    }
+}
+'@
+    [Windows.Forms.Application]::AddMessageFilter((New-Object ACSS.EingabeSperre))
+    $script:eingabeSperreDa = $true
+}
+catch { Write-Verbose "Eingabesperre nicht verfuegbar: $($_.Exception.Message)" }
+
 # Wie stark muss das Layout wachsen? 96 dpi = 100 %, 144 dpi = 150 %.
 # Alle Groessen im Skript sind fuer 100 % geschrieben.
 $script:uiScale = 1.0
@@ -193,6 +219,14 @@ $script:dolphinNamen = @()
 $script:endeSeit = $null
 # Ergebnis des letzten Speicherversuchs der Einstellungen (siehe Save-ConfigFromUI)
 $script:configSaved = $false
+# Laeuft gerade etwas im Hintergrund (git, Kopieren, Download)? Siehe
+# Start-Beschaeftigt. Solange: Eingaben verworfen, Timer setzen aus.
+$script:beschaeftigt = 0
+$script:beschaeftigtText = ''
+$script:beschaeftigtSeit = Get-Date
+$script:letzteArbeit = [datetime]::MinValue
+$script:schliessenWennFrei = $false
+$script:gitPfad = $null
 
 # Vorbelegung fuer Set-StrictMode -Version Latest.
 # StrictMode bricht ab, sobald eine Variable GELESEN wird, die es noch nicht
@@ -207,6 +241,9 @@ $script:configSaved = $false
 
 # Oberflaeche des Hauptfensters (entsteht im Abschnitt "Main logic")
 $script:mainForm = $null
+$script:fortschrittPanel = $null
+$script:fortschrittText = $null
+$script:fortschrittTimer = $null
 $script:txtLog = $null
 $script:lblStatus = $null
 $script:btnPlay = $null
@@ -622,21 +659,262 @@ function Save-ConfigFromUI {
 
 #endregion
 
-#region Git helpers
+#region Hintergrund: git, Kopieren und Internet ohne Einfrieren
 
-# Macht aus der Ausgabe von git sauberen Text.
-# Ohne das verpackt PowerShell alles, was git nach stderr schreibt, in
-# ErrorRecords - und die werden mit "At C:\...:815 char:32", "CategoryInfo"
-# usw. ausgegeben. Dieser Ballast verwirrt nur; uns interessiert der Satz,
-# den git wirklich geschrieben hat.
-function ConvertTo-GitText {
-    param($Ausgabe)
-    if ($null -eq $Ausgabe) { return "" }
-    $zeilen = foreach ($z in @($Ausgabe)) {
-        if ($z -is [System.Management.Automation.ErrorRecord]) { $z.Exception.Message }
-        else { "$z" }
+# --------------------------------------------------------------------------
+# Warum dieser Aufwand?
+# --------------------------------------------------------------------------
+# Das Fenster laeuft im selben Thread wie alle Arbeit. Frueher wartete das
+# Programm auf jedes git (Holen, Hochladen) einfach - so lange stand das
+# Fenster still: kein Neuzeichnen, kein Verschieben, Windows meldete
+# "Keine Rueckmeldung".
+#
+# Jetzt laufen git, robocopy und gh als eigener Prozess, Downloads in einem
+# eigenen Runspace. Waehrend darauf gewartet wird, arbeitet das Fenster seine
+# Nachrichten ab: es zeichnet sich neu, laesst sich verschieben und
+# verkleinern, und unten laeuft eine Fortschrittsanzeige.
+#
+# Damit dabei nichts durcheinandergeraet, gilt waehrend des Wartens:
+#   - Klicks und Tastendruecke in den Fenstern werden verworfen (siehe
+#     ACSS.EingabeSperre). Sonst koennte ein zweiter Klick ein zweites git
+#     starten, waehrend das erste noch laeuft. Die Titelleiste bleibt frei.
+#   - Die Timer (Herzschlag, automatische Anzeige, Speichern der Felder)
+#     setzen aus und holen es danach nach.
+#   - Schliessen wird verschoben, bis der Vorgang fertig ist.
+
+# Merkt sich, dass etwas im Hintergrund laeuft. Zaehler statt Ja/Nein, weil
+# Aufrufe verschachtelt sein koennen.
+function Start-Beschaeftigt {
+    param([string]$Text)
+    $script:beschaeftigt++
+    $script:beschaeftigtText = $Text
+    if ($script:beschaeftigt -eq 1) { $script:beschaeftigtSeit = Get-Date }
+    if ($script:eingabeSperreDa) { [ACSS.EingabeSperre]::Aktiv = $true }
+}
+
+function Stop-Beschaeftigt {
+    if ($script:beschaeftigt -gt 0) { $script:beschaeftigt-- }
+    if ($script:beschaeftigt -eq 0) {
+        $script:letzteArbeit = Get-Date
+        if ($script:eingabeSperreDa) { [ACSS.EingabeSperre]::Aktiv = $false }
     }
-    return (($zeilen -join "`r`n").Trim())
+}
+
+# Laesst das Fenster seine Nachrichten abarbeiten (Neuzeichnen, Verschieben,
+# Fortschrittsbalken) und frischt dabei die Fortschrittsanzeige auf.
+function Invoke-Nachrichten {
+    Update-Fortschritt
+    [Windows.Forms.Application]::DoEvents()
+}
+
+# Zeigt unten im Hauptfenster, was gerade laeuft - aber erst nach einer
+# Drittelsekunde, damit kurze Vorgaenge nicht flackern.
+function Update-Fortschritt {
+    if (-not $script:fortschrittPanel -or $script:beschaeftigt -le 0) { return }
+    $dauer = ((Get-Date) - $script:beschaeftigtSeit).TotalSeconds
+    if ($dauer -lt 0.3) { return }
+    $text = $script:beschaeftigtText + ' ...'
+    if ($dauer -ge 3) { $text += (' ({0:N0} s)' -f [math]::Floor($dauer)) }
+    if ($script:fortschrittText.Text -ne $text) { $script:fortschrittText.Text = $text }
+    if (-not $script:fortschrittPanel.Visible) {
+        $script:fortschrittPanel.Visible = $true
+        [Windows.Forms.Application]::UseWaitCursor = $true
+    }
+}
+
+# Laeuft alle 250 ms (fortschrittTimer): blendet die Anzeige wieder aus,
+# wenn seit 400 ms nichts mehr laeuft - so flackert sie nicht zwischen zwei
+# git-Aufrufen. Holt ausserdem ein verschobenes Schliessen nach.
+function Invoke-FortschrittTick {
+    if ($script:beschaeftigt -gt 0) { Update-Fortschritt; return }
+    if ($script:fortschrittPanel -and $script:fortschrittPanel.Visible -and
+        ((Get-Date) - $script:letzteArbeit).TotalMilliseconds -ge 400) {
+        $script:fortschrittPanel.Visible = $false
+        [Windows.Forms.Application]::UseWaitCursor = $false
+    }
+    if ($script:schliessenWennFrei -and $script:mainForm) {
+        $script:schliessenWennFrei = $false
+        $script:mainForm.Close()
+    }
+}
+
+# Baut aus einzelnen Argumenten eine Befehlszeile nach den Windows-Regeln -
+# denselben, nach denen git.exe und robocopy.exe sie wieder zerlegen:
+# Argumente mit Leerzeichen oder Anfuehrungszeichen kommen in "..."; ein "
+# darin wird zu \", und Backslashes direkt davor bzw. vor dem schliessenden
+# " werden verdoppelt. Alle anderen Backslashes bleiben, wie sie sind.
+function ConvertTo-Befehlszeile {
+    param([string[]]$Argumente)
+    if ($null -eq $Argumente) { return '' }
+    $teile = foreach ($a in $Argumente) {
+        if ($null -eq $a) { $a = '' }
+        if ($a.Length -gt 0 -and $a -notmatch '[\s"]') { $a; continue }
+        $sb = New-Object Text.StringBuilder
+        [void]$sb.Append('"')
+        $backslashes = 0
+        foreach ($zeichen in $a.ToCharArray()) {
+            if ($zeichen -eq [char]'\') { $backslashes++; continue }
+            if ($zeichen -eq [char]'"') {
+                [void]$sb.Append(('\' * (2 * $backslashes + 1)) + '"')
+                $backslashes = 0
+                continue
+            }
+            if ($backslashes -gt 0) { [void]$sb.Append('\' * $backslashes); $backslashes = 0 }
+            [void]$sb.Append($zeichen)
+        }
+        [void]$sb.Append(('\' * (2 * $backslashes)) + '"')
+        $sb.ToString()
+    }
+    return (@($teile) -join ' ')
+}
+
+# Beendet einen Prozess samt allem, was er gestartet hat (git startet z. B.
+# git-remote-https - der wuerde sonst weiterlaufen und die Ausgabe offen halten).
+function Stop-Prozessbaum {
+    param($Prozess)
+    try {
+        if ($env:OS -eq 'Windows_NT') {
+            $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Prozess.Id /T /F 2>&1
+        }
+        if (-not $Prozess.HasExited) { $Prozess.Kill() }
+    }
+    catch { Write-Verbose "Prozess liess sich nicht beenden: $($_.Exception.Message)" }
+}
+
+# Startet ein Programm und wartet darauf, ohne das Fenster einzufrieren.
+# Rueckgabe:
+#   Code  Exitcode; 9009 = Programm nicht gefunden, 124 = Zeitueberschreitung
+#   Out   was das Programm auf stdout schreibt (zum Auswerten)
+#   Err   was es auf stderr schreibt (Meldungen, Fortschritt)
+#   Text  beides zusammen - fuer Meldungen an den Nutzer
+# Die Ausgabe wird als UTF-8 gelesen (so schreibt git sie).
+function Invoke-Extern {
+    param(
+        [string]$Datei,
+        [string[]]$Argumente = @(),
+        [string]$Text = 'Einen Moment',
+        [int]$TimeoutSek = 300
+    )
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Datei
+    $psi.Arguments = ConvertTo-Befehlszeile $Argumente
+    $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $psi.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    try { $p = [Diagnostics.Process]::Start($psi) }
+    catch {
+        $m = $_.Exception.Message
+        return [pscustomobject]@{ Code = 9009; Out = ''; Err = $m; Text = $m }
+    }
+
+    $zuLange = $false
+    $tOut = $null; $tErr = $null
+    Start-Beschaeftigt $Text
+    try {
+        # Keine Eingabe: nichts darf auf eine Antwort von uns warten.
+        $p.StandardInput.Close()
+        $tOut = $p.StandardOutput.ReadToEndAsync()
+        $tErr = $p.StandardError.ReadToEndAsync()
+        $ende = (Get-Date).AddSeconds($TimeoutSek)
+        while (-not $p.WaitForExit(25)) {
+            Invoke-Nachrichten
+            if ((Get-Date) -gt $ende) {
+                $zuLange = $true
+                Stop-Prozessbaum $p
+                break
+            }
+        }
+        [void]$p.WaitForExit(5000)
+        # Die Ausgabe ist erst vollstaendig, wenn beide Stroeme zu Ende
+        # gelesen sind - das kann einen Moment nach dem Prozessende sein.
+        $bis = (Get-Date).AddSeconds(10)
+        while (-not ($tOut.IsCompleted -and $tErr.IsCompleted) -and (Get-Date) -lt $bis) {
+            Invoke-Nachrichten
+            [void]$tOut.Wait(25)
+        }
+    }
+    finally { Stop-Beschaeftigt }
+
+    $out = if ($tOut -and $tOut.IsCompleted -and -not $tOut.IsFaulted) { "$($tOut.Result)".Trim() } else { '' }
+    $err = if ($tErr -and $tErr.IsCompleted -and -not $tErr.IsFaulted) { "$($tErr.Result)".Trim() } else { '' }
+    $code = if ($zuLange) { 124 } else { $p.ExitCode }
+    if ($zuLange) { $err = ("Zeitueberschreitung: nach {0} s ohne Ergebnis abgebrochen. {1}" -f $TimeoutSek, $err).Trim() }
+    $p.Dispose()
+    return [pscustomobject]@{
+        Code = $code
+        Out  = $out
+        Err  = $err
+        Text = (@($out, $err) | Where-Object { $_ }) -join "`r`n"
+    }
+}
+
+# Fuehrt PowerShell-Code in einem eigenen Runspace aus (fuer Anfragen ans
+# Internet) und wartet darauf, ohne das Fenster einzufrieren. Der Code sieht
+# nichts vom Programm - alles Noetige bekommt er als Argument.
+# Rueckgabe: was der Code ausgibt. Fehler und Zeitueberschreitung werfen.
+function Invoke-ImHintergrund {
+    param(
+        [scriptblock]$Skript,
+        [object[]]$Argumente = @(),
+        [string]$Text = 'Einen Moment',
+        [int]$TimeoutSek = 60
+    )
+    $ps = [powershell]::Create()
+    try {
+        [void]$ps.AddScript($Skript.ToString())
+        foreach ($a in $Argumente) { [void]$ps.AddArgument($a) }
+        $handle = $ps.BeginInvoke()
+        Start-Beschaeftigt $Text
+        try {
+            $ende = (Get-Date).AddSeconds($TimeoutSek)
+            while (-not $handle.AsyncWaitHandle.WaitOne(25)) {
+                Invoke-Nachrichten
+                if ((Get-Date) -gt $ende) {
+                    [void]$ps.BeginStop($null, $null)
+                    throw ("Zeitueberschreitung: keine Antwort nach {0} s" -f $TimeoutSek)
+                }
+            }
+        }
+        finally { Stop-Beschaeftigt }
+        try { $ergebnis = $ps.EndInvoke($handle) }
+        catch {
+            # Die eigentliche Meldung steckt eine Ebene tiefer.
+            if ($_.Exception.InnerException) { throw $_.Exception.InnerException }
+            throw
+        }
+        if ($ps.Streams.Error.Count -gt 0) { throw $ps.Streams.Error[0].Exception }
+        return $ergebnis
+    }
+    finally { $ps.Dispose() }
+}
+
+# Wo liegt git? Einmal suchen und merken.
+function Get-GitPfad {
+    if (-not $script:gitPfad) {
+        $c = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($c) { $script:gitPfad = $c.Source }
+    }
+    return $script:gitPfad
+}
+
+# Was steht in der Fortschrittsanzeige, waehrend git arbeitet?
+function Get-GitSchrittText {
+    param([string[]]$GitArgs)
+    $befehl = @($GitArgs | Where-Object { $_ -and -not $_.StartsWith('-') }) | Select-Object -First 1
+    switch ($befehl) {
+        'fetch' { 'Hole den Stand vom Server' }
+        'pull' { 'Hole den Stand vom Server' }
+        'push' { 'Lade auf den Server hoch' }
+        'clone' { 'Hole das gemeinsame Repo' }
+        'ls-remote' { 'Pruefe die Verbindung zum Server' }
+        'commit' { 'Speichere den Stand' }
+        default { 'Git arbeitet' }
+    }
 }
 
 function Invoke-Git {
@@ -645,26 +923,44 @@ function Invoke-Git {
     # Ordner - im schlimmsten Fall in einem ganz anderen Repo, auf das dann
     # etwa ein "reset --hard" losgelassen wuerde.
     if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) {
-        return [pscustomobject]@{ Code = 128; Text = 'Kein Repo-Ordner eingetragen.' }
+        $m = 'Kein Repo-Ordner eingetragen.'
+        return [pscustomobject]@{ Code = 128; Out = ''; Err = $m; Text = $m }
     }
-    $out = & git -C $script:cfg.RepoPath @GitArgs 2>&1
-    [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
+    return (Invoke-GitRaw -GitArgs $GitArgs -WorkDir $script:cfg.RepoPath)
 }
 
 # Ruft git auch ausserhalb des Repos auf (fuer --version und --global config)
-# und faengt ab, dass git ueberhaupt fehlt.
+# und faengt ab, dass git ueberhaupt fehlt (Code 9009).
+# Netzwerk-Befehle bekommen mehr Zeit; haengt git laenger, wird abgebrochen.
 function Invoke-GitRaw {
-    param([string[]]$GitArgs, [string]$WorkDir)
-    try {
-        if ($WorkDir) { $out = & git -C $WorkDir @GitArgs 2>&1 }
-        else { $out = & git @GitArgs 2>&1 }
-        return [pscustomobject]@{ Code = $LASTEXITCODE; Text = (ConvertTo-GitText $out) }
+    param([string[]]$GitArgs, [string]$WorkDir, [int]$TimeoutSek = 0)
+    $exe = Get-GitPfad
+    if (-not $exe) {
+        $m = 'git wurde nicht gefunden.'
+        return [pscustomobject]@{ Code = 9009; Out = ''; Err = $m; Text = $m }
     }
-    catch {
-        # git nicht gefunden -> 9009 ist Windows' "Befehl nicht gefunden"
-        return [pscustomobject]@{ Code = 9009; Text = $_.Exception.Message }
+    $alle = @()
+    if ($WorkDir) { $alle += @('-C', $WorkDir) }
+    $alle += $GitArgs
+    if ($TimeoutSek -le 0) {
+        $befehl = @($GitArgs | Where-Object { $_ -and -not $_.StartsWith('-') }) | Select-Object -First 1
+        $TimeoutSek = if ($befehl -eq 'clone') { 900 }
+        elseif (@('fetch', 'pull', 'push', 'ls-remote') -contains $befehl) { 300 }
+        else { 120 }
     }
+    return (Invoke-Extern -Datei $exe -Argumente $alle -Text (Get-GitSchrittText $GitArgs) -TimeoutSek $TimeoutSek)
 }
+
+# robocopy im Hintergrund. Rueckgabe: Exitcode (ab 8 = Fehler, 9009 = fehlt).
+function Invoke-Robocopy {
+    param([string]$Quelle, [string]$Ziel, [string[]]$Schalter)
+    $alle = @($Quelle, $Ziel) + $Schalter + @('/NJH', '/NJS', '/NDL', '/NC', '/NS', '/NP', '/R:1', '/W:1')
+    return (Invoke-Extern -Datei 'robocopy.exe' -Argumente $alle -Text 'Kopiere den Spielstand' -TimeoutSek 600).Code
+}
+
+#endregion
+
+#region Git helpers
 
 # --------------------------------------------------------------------------
 # Git-Meldungen in Klartext uebersetzen
@@ -717,6 +1013,14 @@ $script:GitKlartext = @(
     @{ Muster = 'Filename too long|unable to write file.*too long|path too long'
         Text  = 'Ein Dateiname wird zu lang - Windows steigt bei sehr langen Pfaden aus.'
         Tipp  = 'Einmalig ausfuehren:  git config --global core.longpaths true  - oder den Repo-Ordner naeher an die Laufwerkswurzel legen, z. B. C:\ACSave.'
+    }
+    @{ Muster = 'Zeitueberschreitung'
+        Text  = 'Git hat zu lange nicht geantwortet und wurde abgebrochen - meist ist die Verbindung sehr langsam oder weg.'
+        Tipp  = 'Internetverbindung pruefen und es noch einmal versuchen. Der Spielstand bleibt solange auf diesem PC erhalten.'
+    }
+    @{ Muster = 'Host key verification failed|authenticity of host'
+        Text  = 'Der Schluessel des Servers ist auf diesem PC noch nicht bestaetigt (SSH).'
+        Tipp  = 'Einmalig eine Eingabeaufforderung im Repo-Ordner oeffnen, "git fetch" ausfuehren und die Frage nach dem Schluessel mit "yes" beantworten.'
     }
     @{ Muster = 'detected dubious ownership|safe\.directory'
         Text  = 'Git traut dem Ordner nicht, weil er einem anderen Benutzerkonto gehoert.'
@@ -775,14 +1079,16 @@ function Test-Repo {
 # die es noch nicht auf den Server geschafft haben (typisch nach einem Absturz
 # oder wenn beim Beenden das Hochladen scheiterte).
 function Get-LokalerFortschritt {
+    # Ausgewertet wird nur stdout: git schreibt Warnungen (z. B. zu
+    # Zeilenenden) nach stderr, und die sind keine geaenderten Dateien.
     $offen = Invoke-Git @('status', '--porcelain')
     $vorne = Invoke-Git @('rev-list', '--count', "origin/$($script:cfg.Branch)..HEAD")
     $anzahl = 0
-    [void][int]::TryParse(("$($vorne.Text)").Trim(), [ref]$anzahl)
+    [void][int]::TryParse(("$($vorne.Out)").Trim(), [ref]$anzahl)
     return [pscustomobject]@{
-        Dateien = @(($offen.Text -split "`r?`n") | Where-Object { $_.Trim() }).Count
+        Dateien = @(($offen.Out -split "`r?`n") | Where-Object { $_.Trim() }).Count
         Commits = $anzahl
-        Etwas   = (($offen.Text).Trim() -ne '' -or $anzahl -gt 0)
+        Etwas   = (($offen.Out).Trim() -ne '' -or $anzahl -gt 0)
     }
 }
 
@@ -1071,8 +1377,8 @@ function Restore-Saves {
     Write-Log "Schreibe Spielstand aus dem Repo in den Dolphin-Ordner..."
     # /E = inkl. Unterordner, ueberschreibt; bewusst OHNE Loeschen, damit im
     # Dolphin-Ordner nichts Fremdes geloescht wird.
-    $null = robocopy $src $dst /E /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
-    if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER beim Zurueckschreiben (robocopy-Code $LASTEXITCODE)."; return $false }
+    $code = Invoke-Robocopy $src $dst @('/E')
+    if ($code -ge 8) { Write-Log "FEHLER beim Zurueckschreiben (robocopy-Code $code)."; return $false }
     return $true
 }
 
@@ -1086,9 +1392,9 @@ function Backup-Saves {
     }
     if (-not (Test-Path -LiteralPath $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
     # /MIR = spiegelt exakt ins repo-eigene 'save/' (dort ist Spiegeln sicher).
-    $null = robocopy $src $dst /MIR /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
-    if ($LASTEXITCODE -ge 8) {
-        Write-Log "FEHLER beim Sichern (robocopy-Code $LASTEXITCODE)."
+    $code = Invoke-Robocopy $src $dst @('/MIR')
+    if ($code -ge 8) {
+        Write-Log "FEHLER beim Sichern (robocopy-Code $code)."
         # Bricht /MIR mittendrin ab, liegt in save/ ein Mischmasch aus altem und
         # neuem Stand. Der darf auf keinen Fall hochgeladen werden - also save/
         # auf den zuletzt gespeicherten Stand zuruecksetzen.
@@ -1430,7 +1736,7 @@ function Get-LockStateRemote {
     if ($j.Code -ne 0) { return [pscustomobject]@{ State = 'free' } }   # Datei fehlt = niemand spielt
     try {
         # Sperr-Dateien aelterer Fassungen tragen noch ein BOM - abschneiden.
-        $o = ("$($j.Text)".TrimStart([char]0xFEFF)) | ConvertFrom-Json
+        $o = ("$($j.Out)".TrimStart([char]0xFEFF)) | ConvertFrom-Json
         # Eintraege ueber Get-JsonWert lesen - fehlende sind erlaubt.
         $upd = ConvertTo-UtcZeit (Get-JsonWert $o 'updatedUtc')
         if (-not $upd) { return $null }
@@ -1456,7 +1762,7 @@ function Get-LockStateRemote {
 
 function Invoke-AutoAuffrischen {
     # Nur wenn gerade nichts laeuft und alles eingerichtet ist.
-    if ($script:holdingLock -or -not $script:gitDa) { return }
+    if ($script:beschaeftigt -gt 0 -or $script:holdingLock -or -not $script:gitDa) { return }
     if ([string]::IsNullOrWhiteSpace($script:cfg.RepoPath)) { return }
     if (-not (Test-Path -LiteralPath (Join-Path $script:cfg.RepoPath '.git'))) { return }
 
@@ -1587,7 +1893,7 @@ function Start-Play {
 
     # Stand VOR dem Sperr-Commit merken. Wird der Push abgelehnt, muss genau
     # dieser Commit wieder weg - aber nichts, was schon vorher hier lag.
-    $basis = (Invoke-Git @('rev-parse', 'HEAD')).Text.Trim()
+    $basis = (Invoke-Git @('rev-parse', 'HEAD')).Out.Trim()
     $vorher = Get-LokalerFortschritt
 
     # Sperre sichern (mit Wettlauf-Schutz: wer zuerst pusht, gewinnt)
@@ -1627,7 +1933,7 @@ function Start-Play {
         # Ausgangsstand fuer den naechsten Versuch neu bestimmen - der Abgleich
         # kann HEAD verschoben haben (sonst ginge es beim naechsten Zuruecknehmen
         # auf einen veralteten Stand zurueck).
-        $basis = (Invoke-Git @('rev-parse', 'HEAD')).Text.Trim()
+        $basis = (Invoke-Git @('rev-parse', 'HEAD')).Out.Trim()
         $vorher = Get-LokalerFortschritt
         $lock = Get-LockState
         if ($lock.State -eq 'locked' -and -not $lock.Mine -and -not $lock.Stale) {
@@ -1801,8 +2107,8 @@ function Save-Sicherheitskopie {
     try {
         $ziel = Join-Path (Join-Path $script:AppDir 'gerettet') (Get-Date).ToString('yyyyMMdd-HHmmss')
         New-Item -ItemType Directory -Path $ziel -Force | Out-Null
-        $null = robocopy $src $ziel /E /NJH /NJS /NDL /NC /NS /NP /R:1 /W:1 2>&1
-        if ($LASTEXITCODE -ge 8) { Write-Log "FEHLER bei der Sicherheitskopie (robocopy-Code $LASTEXITCODE)."; return "" }
+        $code = Invoke-Robocopy $src $ziel @('/E')
+        if ($code -ge 8) { Write-Log "FEHLER bei der Sicherheitskopie (robocopy-Code $code)."; return "" }
         return $ziel
     }
     catch {
@@ -1860,6 +2166,10 @@ function Invoke-SperreVerloren {
 # Herzschlag + Ende-Erkennung (laeuft im Timer-Tick)
 # --------------------------------------------------------------------------
 function Invoke-Tick {
+    # Laeuft gerade ein git im Hintergrund (z. B. ein Klick auf "Status
+    # pruefen" waehrend der Sitzung), setzt dieser Tick aus - er kommt in drei
+    # Sekunden wieder. Sonst liefen zwei git gleichzeitig im selben Repo.
+    if ($script:beschaeftigt -gt 0) { return }
     # Ohne Prozess wartet die Sitzung nur noch aufs Sichern (Complete-Session
     # hat sie offen gelassen) - dann nur den Herzschlag weiterlaufen lassen.
     if ($null -ne $script:proc -and (Test-DolphinBeendet)) {
@@ -2276,7 +2586,7 @@ function Get-StandListe {
     $r = Invoke-Git @('log', '-60', '--pretty=format:%H%x09%ad%x09%s', '--date=format:%d.%m.%Y %H:%M', '--', 'save')
     if ($r.Code -ne 0) { return @() }
     $liste = @()
-    foreach ($z in ($r.Text -split "`r?`n")) {
+    foreach ($z in ($r.Out -split "`r?`n")) {
         if (-not $z.Trim()) { continue }
         $t = $z -split "`t"
         if ($t.Count -lt 3) { continue }
@@ -2699,12 +3009,12 @@ function Test-Setup {
     # 2) Kennt Git meinen Namen? (sonst schlaegt jeder Commit fehl)
     $n = Invoke-GitRaw @('config', '--global', 'user.name')
     $m = Invoke-GitRaw @('config', '--global', 'user.email')
-    if ([string]::IsNullOrWhiteSpace($n.Text) -or [string]::IsNullOrWhiteSpace($m.Text)) {
+    if ([string]::IsNullOrWhiteSpace($n.Out) -or [string]::IsNullOrWhiteSpace($m.Out)) {
         $e += Neu "Git kennt dich" $false ('Git fehlen Name und E-Mail. Einmalig in einer Eingabeaufforderung: ' +
             'git config --global user.name "Dein Name"  und  git config --global user.email "du@example.com"') ""
     }
     else {
-        $e += Neu "Git kennt dich" $true ("{0} <{1}>" -f $n.Text, $m.Text)
+        $e += Neu "Git kennt dich" $true ("{0} <{1}>" -f $n.Out, $m.Out)
     }
 
     # 3) Spielername im Programm
@@ -2754,12 +3064,12 @@ function Test-Setup {
 
     # 6) Ist eine Adresse im Internet hinterlegt?
     $o = Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath
-    if ($o.Code -ne 0 -or [string]::IsNullOrWhiteSpace($o.Text)) {
+    if ($o.Code -ne 0 -or [string]::IsNullOrWhiteSpace($o.Out)) {
         $e += Neu "Adresse des Repos" $false ("Es ist keine Adresse ('origin') hinterlegt - der Austausch mit dem " +
             "anderen Spieler kann so nicht funktionieren. Ueber 'Repo einrichten...', Schritt 2.") $o.Text
         return $e
     }
-    $e += Neu "Adresse des Repos" $true $o.Text
+    $e += Neu "Adresse des Repos" $true $o.Out
 
     # 7) Server erreichbar + Zugangsdaten in Ordnung?
     $ls = Invoke-GitRaw @('ls-remote', '--heads', 'origin') $script:cfg.RepoPath
@@ -2774,8 +3084,8 @@ function Test-Setup {
     $e += Neu "Verbindung zum Server" $true "Server erreichbar, Zugang funktioniert."
 
     # 8) Gibt es den eingetragenen Branch dort?
-    if ($ls.Text -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '\s*$') -or
-        $ls.Text -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '[\r\n]')) {
+    if ($ls.Out -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '\s*$') -or
+        $ls.Out -match ("refs/heads/" + [regex]::Escape($script:cfg.Branch) + '[\r\n]')) {
         $e += Neu "Branch vorhanden" $true $script:cfg.Branch
     }
     else {
@@ -3049,9 +3359,6 @@ function Show-AdvancedDialog {
 # Laufens von Windows festgehalten wird: Der Starter liest die Datei einmal
 # ein und gibt sie sofort wieder frei.
 
-# Fragt GitHub nach dem neuesten Release. Rueckgabe: Objekt mit Version,
-# Beschreibung und Dateiliste - oder $null, wenn es nicht klappt (kein
-# Internet, GitHub gerade nicht erreichbar, Zaehlgrenze erreicht).
 # Wie weit geht die Uhr dieses PCs falsch? Ob eine Sperre abgelaufen ist,
 # wird aus dem Zeitstempel des Spielenden und der EIGENEN Uhr berechnet.
 # Geht eine der beiden Uhren um Minuten falsch, gilt eine frische Sperre als
@@ -3060,23 +3367,31 @@ function Show-AdvancedDialog {
 # Rueckgabe: Abweichung in Sekunden (positiv = PC geht vor), oder $null.
 function Get-UhrAbweichung {
     try {
-        [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $vorher = [datetime]::UtcNow
-        # Bewusst GET statt HEAD: manche Proxys lehnen HEAD ab. Die Antwort ist klein.
-        $r = Invoke-WebRequest -Uri 'https://api.github.com' -UseBasicParsing -TimeoutSec 10 `
-            -Headers @{ 'User-Agent' = 'AC-SaveSync' }
-        $nachher = [datetime]::UtcNow
+        $antwort = Get-ServerZeit
         $d = [datetimeoffset]::MinValue
-        $ok = [datetimeoffset]::TryParse("$($r.Headers['Date'])",
+        $ok = [datetimeoffset]::TryParse("$($antwort.Datum)",
             [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$d)
         if (-not $ok) { return $null }
         # Mitte zwischen Anfrage und Antwort - gleicht die Laufzeit aus.
-        $mitte = $vorher.AddTicks([long](($nachher - $vorher).Ticks / 2))
+        $mitte = $antwort.Vorher.AddTicks([long](($antwort.Nachher - $antwort.Vorher).Ticks / 2))
         return ($mitte - $d.UtcDateTime).TotalSeconds
     }
     catch { return $null }
+}
+
+# Fragt GitHub nach der Uhrzeit (Kopfzeile "Date" der Antwort), im
+# Hintergrund. Rueckgabe: Datum als Text plus Zeitpunkte vor/nach der Anfrage.
+function Get-ServerZeit {
+    return (Invoke-ImHintergrund -Text 'Pruefe die Uhrzeit' -TimeoutSek 30 -Skript {
+            [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $vorher = [datetime]::UtcNow
+            # Bewusst GET statt HEAD: manche Proxys lehnen HEAD ab. Die Antwort ist klein.
+            $r = Invoke-WebRequest -Uri 'https://api.github.com' -UseBasicParsing -TimeoutSec 10 `
+                -Headers @{ 'User-Agent' = 'AC-SaveSync' }
+            [pscustomobject]@{ Datum = "$($r.Headers['Date'])"; Vorher = $vorher; Nachher = [datetime]::UtcNow }
+        })
 }
 
 # Beim Start: warnen, wenn die Uhr spuerbar falsch geht.
@@ -3099,15 +3414,25 @@ function Test-UhrBeimStart {
     }
 }
 
+# Holt die Angaben zum neuesten Release von GitHub, im Hintergrund.
+function Get-ReleaseDaten {
+    return (Invoke-ImHintergrund -Text 'Suche nach Updates' -TimeoutSek 30 -Argumente @($script:ReleaseApi) -Skript {
+            param($uri)
+            # Aeltere Windows-Fassungen sprechen von sich aus noch kein TLS 1.2,
+            # GitHub verlangt es aber - sonst bricht der Aufruf unverstaendlich ab.
+            [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            Invoke-RestMethod -Uri $uri -TimeoutSec 15 `
+                -Headers @{ 'User-Agent' = 'AC-SaveSync'; 'Accept' = 'application/vnd.github+json' }
+        })
+}
+
+# Fragt GitHub nach dem neuesten Release. Rueckgabe: Objekt mit Version,
+# Beschreibung und Dateiliste - oder $null, wenn es nicht klappt (kein
+# Internet, GitHub gerade nicht erreichbar, Zaehlgrenze erreicht).
 function Get-NeuesteVersion {
     try {
-        # Aeltere Windows-Fassungen sprechen von sich aus noch kein TLS 1.2,
-        # GitHub verlangt es aber - sonst bricht der Aufruf unverstaendlich ab.
-        [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-
-        $r = Invoke-RestMethod -Uri $script:ReleaseApi -TimeoutSec 15 `
-            -Headers @{ 'User-Agent' = 'AC-SaveSync'; 'Accept' = 'application/vnd.github+json' }
+        $r = Get-ReleaseDaten
         # Antwort ueber Get-JsonWert auswerten: Bei einer Fehlermeldung
         # von GitHub (Zaehlgrenze erreicht, Repo ohne Release) fehlen diese
         # Felder - unter StrictMode waere das ein Fehler statt eines sauberen
@@ -3161,6 +3486,18 @@ function Test-UpdateDatei {
     return ""   # leer = in Ordnung
 }
 
+# Laedt eine Datei aus dem Internet, im Hintergrund.
+function Save-Download {
+    param([string]$Uri, [string]$Ziel)
+    [void](Invoke-ImHintergrund -Text 'Lade das Update herunter' -TimeoutSec 180 -Argumente @($Uri, $Ziel) -Skript {
+            param($u, $z)
+            $ProgressPreference = 'SilentlyContinue'   # sonst ist Invoke-WebRequest sehr langsam
+            [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $u -OutFile $z -TimeoutSec 120 -UseBasicParsing -Headers @{ 'User-Agent' = 'AC-SaveSync' }
+        })
+}
+
 # Laedt die neue Fassung, prueft sie, ersetzt die eigene Datei und startet neu.
 function Install-Update {
     param($Info)
@@ -3184,12 +3521,8 @@ function Install-Update {
     $neu = Join-Path $ordner $gesucht
 
     Write-Log ("Lade Version {0} herunter..." -f $Info.Version)
-    [Windows.Forms.Application]::DoEvents()
     try {
-        [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri (Get-JsonWert $datei 'browser_download_url') -OutFile $neu -TimeoutSec 120 `
-            -UseBasicParsing -Headers @{ 'User-Agent' = 'AC-SaveSync' }
+        Save-Download -Uri (Get-JsonWert $datei 'browser_download_url') -Ziel $neu
     }
     catch {
         Write-Log "Herunterladen fehlgeschlagen: $($_.Exception.Message)"
@@ -3220,6 +3553,23 @@ function Install-Update {
     return $true
 }
 
+# Aus dem Release-Text nur den Abschnitt "Was ist neu" - alles andere ist
+# die Installationsanleitung und im Update-Dialog fehl am Platz.
+# Rueckgabe: hoechstens fuenf Zeilen. Ein Spiegelstrich am Zeilenanfang
+# wird entfernt (der Dialog setzt selbst einen davor).
+function Get-UpdateNeuigkeiten {
+    param([string]$Text)
+    $zeilen = @()
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $zeilen }
+    $drin = $false
+    foreach ($z in ($Text -split "`r?`n")) {
+        if ($z -match '^##\s') { $drin = ($z -match 'Was ist neu'); continue }
+        $inhalt = ($z.Trim() -replace '^[-*]\s+', '').Trim()
+        if ($drin -and $inhalt) { $zeilen += $inhalt }
+    }
+    return @($zeilen | Select-Object -First 5)
+}
+
 # Der ganze Ablauf mit Rueckfragen. -Still: keine Meldung, wenn schon aktuell
 # (fuer die Pruefung beim Start).
 function Invoke-UpdatePruefung {
@@ -3246,19 +3596,10 @@ function Invoke-UpdatePruefung {
     }
 
     Write-Log ("Neue Version verfuegbar: {0} (du hast {1})." -f $info.Version, $script:Version)
-    # Aus dem Release-Text nur den Abschnitt "Was ist neu" zeigen - alles
-    # andere ist die Installationsanleitung und hier fehl am Platz.
     $was = ""
-    if ($info.Text) {
-        $zeilen = @()
-        $drin = $false
-        foreach ($z in ($info.Text -split "`r?`n")) {
-            if ($z -match '^##\s') { $drin = ($z -match 'Was ist neu'); continue }
-            if ($drin -and $z.Trim()) { $zeilen += $z.Trim() }
-        }
-        if ($zeilen.Count -gt 0) {
-            $was = "`n`nNeu darin:`n" + (($zeilen | Select-Object -First 5 | ForEach-Object { "- $_" }) -join "`n")
-        }
+    $neuigkeiten = @(Get-UpdateNeuigkeiten $info.Text)
+    if ($neuigkeiten.Count -gt 0) {
+        $was = "`n`nNeu darin:`n" + (($neuigkeiten | ForEach-Object { "- $_" }) -join "`n")
     }
 
     $r = [Windows.Forms.MessageBox]::Show(
@@ -3389,7 +3730,7 @@ function Connect-Remote {
         Write-Log "Erst Schritt 1 (Lokales Repo anlegen) ausfuehren."; return
     }
     $r = Invoke-Git @('remote')
-    if ($r.Text -match '(^|\r?\n)origin(\r?\n|$)') {
+    if ($r.Out -match '(^|\r?\n)origin(\r?\n|$)') {
         Invoke-Git @('remote', 'set-url', 'origin', $url) | Out-Null
         Write-Log "origin aktualisiert."
     }
@@ -3415,10 +3756,9 @@ function Copy-Repo {
     Write-Log "Klone Repo..."
     # "--" davor: eine Adresse, die mit "-" beginnt, wuerde git sonst als
     # Option lesen statt als Adresse.
-    $out = & git clone -- $url $target 2>&1
-    $text = ConvertTo-GitText $out
+    $klon = Invoke-GitRaw @('clone', '--', $url, $target)
     if (-not (Test-Path -LiteralPath (Join-Path $target '.git'))) {
-        Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." ([pscustomobject]@{ Text = $text })
+        Write-GitProblem "Das gemeinsame Repo konnte nicht geholt werden." $klon
         return
     }
 
@@ -3427,7 +3767,7 @@ function Copy-Repo {
     # Branch (z. B. 'master' statt 'main'), ist der Ordner sonst LEER - und das
     # faellt sonst erst beim Spielen auf, wenn der Spielstand fehlt.
     $cur = Invoke-Git @('rev-parse', '--abbrev-ref', 'HEAD')
-    if ($cur.Code -ne 0 -or $cur.Text -ne $script:cfg.Branch) {
+    if ($cur.Code -ne 0 -or $cur.Out -ne $script:cfg.Branch) {
         $co = Invoke-Git @('checkout', '-B', $script:cfg.Branch, "origin/$($script:cfg.Branch)")
         if ($co.Code -ne 0) {
             Write-GitProblem ("Der Ordner wurde geholt, aber der Branch '{0}' konnte nicht ausgecheckt werden - er ist noch leer." -f $script:cfg.Branch) $co
@@ -3451,8 +3791,9 @@ function New-RemoteWithGh {
     }
     Initialize-Repo
     Write-Log "Erstelle privates GitHub-Repo '$name' und lade hoch..."
-    $out = & gh repo create $name --private --source $script:cfg.RepoPath --remote origin --push 2>&1
-    Write-Log ("gh: " + (($out | Out-String).Trim()))
+    $r = Invoke-Extern -Datei $gh.Source -Argumente @('repo', 'create', $name, '--private', '--source', $script:cfg.RepoPath, '--remote', 'origin', '--push') `
+        -Text 'Lege das Repo bei GitHub an' -TimeoutSek 300
+    Write-Log ("gh: " + $r.Text)
 }
 
 # --------------------------------------------------------------------------
@@ -3769,7 +4110,7 @@ function Invoke-SetupErstellen {
 
     # Erfolg daran erkennen, dass der Branch jetzt beim Server bekannt ist
     $ls = Invoke-GitRaw @('ls-remote', '--heads', 'origin', $script:cfg.Branch) $script:cfg.RepoPath
-    if ($ls.Code -eq 0 -and $ls.Text) {
+    if ($ls.Code -eq 0 -and $ls.Out) {
         $script:setupStatusA.Text = "Fertig! Schick die Adresse jetzt an deinen Mitspieler."
         $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
         $script:setupKopierA.Enabled = $true
@@ -3825,8 +4166,8 @@ function Invoke-SetupGh {
     [Windows.Forms.Application]::DoEvents()
     New-RemoteWithGh $script:setupNameBox.Text
     $u = Invoke-GitRaw @('remote', 'get-url', 'origin') $script:cfg.RepoPath
-    if ($u.Code -eq 0 -and $u.Text) {
-        $script:setupUrlA.Text = $u.Text
+    if ($u.Code -eq 0 -and $u.Out) {
+        $script:setupUrlA.Text = $u.Out
         $script:setupStatusA.Text = "Fertig! Schick die Adresse oben an deinen Mitspieler."
         $script:setupStatusA.ForeColor = [Drawing.Color]::FromArgb(0, 110, 0)
         $script:setupKopierA.Enabled = $true
@@ -4238,6 +4579,32 @@ Set-Tip ("Protokoll dieser Sitzung: was das Skript gerade tut.`n" +
     "Wenn etwas nicht klappt, steht hier die Meldung von Git im Klartext -`n" +
     "diesen Text am besten mitkopieren, wenn du nachfragst.") $lblLog $script:txtLog
 
+# Fortschrittsanzeige unter dem Protokoll: erscheint nur, waehrend im
+# Hintergrund etwas laeuft (Holen, Hochladen, Kopieren, Download).
+# Siehe Update-Fortschritt und Invoke-FortschrittTick.
+$y += 228
+$script:fortschrittPanel = New-Object Windows.Forms.Panel
+$script:fortschrittPanel.Location = New-Object Drawing.Point(15, $y)
+$script:fortschrittPanel.Size = New-Object Drawing.Size(593, 24)
+$script:fortschrittPanel.Anchor = 'Bottom,Left,Right'
+$script:fortschrittPanel.Visible = $false
+$fortschrittBalken = New-Object Windows.Forms.ProgressBar
+$fortschrittBalken.Style = 'Marquee'
+$fortschrittBalken.MarqueeAnimationSpeed = 30
+$fortschrittBalken.Location = New-Object Drawing.Point(0, 4)
+$fortschrittBalken.Size = New-Object Drawing.Size(120, 16)
+$script:fortschrittPanel.Controls.Add($fortschrittBalken)
+$script:fortschrittText = New-Object Windows.Forms.Label
+$script:fortschrittText.Location = New-Object Drawing.Point(130, 2)
+$script:fortschrittText.Size = New-Object Drawing.Size(460, 20)
+$script:fortschrittText.Anchor = 'Top,Left,Right'
+$script:fortschrittText.TextAlign = 'MiddleLeft'
+$script:fortschrittPanel.Controls.Add($script:fortschrittText)
+$form.Controls.Add($script:fortschrittPanel)
+Set-Tip ("Hier siehst du, was gerade im Hintergrund laeuft.`n" +
+    "Das Fenster bleibt dabei bedienbar - Klicks werden aber erst`n" +
+    "wieder angenommen, wenn der Vorgang fertig ist.") $script:fortschrittText
+
 # Beim Breiterziehen des Fensters mitwachsen lassen:
 # - die Pfad-Textfelder dehnen sich nach rechts (lange Pfade werden sichtbar),
 # - die "..."-Knoepfe bleiben rechts kleben.
@@ -4260,6 +4627,10 @@ $script:timer.Add_Tick({ Invoke-Tick })
 $script:saveTimer = New-Object Windows.Forms.Timer
 $script:saveTimer.Interval = 800
 $script:saveTimer.Add_Tick({
+        # Waehrend im Hintergrund etwas laeuft, NICHT speichern: sonst
+        # wechselte mitten in einem Vorgang z. B. der Repo-Ordner. Der Timer
+        # laeuft weiter und versucht es gleich noch einmal.
+        if ($script:beschaeftigt -gt 0) { return }
         $script:saveTimer.Stop()
         Save-ConfigFromUI
         [void](Update-ReadyState)
@@ -4363,6 +4734,14 @@ $btnAdvanced.Add_Click({ Show-AdvancedDialog })
 
 $form.Add_FormClosing({
         $e = $args[1]
+        # Laeuft gerade etwas im Hintergrund (z. B. ein Hochladen), erst das
+        # zu Ende bringen - das Fenster schliesst sich danach von selbst.
+        if ($script:beschaeftigt -gt 0) {
+            $e.Cancel = $true
+            $script:schliessenWennFrei = $true
+            Write-Log ("Wird geschlossen, sobald '{0}' fertig ist." -f $script:beschaeftigtText)
+            return
+        }
         # Noch nicht geschriebene Aenderungen sichern (der Wartetimer koennte
         # gerade noch laufen).
         if ($script:saveTimer) { $script:saveTimer.Stop() }
@@ -4380,7 +4759,13 @@ $form.Add_FormClosing({
         }
     })
 
-$form.Add_Shown({ $script:startTimer.Start() })
+# Blendet die Fortschrittsanzeige aus, wenn nichts mehr laeuft, und holt ein
+# verschobenes Schliessen nach (siehe Invoke-FortschrittTick).
+$script:fortschrittTimer = New-Object Windows.Forms.Timer
+$script:fortschrittTimer.Interval = 250
+$script:fortschrittTimer.Add_Tick({ Invoke-FortschrittTick })
+
+$form.Add_Shown({ $script:startTimer.Start(); $script:fortschrittTimer.Start() })
 
 Write-Log "Bereit."
 Set-UiScale $form
