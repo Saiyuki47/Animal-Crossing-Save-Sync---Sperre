@@ -148,6 +148,9 @@ function Reset-Zustand {
     $script:UebergabeVon = ''
     $script:installFrage = $false
     $script:istErststart = $false
+    $script:UebergabeWarteSek = 30
+    $script:uebergeben = $false
+    $script:instanzName = $null
     $script:proc = $null
     $script:holdingLock = $false
     $script:lastHeartbeat = Get-Date

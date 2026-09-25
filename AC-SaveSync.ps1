@@ -202,6 +202,10 @@ Remove-Item -Path Env:\ACSS_AUFTRAG, Env:\ACSS_UEBERGABE -ErrorAction SilentlyCo
 # Nach dem Start einmal fragen, ob fest installiert werden soll?
 # (siehe Invoke-InstallBeimStart)
 $script:installFrage = $false
+# So lange wird nach dem Start der installierten Fassung auf ihre Meldung
+# gewartet (siehe Start-Installiertes) - auf langsamen PCs dauert allein das
+# Laden des Programms einige Sekunden.
+$script:UebergabeWarteSek = 30
 # Pfad der Protokolldatei dieses Laufs (siehe Initialize-LogDatei)
 $script:LogPfad = $null
 # Gibt es noch keine Einstellungsdatei, ist das der allererste Start -
@@ -236,6 +240,9 @@ $script:pendingLog = @()
 $script:gitDa = $true
 # Laeuft gerade ein Update? Dann beim Schliessen nicht nachfragen.
 $script:updateLaeuft = $false
+# Laeuft schon die installierte Fassung (aus dem Fenster heraus gestartet)?
+# Dann beim Schliessen weder fragen noch speichern (siehe Install-UndNeustart).
+$script:uebergeben = $false
 # Fehlgeschlagene Herzschlaege in Folge und wann zuletzt etwas ankam
 $script:hbFehler = 0
 $script:hbLetzterErfolg = Get-Date
@@ -262,6 +269,8 @@ $script:schliesseAb = $false
 $script:hbAufgeschobenSeit = $null
 # Haelt dieses Programm die "nur einmal starten"-Sperre? (siehe Enter-EinzelInstanz)
 $script:instanzSperre = $null
+# ... und unter welchem Namen (siehe Start-Installiertes)
+$script:instanzName = $null
 
 # Vorbelegung fuer Set-StrictMode -Version Latest.
 # StrictMode bricht ab, sobald eine Variable GELESEN wird, die es noch nicht
@@ -6022,17 +6031,34 @@ function Update-InstallEintrag {
 # Der Merker ACSS_UEBERGABE sagt ihr, von welcher Datei sie kommt: Sie reicht
 # dann ihrerseits nie weiter (keine Schleife, falls ein Pfadvergleich einmal
 # nicht passt), und der Assistent kann sagen, welche Datei uebrig ist.
-# Rueckgabe: $true, wenn sie gestartet ist - dann soll sich dieses beenden.
+# Danach wird gewartet, bis sie die Sperre uebernommen hat - erst dann laeuft
+# sie sicher. Bleibt das aus (im Test einmal beobachtet: Windows meldete den
+# Start als gelungen, gestartet wurde aber nichts), folgt ein zweiter Versuch.
+# Klappt auch der nicht, holt sich dieses Programm die Sperre zurueck und
+# laeuft weiter - statt dass am Ende gar keins laeuft.
+# Rueckgabe: $true, wenn die installierte Fassung laeuft - dann soll sich
+# dieses beenden.
 function Start-Installiertes {
+    $name = if ($script:instanzName) { $script:instanzName } else { Get-InstanzName }
     $env:ACSS_UEBERGABE = "$($script:SelfPath)"
-    try { Start-Process -FilePath (Get-InstallPfad) -ErrorAction Stop }
-    catch {
-        Write-Log ("Die installierte Fassung liess sich nicht starten: {0}" -f $_.Exception.Message)
+    try {
+        foreach ($versuch in 1, 2) {
+            try { Start-Process -FilePath (Get-InstallPfad) -ErrorAction Stop }
+            catch {
+                Write-Log ("Die installierte Fassung liess sich nicht starten: {0}" -f $_.Exception.Message)
+                return $false
+            }
+            Exit-EinzelInstanz
+            if (Wait-AndereInstanz -Name $name) { return $true }
+            Write-Log ("Die installierte Fassung hat sich nach dem {0}. Start nicht gemeldet." -f $versuch)
+            # Sperre zurueckholen. Hat sie inzwischen doch ein anderes, ist
+            # die installierte Fassung eben etwas spaeter angelaufen.
+            if (-not (Enter-EinzelInstanz -Name $name -WarteSek 0)) { return $true }
+        }
+        Write-Log "Das Programm laeuft deshalb von hier aus weiter."
         return $false
     }
     finally { Remove-Item -Path Env:\ACSS_UEBERGABE -ErrorAction SilentlyContinue }
-    Exit-EinzelInstanz
-    return $true
 }
 
 # Aeltere Einrichtung, die noch aus dem Downloads-Ordner o. Ae. laeuft: nach
@@ -6066,14 +6092,20 @@ function Install-UndNeustart {
                 -Text "Es laeuft gerade eine Sitzung. Bitte erst 'Spielen beenden' und danach installieren.")
         return $false
     }
+    # Die Einstellungen jetzt speichern, nicht erst beim Schliessen: Bis dahin
+    # hat die neue Fassung sie schon eingelesen - oder liest sie womoeglich
+    # gerade, waehrend die Datei neu geschrieben wird (Start-Installiertes
+    # wartet ja, bis sie laeuft).
+    $script:cfg.InstallDeclined = $false
+    if ($script:saveTimer) { $script:saveTimer.Stop() }
+    Save-ConfigFromUI
     if (-not (Install-Programm) -or -not (Start-Installiertes)) {
         [void](Show-Meldung -Titel "Fest installieren" -Symbol 'Warning' -Text (
                 "Das hat nicht geklappt. Das Programm laeuft von hier aus unveraendert weiter.`n`n" +
                 "Einzelheiten stehen im Protokoll."))
         return $false
     }
-    $script:cfg.InstallDeclined = $false
-    $script:updateLaeuft = $true      # FormClosing soll nicht nachfragen
+    $script:uebergeben = $true        # FormClosing: nicht fragen, nicht mehr speichern
     $script:mainForm.Close()
     return $true
 }
@@ -6938,6 +6970,7 @@ function Enter-EinzelInstanz {
     }
     if (-not $frei) { $m.Dispose(); return $false }
     $script:instanzSperre = $m
+    $script:instanzName = $Name
     return $true
 }
 
@@ -6947,6 +6980,43 @@ function Exit-EinzelInstanz {
     catch { Write-Verbose "Einzelstart-Sperre schon frei: $($_.Exception.Message)" }
     $script:instanzSperre.Dispose()
     $script:instanzSperre = $null
+}
+
+# Haelt gerade ein anderes Programm die Sperre? Daran erkennt dieses, dass
+# die eben gestartete Fassung laeuft (siehe Start-Installiertes). Das kurze
+# eigene Zugreifen stoert sie nicht - sie wartet beim Start bis zu drei
+# Sekunden. Laesst es sich nicht pruefen, gilt "ja": Dann bleibt es beim
+# alten Verhalten, dem Start einfach zu vertrauen.
+function Test-AndereInstanz {
+    param([string]$Name)
+    try { $m = New-Object Threading.Mutex($false, $Name) }
+    catch { return $true }
+    try {
+        $frei = $false
+        try { $frei = $m.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $frei = $true }
+        if ($frei) { $m.ReleaseMutex() }
+        return (-not $frei)
+    }
+    finally { $m.Dispose() }
+}
+
+# Wartet, bis ein anderes Programm die Sperre haelt. Das Fenster bleibt dabei
+# bedienbar, Klicks werden verworfen (siehe Start-Beschaeftigt).
+# Rueckgabe: $true, sobald das so ist - $false nach Ablauf der Frist.
+function Wait-AndereInstanz {
+    param([string]$Name, [int]$Sekunden = $script:UebergabeWarteSek)
+    Start-Beschaeftigt 'Starte die installierte Fassung'
+    try {
+        $ende = (Get-Date).AddSeconds($Sekunden)
+        while (-not (Test-AndereInstanz $Name)) {
+            if ((Get-Date) -gt $ende) { return $false }
+            Invoke-Nachrichten
+            Start-Sleep -Milliseconds 100
+        }
+        return $true
+    }
+    finally { Stop-Beschaeftigt }
 }
 
 # Holt das Fenster des schon laufenden Programms nach vorn (auch aus der
@@ -7386,6 +7456,9 @@ $form.Add_FormClosing({
         # Noch nicht geschriebene Aenderungen sichern (der Wartetimer koennte
         # gerade noch laufen).
         if ($script:saveTimer) { $script:saveTimer.Stop() }
+        # Laeuft schon die installierte Fassung, ist bereits gespeichert - und
+        # sie liest die Einstellungen womoeglich gerade (siehe Install-UndNeustart).
+        if ($script:uebergeben) { return }
         Save-ConfigFromUI
         # Beim Neustart nach einem Update nicht noch einmal nachfragen.
         if ($script:updateLaeuft) { return }

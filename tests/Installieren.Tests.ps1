@@ -264,27 +264,56 @@ Test "Beim Start: aeltere Einrichtung wird gefragt, .ps1 und Weitergereichtes ni
     Soll ($script:aufrufe.Count -eq 0) "weder installiert noch gestartet"
 }
 
-Test "Start-Installiertes: startet die Kopie mit Merker und gibt die Einzelstart-Sperre frei" -NurWindows {
-    # Als "installierte Fassung" ein winziges Programm, das nur aufschreibt,
-    # welchen Merker es mitbekommt.
-    $ausgabe = Join-Path $script:TestWurzel ('merker-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.txt')
+# Baut als "installierte Fassung" ein winziges Programm. Es haengt an $Ausgabe
+# an, welchen Merker es mitbekommt, und uebernimmt mit -MitSperre die
+# Einzelstart-Sperre $Name - so meldet sich auch die echte.
+function New-MiniInstallation {
+    param([string]$Ausgabe, [string]$Name, [switch]$MitSperre)
     New-Item -ItemType Directory -Path $script:InstallDir -Force | Out-Null
+    $code = '[IO.File]::AppendAllText(''{0}'', "[$env:ACSS_UEBERGABE]")' -f $Ausgabe
+    if ($MitSperre) {
+        $code = ('$m = New-Object Threading.Mutex($false, ''{0}''); [void]$m.WaitOne(20000); ' -f $Name) + $code + '; Start-Sleep -Seconds 5'
+    }
     $mini = Join-Path $script:InstallDir 'mini.ps1'
-    [IO.File]::WriteAllText($mini, ('[IO.File]::WriteAllText(''{0}'', "[$env:ACSS_UEBERGABE]")' -f $ausgabe), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($mini, $code, [Text.UTF8Encoding]::new($false))
     & (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools/Build-Cmd.ps1') -Source $mini -Output (Get-InstallPfad) | Out-Null
+}
 
-    $script:SelfPath = Join-Path $script:TestWurzel 'Downloads/AC-SaveSync.cmd'
+Test "Start-Installiertes: startet die Kopie mit Merker und wartet, bis sie die Sperre haelt" -NurWindows {
+    $ausgabe = Join-Path $script:TestWurzel ('merker-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.txt')
     $name = Get-InstanzName (Join-Path $script:TestWurzel ('einzel-' + [guid]::NewGuid().ToString('N')))
-    Soll (Enter-EinzelInstanz -Name $name -WarteSek 0) "Sperre gehalten (Voraussetzung)"
-    Soll (Start-Installiertes) "gestartet"
-    Soll ($null -eq $env:ACSS_UEBERGABE) "Merker hier gleich wieder weg"
-    Soll ($null -eq $script:instanzSperre) "Einzelstart-Sperre freigegeben"
-    Soll (Wait-Bis { Test-Path -LiteralPath $ausgabe } 60) "installierte Fassung gestartet"
-    Soll ((Wait-Bis { (Get-Content -LiteralPath $ausgabe -Raw) -eq "[$($script:SelfPath)]" } 5)) "Merker kommt an (war: $(Get-Content -LiteralPath $ausgabe -Raw))"
+    New-MiniInstallation -Ausgabe $ausgabe -Name $name -MitSperre
+    $script:SelfPath = Join-Path $script:TestWurzel 'Downloads/AC-SaveSync.cmd'
 
-    # Laesst sie sich nicht starten, laeuft dieses Programm weiter - mit Sperre.
+    Soll (Enter-EinzelInstanz -Name $name -WarteSek 0) "Sperre gehalten (Voraussetzung)"
+    Soll (-not (Test-AndereInstanz $name)) "die eigene Sperre zaehlt nicht als andere"
+    Soll (Start-Installiertes) "gestartet und gemeldet"
+    Soll (Test-AndereInstanz $name) "erst zurueck, als die neue Fassung die Sperre haelt"
+    Soll ($null -eq $script:instanzSperre) "eigene Sperre abgegeben"
+    Soll ($null -eq $env:ACSS_UEBERGABE) "Merker hier gleich wieder weg"
+    Soll ((Wait-Bis { (Get-Content -LiteralPath $ausgabe -Raw -ErrorAction SilentlyContinue) -eq "[$($script:SelfPath)]" } 10)) "Merker kommt an (war: $(Get-Content -LiteralPath $ausgabe -Raw -ErrorAction SilentlyContinue))"
+    Soll (Wait-Bis { -not (Test-AndereInstanz $name) } 20) "nach ihrem Ende ist die Sperre wieder frei"
+}
+
+Test "Start-Installiertes: meldet sich die Kopie nicht, zweiter Versuch - danach laeuft dieses weiter" -NurWindows {
+    $script:UebergabeWarteSek = 3
+    $ausgabe = Join-Path $script:TestWurzel ('merker-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.txt')
+    $name = Get-InstanzName (Join-Path $script:TestWurzel ('einzel-' + [guid]::NewGuid().ToString('N')))
+    New-MiniInstallation -Ausgabe $ausgabe -Name $name
+    $script:SelfPath = Join-Path $script:TestWurzel 'Downloads/AC-SaveSync.cmd'
+
+    Soll (Enter-EinzelInstanz -Name $name -WarteSek 0) "Sperre gehalten (Voraussetzung)"
+    Soll (-not (Start-Installiertes)) "nicht uebergeben"
+    Soll ($null -ne $script:instanzSperre) "Sperre wieder bei diesem Programm"
+    $t = Get-ProtokollText
+    Soll ($t -match 'nach dem 1\. Start nicht gemeldet' -and $t -match 'nach dem 2\. Start nicht gemeldet') "beide Versuche im Protokoll"
+    Soll ($t -match 'laeuft deshalb von hier aus weiter') "und dass es von hier weiterlaeuft"
+    $zwei = "[$($script:SelfPath)][$($script:SelfPath)]"
+    Soll (Wait-Bis { (Get-Content -LiteralPath $ausgabe -Raw -ErrorAction SilentlyContinue) -eq $zwei } 20) "zweimal gestartet"
+
+    # Laesst sie sich gar nicht starten: sofort zurueck, mit Sperre.
+    $script:Protokoll.Clear()
     $script:InstallDir = Join-Path $script:TestWurzel ('fehlt-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-    Soll (Enter-EinzelInstanz -Name $name -WarteSek 0) "Sperre wieder gehalten"
     Soll (-not (Start-Installiertes)) "Start gescheitert"
     Soll ((Get-ProtokollText) -match 'liess sich nicht starten') "Grund im Protokoll"
     Soll ($null -ne $script:instanzSperre) "Sperre bleibt"
@@ -293,33 +322,36 @@ Test "Start-Installiertes: startet die Kopie mit Merker und gibt die Einzelstart
 
 Test "Frage bei aelterer Einrichtung: Nein wird gemerkt, Ja installiert und startet neu" {
     $script:SelfPath = Join-Path $script:TestWurzel 'Downloads/AC-SaveSync.cmd'
-    $script:gespeichert = 0
-    function Save-ConfigFromUI { $script:gespeichert++ }
-    $script:installiert = 0
-    function Install-Programm { $script:installiert++; $true }
-    function Start-Installiertes { $true }
+    $script:aufrufe = @()
+    function Save-ConfigFromUI { $script:aufrufe += "speichern($($script:cfg.InstallDeclined))" }
+    function Install-Programm { $script:aufrufe += 'installieren'; $true }
+    function Start-Installiertes { $script:aufrufe += 'starten'; $true }
 
     $script:installFrage = $true
     [AcssTest.Dialog]::Reset('No')
     Soll (-not (Invoke-InstallFrage)) "Nein: laeuft weiter"
-    Soll ($script:cfg.InstallDeclined -and $script:gespeichert -eq 1) "Nein gemerkt und gespeichert"
-    Soll ($script:installiert -eq 0 -and -not $script:installFrage) "nichts installiert, keine zweite Frage"
+    Soll (($script:aufrufe -join ',') -eq 'speichern(True)') "Nein gemerkt und gespeichert, nichts installiert (war: $($script:aufrufe -join ','))"
+    Soll (-not $script:installFrage) "keine zweite Frage"
     $t = [AcssTest.Dialog]::Texte[0]
     Soll ($t -match '^Neu: ' -and $t.Contains($script:SelfPath)) "nennt die Datei, die danach uebrig ist"
 
-    # Ueber "Erweitert..." nachgeholt
+    # Ueber "Erweitert..." nachgeholt. Gespeichert wird VOR dem Start - danach
+    # liest die neue Fassung die Einstellungen womoeglich schon.
+    $script:aufrufe = @()
     $script:mainForm = New-Object AcssTest.Fenster
+    $script:saveTimer.Start()
     [AcssTest.Dialog]::Reset('Yes')
     Soll (Invoke-InstallFrage -Nachholen) "Ja: installiert und neu gestartet"
-    Soll ($script:installiert -eq 1) "installiert"
-    Soll ($script:updateLaeuft -and $script:mainForm.Geschlossen -eq 1) "Fenster zu, ohne Rueckfrage beim Schliessen"
-    Soll (-not $script:cfg.InstallDeclined) "das fruehere Nein ist vergessen"
+    Soll (($script:aufrufe -join ',') -eq 'speichern(False),installieren,starten') "erst gespeichert (ohne das fruehere Nein), dann installiert und gestartet (war: $($script:aufrufe -join ','))"
+    Soll (-not $script:saveTimer.Enabled) "Wartetimer fuers Speichern gestoppt"
+    Soll ($script:uebergeben -and $script:mainForm.Geschlossen -eq 1) "Fenster zu - beim Schliessen weder Rueckfrage noch Speichern"
     Soll ([AcssTest.Dialog]::Texte[0] -notmatch '^Neu: ') "nachgeholt: ohne 'Neu:'"
 }
 
 Test "Fest installieren: waehrend einer Sitzung erst Spielen beenden, Fehler melden" {
     $script:installiert = 0
     function Install-Programm { $script:installiert++; $false }
+    function Save-ConfigFromUI { }
     $script:holdingLock = $true
     [AcssTest.Dialog]::Reset('Yes')
     Soll (-not (Install-UndNeustart)) "waehrend einer Sitzung: nicht installiert"
@@ -330,6 +362,7 @@ Test "Fest installieren: waehrend einer Sitzung erst Spielen beenden, Fehler mel
     [AcssTest.Dialog]::Reset('Yes')
     Soll (-not (Install-UndNeustart)) "gescheitert: laeuft weiter"
     Soll ($script:mainForm.Geschlossen -eq 0 -and [AcssTest.Dialog]::Texte[0] -match 'nicht geklappt') "Fenster bleibt offen, Meldung"
+    Soll (-not $script:uebergeben) "beim spaeteren Schliessen wird normal gespeichert"
 }
 
 Test "Deinstallieren: erst fragen, Einstellungen und gemeinsamer Ordner bleiben" {
