@@ -92,9 +92,13 @@ $UIA = [System.Windows.Automation.AutomationElement]
 # Alle Fenster des Programms. Dialoge und Meldungen, die einem Fenster
 # gehoeren, haengt UI Automation unter dieses Fenster - nicht unter den
 # Desktop. Deshalb werden auch die direkten Unterfenster mitgesucht.
+# Nur echte Fenster: Steht der Mauszeiger zufaellig ueber einem Knopf,
+# erscheint dessen Kurzhinweis samt Schatten (Klasse "SysShadow", ohne Namen).
+# Beides galt sonst als "unerwartetes Fenster", und der Test scheiterte.
 function Get-ProgrammFenster {
-    $bed = New-Object System.Windows.Automation.PropertyCondition($UIA::ProcessIdProperty, $script:app.Id)
     $istFenster = New-Object System.Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)
+    $bed = New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition($UIA::ProcessIdProperty, $script:app.Id)), $istFenster)
     $alle = New-Object System.Collections.ArrayList
     foreach ($f in $UIA::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $bed)) {
         [void]$alle.Add($f)
